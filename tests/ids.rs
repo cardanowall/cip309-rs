@@ -16,7 +16,7 @@ use common::{read_fixture_json, sdk_py_fixtures};
 
 #[test]
 fn poe_is_the_standard_defined_prefix() {
-    // `poe` is the single prefix the CIP-309 standard defines; service-entity
+    // `poe` is the single prefix the Label 309 standard defines; service-entity
     // prefixes (account / invoice / api-key) are gateway-specific and live
     // behind the generic prefix-string codec, not this enum.
     assert_eq!(IdPrefix::Poe.as_str(), "poe");

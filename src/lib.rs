@@ -1,4 +1,4 @@
-//! Rust SDK for the CIP-309 Proof-of-Existence standard.
+//! Rust SDK for the Label 309 Proof-of-Existence standard.
 //!
 //! This crate is a byte-parity sibling of the TypeScript (`@cardanowall/sdk-ts`)
 //! and Python (`cardanowall-sdk`) SDKs. It independently reproduces the exact

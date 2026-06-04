@@ -1,4 +1,4 @@
-//! CIP-309 wire-format parity tests.
+//! Label 309 wire-format parity tests.
 //!
 //! These tests pin the Rust encoder, validator, and chunking helpers against the
 //! same vectors the TypeScript and Python SDKs use:

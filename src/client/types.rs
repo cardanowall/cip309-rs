@@ -8,7 +8,7 @@
 
 use serde::Deserialize;
 
-/// A CIP-309 hash algorithm the high-level publish helpers support.
+/// A Label 309 hash algorithm the high-level publish helpers support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedHashAlg {
     /// SHA-256 (`sha2-256`).

@@ -1,6 +1,6 @@
 //! Hash primitives: SHA-256, BLAKE2b-256, and dual-hash digests.
 //!
-//! These are the closed-catalogue content-hash primitives of the CIP-309
+//! These are the closed-catalogue content-hash primitives of the Label 309
 //! standard. Both algorithms are registered under stable wire identifiers
 //! ([`SHA2_256_ID`] / [`BLAKE2B_256_ID`]); a record may publish a content
 //! digest under either, and [`dual_hash`] computes both at once for callers
@@ -22,13 +22,13 @@ use sha2::{Digest as Sha2Digest, Sha256};
 
 /// Wire identifier for the SHA-256 content-hash algorithm.
 ///
-/// Used as the key under which a SHA-256 digest is published in a CIP-309
+/// Used as the key under which a SHA-256 digest is published in a Label 309
 /// record's hash map.
 pub const SHA2_256_ID: &str = "sha2-256";
 
 /// Wire identifier for the BLAKE2b-256 content-hash algorithm.
 ///
-/// Used as the key under which a BLAKE2b-256 digest is published in a CIP-309
+/// Used as the key under which a BLAKE2b-256 digest is published in a Label 309
 /// record's hash map.
 pub const BLAKE2B_256_ID: &str = "blake2b-256";
 

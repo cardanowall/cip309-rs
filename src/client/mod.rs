@@ -1,6 +1,6 @@
-//! Gateway-agnostic HTTP client for the CIP-309 service surface.
+//! Gateway-agnostic HTTP client for the Label 309 service surface.
 //!
-//! The client targets any CIP-309 gateway: the caller passes an explicit
+//! The client targets any Label 309 gateway: the caller passes an explicit
 //! `base_url` and an opaque bearer key, and every request is built through the
 //! verifier's single outbound egress
 //! ([`crate::verifier::fetch`]) so the deny-host policy, the protocol/method
@@ -8,7 +8,7 @@
 //!
 //! The surface mirrors the TypeScript and Python SDKs:
 //!
-//! - [`Cip309Client`] — construction (required `base_url` + optional
+//! - [`Label309Client`] — construction (required `base_url` + optional
 //!   opaque bearer) and the three namespaces.
 //! - [`PoeNamespace`] — quote, multipart uploads, publish, publish-batch, and
 //!   the high-level [`publish_content`](PoeNamespace::publish_content) /
@@ -16,15 +16,15 @@
 //! - [`RecordsNamespace`] — record list, fetch, and verify.
 //! - [`AccountNamespace`] — account balance read.
 //! - The RFC 7807 / RFC 9457 [`ProblemDetails`] parser and the full typed
-//!   [`Cip309HttpError`] catalogue, with an unknown-code fallback to
+//!   [`Label309HttpError`] catalogue, with an unknown-code fallback to
 //!   [`HttpErrorKind::Other`].
 //! - The off-host signing helpers ([`prepare_sig_structure`] / `assemble_*`),
 //!   which reuse [`crate::cose`] and never see the integrator's private key.
 
 pub mod account;
-pub mod cip309_client;
 pub mod errors;
 pub mod http;
+pub mod label309_client;
 pub mod off_host_sign;
 pub mod poe;
 pub mod publish;
@@ -33,12 +33,12 @@ pub mod transport;
 pub mod types;
 
 pub use account::AccountNamespace;
-pub use cip309_client::{Cip309Client, Cip309ClientConfig, InvalidClientConfigError};
 pub use errors::{
-    parse_http_error, Cip309HttpError, HttpErrorKind, ParseHttpErrorArgs, ProblemDetails,
+    parse_http_error, HttpErrorKind, Label309HttpError, ParseHttpErrorArgs, ProblemDetails,
     ProblemErrorEntry,
 };
 pub use http::{ClientError, NamespaceConfig};
+pub use label309_client::{InvalidClientConfigError, Label309Client, Label309ClientConfig};
 pub use off_host_sign::{
     assemble_cose_sign1, assemble_cose_sign1_hashed, build_to_sign, prepare_sig_structure,
     prepare_sig_structure_hashed, AssembledCoseSign1, OffHostSignError, PreparedSigStructure,

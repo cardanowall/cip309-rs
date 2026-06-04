@@ -52,7 +52,7 @@ fn config_resolution_contract() {
 #[test]
 fn missing_base_url_is_rejected() {
     for base_url in [None, Some(String::new())] {
-        let result = Cip309Client::new(Cip309ClientConfig {
+        let result = Label309Client::new(Label309ClientConfig {
             api_key: Some("opaque-token".to_string()),
             base_url,
         });

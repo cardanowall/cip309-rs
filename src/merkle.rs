@@ -1,6 +1,6 @@
 //! Binary Merkle tree root, inclusion proof, and verification (RFC 9162).
 //!
-//! This module reproduces the CIP-309 Merkle subsystem byte-for-byte against the
+//! This module reproduces the Label 309 Merkle subsystem byte-for-byte against the
 //! TypeScript (`@cardanowall/sdk-ts`) and Python (`cardanowall`) SDKs. Two
 //! surfaces live here:
 //!

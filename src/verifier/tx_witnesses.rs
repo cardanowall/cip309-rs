@@ -1,4 +1,4 @@
-//! Transaction-level decode for the CIP-309 verifier.
+//! Transaction-level decode for the Label 309 verifier.
 //!
 //! This module surfaces the Cardano TRANSACTION that carried a PoE record: which
 //! wallet vkey(s) signed it, the fee, the outputs, and the co-published metadata

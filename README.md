@@ -1,6 +1,6 @@
-# cardanowall — Rust SDK for the CIP-309 Proof-of-Existence standard
+# cardanowall — Rust SDK for the Label 309 Proof-of-Existence standard
 
-`cardanowall` is the Rust implementation of the CIP-309 Proof-of-Existence (PoE)
+`cardanowall` is the Rust implementation of the Label 309 Proof-of-Existence (PoE)
 toolkit: a standalone structural validator, a public verifier, a recipient
 verifier with sealed-PoE decryption, and a gateway-agnostic HTTP client. It is a
 **byte-parity sibling** of the TypeScript (`@cardanowall/sdk-ts`) and Python
@@ -28,7 +28,7 @@ SDK.
     signatures.
   - **Recipient verifier** — the public verifier plus an X25519 private key:
     decrypts a sealed PoE and recomputes plaintext hashes.
-- **A gateway-agnostic client** (`client::Cip309Client`) for any CIP-309
+- **A gateway-agnostic client** (`client::Label309Client`) for any Label 309
   gateway: you pass an explicit base URL and an optional opaque bearer key.
 - **The cryptographic building blocks** — hash, KDF, COSE, sealed-PoE,
   recipient encoding, Merkle, and seed-derived identity helpers.
@@ -41,7 +41,7 @@ on it by path/git:
 ```toml
 # Cargo.toml — by git, until published
 [dependencies]
-cardanowall = { git = "https://github.com/cardanowall/cip309-rs" }
+cardanowall = { git = "https://github.com/cardanowall/label-309-rs" }
 ```
 
 Once published to crates.io the line will be:
@@ -155,7 +155,7 @@ let signature = signer.sign(&sig_structure_bytes)?; // 64-byte Ed25519 signature
 `derive_mlkem768x25519_keypair` (hybrid post-quantum X-Wing) expose the same
 deterministic identity keys directly.
 
-### Talk to a gateway (any CIP-309 deployment)
+### Talk to a gateway (any Label 309 deployment)
 
 The client targets no default host. You name the gateway with an explicit
 `base_url`; the optional `api_key` is an opaque bearer forwarded verbatim as
@@ -163,9 +163,9 @@ The client targets no default host. You name the gateway with an explicit
 anonymous and read-only.
 
 ```rust
-use cardanowall::client::{Cip309Client, Cip309ClientConfig};
+use cardanowall::client::{Label309Client, Label309ClientConfig};
 
-let client = Cip309Client::new(Cip309ClientConfig {
+let client = Label309Client::new(Label309ClientConfig {
     base_url: Some("https://gateway.example".to_string()),
     api_key: Some("opaque-bearer-token".to_string()),
 })?;
@@ -176,7 +176,7 @@ let record = client.records().get("aabbccdd…")?;  // RecordResource, by tx has
 ```
 
 `cardanowall.com` is one example deployment; this SDK works against any gateway
-that implements the CIP-309 surface. A missing or empty `base_url` is the one
+that implements the Label 309 surface. A missing or empty `base_url` is the one
 illegal config and raises `InvalidClientConfigError` from the constructor.
 
 ## API overview
@@ -186,7 +186,7 @@ illegal config and raises `InvalidClientConfigError` from the constructor.
 | `hash`                                   | `sha256`, `blake2b256`, `dual_hash`, `dual_hash_stream`; `SHA2_256_ID`, `BLAKE2B_256_ID`                                                                                                                      |
 | `poe_standard`                           | `validate_poe_record`, `encode_poe_record`, `encode_record_body_for_signing`, `chunk_bytes` / `bytes_chunk_array_concat`, `chunk_uri` / `reconstruct_chunked_uri`; `PoeRecord`, `ValidateResult`, `ErrorCode` |
 | `verifier`                               | `verify_tx`, `VerifyTxInput`, `VerifyReport`, `Verdict`, `ExitCode`, `Profile`, `Decryption`; `verify_record_signatures`, `extract_label_309_metadata`, `resolve_cardano_tx`, `verify_report_to_dict`         |
-| `client`                                 | `Cip309Client`, `Cip309ClientConfig`; namespaces `poe()` / `records()` / `inbox()` / `account()`; `Signer`, off-host signing helpers, `HttpError`, `ProblemDetails`                                           |
+| `client`                                 | `Label309Client`, `Label309ClientConfig`; namespaces `poe()` / `records()` / `inbox()` / `account()`; `Signer`, off-host signing helpers, `HttpError`, `ProblemDetails`                                       |
 | `seed_derive`                            | `signer_from_seed`, `derive_ed25519_keypair`, `derive_x25519_keypair`, `derive_mlkem768x25519_keypair`, `derive_bookmark_key`                                                                                 |
 | `sealed_poe`                             | `ecies_sealed_poe_wrap_secure`, `ecies_sealed_poe_unwrap`, `ecies_sealed_poe_trial_decrypt`, envelope/slots/kem/aead                                                                                          |
 | `recipient`                              | `encode_age_x25519_recipient`, `encode_age_xwing_recipient`, `parse_age_recipient`, bech32 helpers                                                                                                            |
@@ -226,7 +226,7 @@ compatibility one.
 
 ## Standard and service independence
 
-A CIP-309 proof is verifiable with no cooperation from whoever published it:
+A Label 309 proof is verifiable with no cooperation from whoever published it:
 
 1. fetch the transaction's label-309 metadata from any public Cardano explorer;
 2. reassemble and structurally validate the record (`validate_poe_record`);
@@ -244,7 +244,7 @@ do this for you.
 - **`@cardanowall/crypto-core`** — closed-catalogue cryptographic primitives
   (hash, KDF, signature, KEM, AEAD, CBOR, COSE, sealed-PoE, Merkle, recipient
   encoding, seed derivation). The portable building blocks.
-- **`@cardanowall/poe-standard`** — the CIP-309 wire-format library: record
+- **`@cardanowall/poe-standard`** — the Label 309 wire-format library: record
   schema, canonical-CBOR encoder, pure structural validator, error-code
   catalogue.
 - **`@cardanowall/sdk-ts`** — the browser + Node TypeScript SDK: verifier,

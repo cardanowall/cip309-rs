@@ -1,6 +1,6 @@
 # Security Policy
 
-`cardanowall` is the Rust SDK for CIP-309, a standard for cryptographic Proof of
+`cardanowall` is the Rust SDK for Label 309, a standard for cryptographic Proof of
 Existence. Its security properties matter to everyone who relies on a proof, so
 we take reports seriously and ask that they be handled responsibly.
 
@@ -21,10 +21,10 @@ In scope for a report here:
 
 Out of scope here (report it in the relevant repository instead):
 
-- A flaw or ambiguity in the **standard** itself — report it in the `cip309`
+- A flaw or ambiguity in the **standard** itself — report it in the `label-309`
   standard repository.
-- A bug in another implementation — `cip309-ts`, `cip309-py`, or the
-  `cip309-cli` command-line tool. Use that repository's security policy.
+- A bug in another implementation — `label-309-ts`, `label-309-py`, or the
+  `label-309-cli` command-line tool. Use that repository's security policy.
 
 ## Core security goals
 
@@ -64,4 +64,4 @@ Please include, as far as you can:
 - Because this crate is **pre-1.0**, there are no long-term-supported released
   versions yet; fixes land on the current line.
 
-Thank you for helping keep CIP-309 trustworthy.
+Thank you for helping keep Label 309 trustworthy.

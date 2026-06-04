@@ -1,6 +1,6 @@
 //! The gateway-agnostic HTTP client and its configuration.
 //!
-//! The client targets any CIP-309 gateway. The caller supplies the target
+//! The client targets any Label 309 gateway. The caller supplies the target
 //! directly, mirroring the reference SDKs:
 //!
 //! - `base_url` is required: it is used verbatim (one trailing slash stripped).
@@ -34,9 +34,9 @@ impl InvalidClientConfigError {
     pub const CODE: &'static str = "INVALID_CLIENT_CONFIG";
 }
 
-/// Configuration for [`Cip309Client`].
+/// Configuration for [`Label309Client`].
 #[derive(Debug, Clone, Default)]
-pub struct Cip309ClientConfig {
+pub struct Label309ClientConfig {
     /// The bearer credential, forwarded verbatim as `Authorization: Bearer …`.
     ///
     /// An opaque token: any string is accepted and never validated or parsed.
@@ -48,11 +48,11 @@ pub struct Cip309ClientConfig {
 }
 
 /// Resolve the base URL from the config: `base_url` is required and non-empty.
-fn resolve_base_url(config: &Cip309ClientConfig) -> Result<String, InvalidClientConfigError> {
+fn resolve_base_url(config: &Label309ClientConfig) -> Result<String, InvalidClientConfigError> {
     match &config.base_url {
         Some(base_url) if !base_url.is_empty() => Ok(base_url.clone()),
         _ => Err(InvalidClientConfigError(
-            "Cip309Client: base_url is required. Pass the gateway base URL \
+            "Label309Client: base_url is required. Pass the gateway base URL \
              (the api_key is an optional opaque bearer; omit it for read-only access)."
                 .to_string(),
         )),
@@ -64,25 +64,25 @@ fn strip_trailing_slash(url: &str) -> String {
     url.strip_suffix('/').unwrap_or(url).to_string()
 }
 
-/// The gateway-agnostic CIP-309 HTTP client.
+/// The gateway-agnostic Label 309 HTTP client.
 ///
 /// The client owns the outbound transport (the verifier's single egress) and
 /// hands out the namespaces ([`poe`](Self::poe), [`records`](Self::records),
 /// [`account`](Self::account)), each borrowing the client for the duration of a
 /// call.
-pub struct Cip309Client {
+pub struct Label309Client {
     api_key: Option<String>,
     base_url: String,
     transport: Box<dyn ClientTransport>,
 }
 
-impl Cip309Client {
+impl Label309Client {
     /// Construct a client from a config, using the production reqwest transport.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidClientConfigError`] when `base_url` is missing or empty.
-    pub fn new(config: Cip309ClientConfig) -> Result<Self, InvalidClientConfigError> {
+    pub fn new(config: Label309ClientConfig) -> Result<Self, InvalidClientConfigError> {
         Self::with_transport(config, Box::new(ReqwestClientTransport::new()))
     }
 
@@ -92,7 +92,7 @@ impl Cip309Client {
     ///
     /// Returns [`InvalidClientConfigError`] when `base_url` is missing or empty.
     pub fn with_transport(
-        config: Cip309ClientConfig,
+        config: Label309ClientConfig,
         transport: Box<dyn ClientTransport>,
     ) -> Result<Self, InvalidClientConfigError> {
         let base_url = strip_trailing_slash(&resolve_base_url(&config)?);

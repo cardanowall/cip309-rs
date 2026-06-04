@@ -1,7 +1,7 @@
-# Contributing to the CIP-309 Rust SDK
+# Contributing to the Label 309 Rust SDK
 
 Thank you for your interest in improving `cardanowall`, the Rust implementation
-of **CIP-309** — an open standard for **Proof of Existence (PoE)** anchored on
+of **Label 309** — an open standard for **Proof of Existence (PoE)** anchored on
 the Cardano blockchain.
 
 This crate is **pre-1.0**. It is a **byte-parity twin** of the TypeScript and
@@ -16,17 +16,17 @@ All contributions are made under the terms in [Licensing](#licensing) and the
 
 ## What belongs in this repository
 
-This repository is the **Rust SDK** for CIP-309. Bug fixes, performance work,
+This repository is the **Rust SDK** for Label 309. Bug fixes, performance work,
 new SDK surface, and Rust-specific issues belong here.
 
 What does **not** belong here:
 
 - **Changes to the wire format, grammar, schemas, registries, or the
-  conformance vectors** belong in the `cip309` standard repository. The vectors
+  conformance vectors** belong in the `label-309` standard repository. The vectors
   are authoritative; a divergence between this crate and a vector is a bug in
   the crate, not the vector.
-- **Issues in another implementation** belong in its repository — `cip309-ts`
-  (npm), `cip309-py` (PyPI), or `cip309-cli` (the command-line tool).
+- **Issues in another implementation** belong in its repository — `label-309-ts`
+  (npm), `label-309-py` (PyPI), or `label-309-cli` (the command-line tool).
 
 If you are unsure, open an issue here and ask.
 
@@ -48,11 +48,11 @@ CI runs exactly these. A pull request must pass all four.
 
 ### Conformance and byte-parity
 
-Cross-implementation **byte-parity** is a core guarantee of CIP-309. The vectors
+Cross-implementation **byte-parity** is a core guarantee of Label 309. The vectors
 in `tests/fixtures/` are byte-identical to those the TypeScript and Python SDKs
 load. Do not edit a vector to make a test pass: a vector mismatch means this
 crate diverged from the standard. If you believe a vector itself is wrong, raise
-it in the `cip309` standard repository — the vectors live there canonically.
+it in the `label-309` standard repository — the vectors live there canonically.
 
 ---
 

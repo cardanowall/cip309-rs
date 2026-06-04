@@ -36,7 +36,7 @@ pub enum ResolveError {
     /// A definitive "this tx carries no PoE record" response from a gateway.
     /// Maps to verdict `failed` / exit 1.
     #[error("NOT_A_CARDANOWALL_RECORD: {0}")]
-    NotACip309Record(String),
+    NotALabel309Record(String),
     /// A service-independence (deny-host) violation. Maps to verdict `failed` /
     /// exit 1.
     #[error("SERVICE_INDEPENDENCE_VIOLATION: {0}")]
@@ -75,7 +75,7 @@ pub fn resolve_cardano_tx(
     for koios_url in chain {
         match resolve_via_koios(tx_hash, koios_url, fetcher) {
             Ok(resolved) => return Ok(resolved),
-            Err(e @ ResolveError::NotACip309Record(_))
+            Err(e @ ResolveError::NotALabel309Record(_))
             | Err(e @ ResolveError::ServiceIndependence(_)) => return Err(e),
             Err(ResolveError::ProviderUnavailable(msg)) => last_err = Some(msg),
         }
@@ -84,7 +84,7 @@ pub fn resolve_cardano_tx(
     if let Some(project_id) = blockfrost_project_id {
         match resolve_via_blockfrost(tx_hash, project_id, fetcher) {
             Ok(resolved) => return Ok(resolved),
-            Err(e @ ResolveError::NotACip309Record(_))
+            Err(e @ ResolveError::NotALabel309Record(_))
             | Err(e @ ResolveError::ServiceIndependence(_)) => return Err(e),
             Err(ResolveError::ProviderUnavailable(msg)) => last_err = Some(msg),
         }
@@ -136,12 +136,12 @@ fn resolve_via_koios(
     }
     let cbor_json = parse_json(&cbor_res.bytes)?;
     let arr = cbor_json.as_array().ok_or_else(|| {
-        ResolveError::NotACip309Record(
+        ResolveError::NotALabel309Record(
             "koios returned empty array for tx_cbor; tx may not exist".to_string(),
         )
     })?;
     if arr.is_empty() {
-        return Err(ResolveError::NotACip309Record(
+        return Err(ResolveError::NotALabel309Record(
             "koios returned empty array for tx_cbor; tx may not exist".to_string(),
         ));
     }
@@ -174,10 +174,10 @@ fn resolve_via_koios(
     }
     let info_json = parse_json(&info_res.bytes)?;
     let info_arr = info_json.as_array().ok_or_else(|| {
-        ResolveError::NotACip309Record("koios returned empty array for tx_info".to_string())
+        ResolveError::NotALabel309Record("koios returned empty array for tx_info".to_string())
     })?;
     if info_arr.is_empty() {
-        return Err(ResolveError::NotACip309Record(
+        return Err(ResolveError::NotALabel309Record(
             "koios returned empty array for tx_info".to_string(),
         ));
     }

@@ -106,7 +106,7 @@ impl<'t> RecordsNamespace<'t> {
         decode(&response.body)
     }
 
-    /// Run the canonical CIP-309 verifier against the record at `tx_hash`.
+    /// Run the canonical Label 309 verifier against the record at `tx_hash`.
     ///
     /// Returns the verify report as a JSON value. The report is the serialized
     /// `VerifyReport` the standalone verifier emits — the gateway returns it

@@ -551,7 +551,7 @@ fn provider_unavailable_when_gateway_errors() {
 
 #[test]
 fn core_profile_skips_signed_record_with_out_of_profile_info() {
-    use cardanowall::cose::{cose_sign1_cip309_build, Cip309Signer, CoseHeader};
+    use cardanowall::cose::{cose_sign1_label309_build, CoseHeader, Label309Signer};
     use cardanowall::poe_standard::{
         chunk_bytes, encode_record_body_for_signing, ItemEntry, PoeRecord, SigEntry,
     };
@@ -579,11 +579,11 @@ fn core_profile_skips_signed_record_with_out_of_profile_info() {
     let protected = CoseHeader::new()
         .with_int(1, cardanowall::cbor::CborValue::int(-8))
         .with_int(4, cardanowall::cbor::CborValue::bytes(pubkey.to_vec()));
-    let cose = cose_sign1_cip309_build(
+    let cose = cose_sign1_label309_build(
         &protected,
         &CoseHeader::new(),
         &body,
-        Cip309Signer::Seed(&identity.secret_key),
+        Label309Signer::Seed(&identity.secret_key),
     )
     .unwrap();
     record.sigs = Some(vec![SigEntry {

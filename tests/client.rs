@@ -13,9 +13,9 @@ mod common;
 use std::sync::Mutex;
 
 use cardanowall::client::{
-    parse_http_error, AccountBalance, Cip309Client, Cip309ClientConfig, Cip309HttpError,
-    ClientError, ClientResponse, ClientTransport, HttpErrorKind, InvalidClientConfigError,
-    MerkleLeaf, ParseHttpErrorArgs, PoeVerifyInput, PublishBatchEntry, PublishBatchInput,
+    parse_http_error, AccountBalance, ClientError, ClientResponse, ClientTransport, HttpErrorKind,
+    InvalidClientConfigError, Label309Client, Label309ClientConfig, Label309HttpError, MerkleLeaf,
+    ParseHttpErrorArgs, PoeVerifyInput, PublishBatchEntry, PublishBatchInput,
     PublishBatchResultEntry, PublishContentInput, PublishInput, PublishMerkleInput,
     PublishPrehashedInput, PublishSealedInput, QuoteInput, RecordSignature, RecordsListInput,
     RequestBody, ResponseHeaders, SealedKemChoice, Signer, SignerError, SupportedHashAlg,
@@ -192,10 +192,10 @@ fn client_with(
     base_url: &str,
     api_key: Option<&str>,
     transport: Box<MockTransport>,
-) -> (Cip309Client, *const MockTransport) {
+) -> (Label309Client, *const MockTransport) {
     let ptr: *const MockTransport = transport.as_ref();
-    let client = Cip309Client::with_transport(
-        Cip309ClientConfig {
+    let client = Label309Client::with_transport(
+        Label309ClientConfig {
             api_key: api_key.map(str::to_string),
             base_url: Some(base_url.to_string()),
         },

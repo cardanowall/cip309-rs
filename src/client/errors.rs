@@ -18,7 +18,7 @@
 //! plus any RFC 7807 §3.2 extension members (`balance_usd_micros`,
 //! `required_usd_micros`, `top_up_url`, …). The `code` is the primary dispatch
 //! key: [`parse_http_error`] maps each registered code to a specific
-//! [`Cip309HttpError`] variant that projects the relevant extension members onto
+//! [`Label309HttpError`] variant that projects the relevant extension members onto
 //! typed fields, and falls back to [`HttpErrorKind::Other`] (carrying the
 //! verbatim document) for any code it does not recognise.
 
@@ -129,12 +129,12 @@ impl ProblemDetails {
 // Typed error catalogue
 // ---------------------------------------------------------------------------
 
-/// The discriminated kind of a [`Cip309HttpError`], keyed on the RFC 7807
+/// The discriminated kind of a [`Label309HttpError`], keyed on the RFC 7807
 /// `code`.
 ///
 /// Each variant carries only the code-specific projected fields; the shared
 /// `problem` document, `request_id`, and `retry_after_seconds` live on the
-/// owning [`Cip309HttpError`] so they are not duplicated per variant. An
+/// owning [`Label309HttpError`] so they are not duplicated per variant. An
 /// unrecognised code becomes [`HttpErrorKind::Other`], keeping the verbatim
 /// document available so a newer gateway never breaks an older client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +177,7 @@ pub enum HttpErrorKind {
     },
     /// 404 — generic missing-resource response.
     NotFound,
-    /// 404 — no CIP-309 record is registered for the requested tx hash.
+    /// 404 — no Label 309 record is registered for the requested tx hash.
     RecordNotFound,
     /// 409 — the `Idempotency-Key` was reused with a different body.
     IdempotencyConflict,
@@ -216,7 +216,7 @@ pub enum HttpErrorKind {
 /// [`kind`](Self::kind).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{}", .problem.message())]
-pub struct Cip309HttpError {
+pub struct Label309HttpError {
     /// The verbatim RFC 7807 problem document.
     pub problem: ProblemDetails,
     /// `X-Request-Id` header, or the in-body `trace_id` fallback.
@@ -227,7 +227,7 @@ pub struct Cip309HttpError {
     pub kind: HttpErrorKind,
 }
 
-impl Cip309HttpError {
+impl Label309HttpError {
     /// The RFC 7807 problem document carried by this error.
     #[must_use]
     pub fn problem(&self) -> &ProblemDetails {
@@ -395,14 +395,14 @@ fn to_problem_details(
     }
 }
 
-/// Decode an RFC 7807 response into the most-specific [`Cip309HttpError`]
+/// Decode an RFC 7807 response into the most-specific [`Label309HttpError`]
 /// variant.
 ///
 /// Dispatch is on the problem `code` (mapping `forbidden` + `csrf-invalid` to
 /// [`HttpErrorKind::Forbidden`]); an unrecognised code falls through to
 /// [`HttpErrorKind::Other`] with the verbatim document.
 #[must_use]
-pub fn parse_http_error(args: ParseHttpErrorArgs) -> Cip309HttpError {
+pub fn parse_http_error(args: ParseHttpErrorArgs) -> Label309HttpError {
     let problem = to_problem_details(
         args.http_status,
         args.body.as_ref(),
@@ -457,7 +457,7 @@ pub fn parse_http_error(args: ParseHttpErrorArgs) -> Cip309HttpError {
         _ => HttpErrorKind::Other,
     };
 
-    Cip309HttpError {
+    Label309HttpError {
         problem,
         request_id,
         retry_after_seconds,

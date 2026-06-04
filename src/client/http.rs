@@ -2,23 +2,23 @@
 //!
 //! The three namespaces (`poe`, `records`, `account`) and the publish helpers
 //! all build the same auth/content headers, parse the JSON body the same way,
-//! and raise the same typed [`Cip309HttpError`] on a non-2xx response. That
+//! and raise the same typed [`Label309HttpError`] on a non-2xx response. That
 //! logic lives here once.
 
-use crate::client::errors::{parse_http_error, Cip309HttpError, ParseHttpErrorArgs};
+use crate::client::errors::{parse_http_error, Label309HttpError, ParseHttpErrorArgs};
 use crate::client::transport::{ClientResponse, ClientTransport, RequestBody};
 use crate::verifier::fetch::{HttpMethod, OutboundError};
 
 /// The error a namespace call returns: a typed HTTP error from the gateway, or a
 /// transport/egress failure.
 ///
-/// The [`Cip309HttpError`] is boxed because it carries the full RFC 7807
+/// The [`Label309HttpError`] is boxed because it carries the full RFC 7807
 /// document; the box keeps `Result<T, ClientError>` small on the success path.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// A typed RFC 7807 error from the gateway (non-2xx response).
     #[error(transparent)]
-    Http(#[from] Box<Cip309HttpError>),
+    Http(#[from] Box<Label309HttpError>),
     /// An outbound egress failure (deny-host, protocol/method, over-cap body, or
     /// a transport error).
     #[error(transparent)]

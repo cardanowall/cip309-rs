@@ -312,7 +312,7 @@ fn record_to_value(record: &PoeRecord) -> Value {
 ///
 /// Byte strings become lowercase hex; map keys are stringified (text keys
 /// verbatim, integer keys as their decimal form); integers and booleans pass
-/// through. A CIP-309 record carries no floats, so none arise here.
+/// through. A Label 309 record carries no floats, so none arise here.
 fn cbor_to_value(value: &CborValue) -> Value {
     match value {
         CborValue::Unsigned(n) => Value::from(*n),

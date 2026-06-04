@@ -379,9 +379,9 @@ mod tests {
         let derived = derive_ed25519_keypair(&seed).unwrap();
         assert_eq!(signer.signer_pubkey(), derived.public_key.to_vec());
         // The signature is a deterministic 64 bytes over the message.
-        let sig = signer.sign(b"cip-309 sig structure").unwrap();
+        let sig = signer.sign(b"label-309 sig structure").unwrap();
         assert_eq!(sig.len(), 64);
-        let sig2 = signer.sign(b"cip-309 sig structure").unwrap();
+        let sig2 = signer.sign(b"label-309 sig structure").unwrap();
         assert_eq!(sig, sig2);
     }
 

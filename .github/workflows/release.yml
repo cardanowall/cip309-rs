@@ -12,7 +12,7 @@ name: release
 #      the `cardanowall` crate (crates.io → crate → Settings → Trusted Publishing)
 #      with these EXACT fields:
 #         Owner             : cardanowall
-#         Repository        : cip309-rs
+#         Repository        : label-309-rs
 #         Workflow filename : release.yml
 #      crates.io has NO organizations — ownership is per-crate. Then clear the
 #      CARGO_REGISTRY_TOKEN secret; the crates-io-auth-action step below mints a
@@ -106,7 +106,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: 'CIP-309 Rust SDK ${{ github.ref_name }}'
+          name: 'Label 309 Rust SDK ${{ github.ref_name }}'
           generate_release_notes: true
           draft: false
           prerelease: ${{ steps.prerelease.outputs.is_prerelease }}

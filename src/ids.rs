@@ -20,12 +20,12 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 /// base32 symbols (130 bits with 2 trailing zero-pad bits).
 pub const CROCKFORD_ENCODED_LENGTH_FOR_UUID: usize = 26;
 
-/// The proof-of-existence record id prefix the CIP-309 standard defines.
+/// The proof-of-existence record id prefix the Label 309 standard defines.
 ///
 /// The byte-level encode/decode helpers take an arbitrary prefix string, so any
 /// gateway can mint Stripe-style `<prefix>_<base32>` ids for its own resource
 /// types without an SDK bump. `poe` is the single prefix the standard itself
-/// defines — the one prefixed id every CIP-309 record carries.
+/// defines — the one prefixed id every Label 309 record carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdPrefix {
     /// Proof-of-existence record id (`poe_…`).

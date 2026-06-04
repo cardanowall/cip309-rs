@@ -1,4 +1,4 @@
-//! CIP-309 record-level signature verification.
+//! Label 309 record-level signature verification.
 //!
 //! One verification per `record.sigs[i]`. The signed payload is
 //! `utf8("cardano-poe-record-sig-v1") || canonical_cbor(record_body_without_sigs)`;
@@ -19,7 +19,7 @@ use subtle::ConstantTimeEq;
 
 use crate::cbor::CborValue;
 use crate::cose::{
-    cose_sign1_cip309_verify, decode_cose_sign1, parse_cose_key_ed25519, CoseSign1Decoded,
+    cose_sign1_label309_verify, decode_cose_sign1, parse_cose_key_ed25519, CoseSign1Decoded,
     CoseVerifyErrorCode, CoseVerifyResult,
 };
 use crate::poe_standard::{
@@ -81,7 +81,7 @@ fn verify_one(
         }
     };
 
-    // A detached (CIP-309) signature MUST carry a null payload; an attached
+    // A detached (Label 309) signature MUST carry a null payload; an attached
     // payload — including a zero-length byte string — is malformed.
     if cose.payload.is_some() {
         return SignatureCheck {
@@ -116,7 +116,7 @@ fn verify_one(
     };
 
     // Strict Ed25519 verify (the helper also handles CIP-8 hashed mode).
-    let verify_result = cose_sign1_cip309_verify(&cose_bytes, record_body, Some(&pub_key));
+    let verify_result = cose_sign1_label309_verify(&cose_bytes, record_body, Some(&pub_key));
     match verify_result {
         CoseVerifyResult::Ok { .. } => {}
         CoseVerifyResult::Err(code) => {

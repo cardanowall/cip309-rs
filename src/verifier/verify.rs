@@ -1,4 +1,4 @@
-//! The CIP-309 standalone verifier entry point.
+//! The Label 309 standalone verifier entry point.
 //!
 //! `verify_tx` runs the pipeline sequentially; the verdict is the worst outcome
 //! across the stages:
@@ -28,7 +28,7 @@ use crate::verifier::types::{
     VerifierIssue, VerifyReport, VerifyTxInput, NETWORK_CARDANO_MAINNET,
 };
 
-/// Verify a Cardano transaction's CIP-309 record and produce a [`VerifyReport`].
+/// Verify a Cardano transaction's Label 309 record and produce a [`VerifyReport`].
 ///
 /// Routes every outbound call through `input.fetch_outbound` (or the default
 /// reqwest transport when absent), so the report's `http_calls` audit and its
@@ -291,7 +291,7 @@ fn resolve_failure_report(
     error: &ResolveError,
 ) -> VerifyReport {
     let (exit_code, code) = match error {
-        ResolveError::NotACip309Record(_) => (ExitCode::Integrity, ErrorCode::MetadataNotFound),
+        ResolveError::NotALabel309Record(_) => (ExitCode::Integrity, ErrorCode::MetadataNotFound),
         ResolveError::ServiceIndependence(_) => {
             (ExitCode::Integrity, ErrorCode::ServiceIndependenceViolation)
         }
@@ -311,7 +311,7 @@ fn resolve_failure_report(
 
 fn error_message(error: &ResolveError) -> String {
     match error {
-        ResolveError::NotACip309Record(m)
+        ResolveError::NotALabel309Record(m)
         | ResolveError::ServiceIndependence(m)
         | ResolveError::ProviderUnavailable(m) => m.clone(),
     }

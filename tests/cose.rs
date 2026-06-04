@@ -9,7 +9,7 @@
 //! - `sig/ed25519-zip215.json` — strict-verify (`zip215: false`) accept/reject.
 //! - `cose/sig-structure.json` — RFC 9052 §4.4 Sig_structure byte layout.
 //! - `cose/sign1-build.json` — full COSE_Sign1 build (RFC general form +
-//!   CIP-309 record signatures) → exact bytes.
+//!   Label 309 record signatures) → exact bytes.
 //! - `cose/sign1-verify.json` — COSE_Sign1 verify accept/reject by error code.
 //! - `cose/sign1-strict-ed25519.json` — strict-Ed25519 rejection within COSE.
 //!
@@ -22,11 +22,11 @@ mod common;
 
 use cardanowall::cbor::{encode_canonical_cbor, CborValue};
 use cardanowall::cose::{
-    build_cip309_sig_structure, build_sig_structure, cose_sign1_cip309_assemble,
-    cose_sign1_cip309_build, cose_sign1_cip309_prepare, cose_sign1_cip309_verify,
+    build_label309_sig_structure, build_sig_structure, cose_sign1_label309_assemble,
+    cose_sign1_label309_build, cose_sign1_label309_prepare, cose_sign1_label309_verify,
     decode_cose_sign1, ed25519_public_key_from_seed, ed25519_sign, ed25519_verify,
-    encode_cose_sign1, parse_cose_key_ed25519, Cip309Signer, CoseHeader, CoseVerifyErrorCode,
-    CoseVerifyResult, CARDANO_POE_SIG_DOMAIN_PREFIX,
+    encode_cose_sign1, parse_cose_key_ed25519, CoseHeader, CoseVerifyErrorCode, CoseVerifyResult,
+    Label309Signer, CARDANO_POE_SIG_DOMAIN_PREFIX,
 };
 use cardanowall::hex;
 use serde_json::Value;
@@ -51,7 +51,7 @@ fn vectors<'a>(corpus: &'a Value, key: &str) -> &'a Vec<Value> {
     corpus[key].as_array().expect("fixture array")
 }
 
-/// Build a CIP-309 path-1 protected header `{1: -8, 4: <32B pubkey>}`.
+/// Build a Label 309 path-1 protected header `{1: -8, 4: <32B pubkey>}`.
 fn protected_header_with_kid(pubkey: &[u8]) -> CoseHeader {
     CoseHeader::new()
         .with_int(1, CborValue::int(-8))
@@ -256,11 +256,11 @@ fn cose_sign1_build_general_rfc_vectors() {
 }
 
 #[test]
-fn cose_sign1_cip309_build_and_sig_structure_vectors() {
+fn cose_sign1_label309_build_and_sig_structure_vectors() {
     let corpus = load("cose/sign1-build.json");
     let vs = vectors(&corpus, "cardano_poe_vectors");
     assert_eq!(vs.len(), 4, "cardano_poe build corpus size");
-    let mut cip309_count = 0usize;
+    let mut label309_count = 0usize;
     for v in vs {
         let name = s(&v["name"]);
         let pubkey = h(s(&v["signer_public_key_hex"]));
@@ -270,7 +270,7 @@ fn cose_sign1_cip309_build_and_sig_structure_vectors() {
 
         // Sig_structure byte-pin.
         let protected_bytes = encode_canonical_cbor(&protected.to_cbor()).unwrap();
-        let sig_structure = build_cip309_sig_structure(&protected_bytes, &body);
+        let sig_structure = build_label309_sig_structure(&protected_bytes, &body);
         assert_eq!(
             hex::encode(&sig_structure),
             s(&v["expected_sig_structure_hex"]),
@@ -281,11 +281,11 @@ fn cose_sign1_cip309_build_and_sig_structure_vectors() {
         assert_eq!(sig_structure[52], 0x40, "{name}: external_aad is h''");
 
         // Seed path → full COSE_Sign1 byte-pin.
-        let cose = cose_sign1_cip309_build(
+        let cose = cose_sign1_label309_build(
             &protected,
             &CoseHeader::new(),
             &body,
-            Cip309Signer::Seed(&seed),
+            Label309Signer::Seed(&seed),
         )
         .unwrap();
         assert_eq!(
@@ -300,18 +300,18 @@ fn cose_sign1_cip309_build_and_sig_structure_vectors() {
             assert_eq!(hex::encode(&signature), expected_sig, "{name}: signature");
         }
 
-        if name.starts_with("cip309-") {
-            cip309_count += 1;
+        if name.starts_with("label309-") {
+            label309_count += 1;
         }
     }
     assert!(
-        cip309_count >= 3,
-        "cross-SDK parity gate: at least 3 cip309-* vectors, got {cip309_count}"
+        label309_count >= 3,
+        "cross-SDK parity gate: at least 3 label309-* vectors, got {label309_count}"
     );
 }
 
 #[test]
-fn cose_sign1_cip309_build_signer_closure_path_is_byte_identical() {
+fn cose_sign1_label309_build_signer_closure_path_is_byte_identical() {
     let corpus = load("cose/sign1-build.json");
     for v in vectors(&corpus, "cardano_poe_vectors") {
         let name = s(&v["name"]);
@@ -327,11 +327,11 @@ fn cose_sign1_cip309_build_signer_closure_path_is_byte_identical() {
             captured.borrow_mut().push(sig_structure.to_vec());
             ed25519_sign(&seed, sig_structure).to_vec()
         };
-        let cose = cose_sign1_cip309_build(
+        let cose = cose_sign1_label309_build(
             &protected,
             &CoseHeader::new(),
             &body,
-            Cip309Signer::Closure(&closure),
+            Label309Signer::Closure(&closure),
         )
         .unwrap();
         assert_eq!(
@@ -350,7 +350,7 @@ fn cose_sign1_cip309_build_signer_closure_path_is_byte_identical() {
 }
 
 #[test]
-fn cose_sign1_cip309_build_rejects_bad_signer() {
+fn cose_sign1_label309_build_rejects_bad_signer() {
     let corpus = load("cose/sign1-build.json");
     let v = &vectors(&corpus, "cardano_poe_vectors")[0];
     let pubkey = h(s(&v["signer_public_key_hex"]));
@@ -360,11 +360,11 @@ fn cose_sign1_cip309_build_rejects_bad_signer() {
     // A closure that returns a 63-byte value is rejected as SIGNER_NOT_PROVIDED
     // (the twins reuse that code for the bad-length case).
     let short = |_: &[u8]| -> Vec<u8> { vec![0u8; 63] };
-    let err = cose_sign1_cip309_build(
+    let err = cose_sign1_label309_build(
         &protected,
         &CoseHeader::new(),
         &body,
-        Cip309Signer::Closure(&short),
+        Label309Signer::Closure(&short),
     )
     .unwrap_err();
     assert_eq!(err.code(), "SIGNER_NOT_PROVIDED");
@@ -375,7 +375,7 @@ fn cose_sign1_cip309_build_rejects_bad_signer() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cip309_prepare_assemble_reproduces_build_bytes() {
+fn label309_prepare_assemble_reproduces_build_bytes() {
     let corpus = load("cose/sign1-build.json");
     for v in vectors(&corpus, "cardano_poe_vectors") {
         let name = s(&v["name"]);
@@ -385,7 +385,7 @@ fn cip309_prepare_assemble_reproduces_build_bytes() {
         let protected = protected_header_with_kid(&pubkey);
 
         // prepare → exact bytes the external signer signs (== the build Sig_structure).
-        let prepared = cose_sign1_cip309_prepare(&protected, &CoseHeader::new(), &body).unwrap();
+        let prepared = cose_sign1_label309_prepare(&protected, &CoseHeader::new(), &body).unwrap();
         assert_eq!(
             hex::encode(&prepared.sig_structure),
             s(&v["expected_sig_structure_hex"]),
@@ -394,7 +394,7 @@ fn cip309_prepare_assemble_reproduces_build_bytes() {
 
         // External signer signs those bytes; assemble folds in the signature.
         let signature = ed25519_sign(&seed, &prepared.sig_structure);
-        let cose = cose_sign1_cip309_assemble(&prepared, &signature).unwrap();
+        let cose = cose_sign1_label309_assemble(&prepared, &signature).unwrap();
         assert_eq!(
             hex::encode(&cose),
             s(&v["expected_cose_sign1_hex"]),
@@ -404,11 +404,11 @@ fn cip309_prepare_assemble_reproduces_build_bytes() {
 }
 
 #[test]
-fn cip309_assemble_rejects_non_64_byte_signature() {
+fn label309_assemble_rejects_non_64_byte_signature() {
     let protected = protected_header_with_kid(&[0xab; 32]);
     let prepared =
-        cose_sign1_cip309_prepare(&protected, &CoseHeader::new(), &h("a16161182a")).unwrap();
-    let err = cose_sign1_cip309_assemble(&prepared, &[0u8; 63]).unwrap_err();
+        cose_sign1_label309_prepare(&protected, &CoseHeader::new(), &h("a16161182a")).unwrap();
+    let err = cose_sign1_label309_assemble(&prepared, &[0u8; 63]).unwrap_err();
     assert_eq!(err.code(), "SIGNER_NOT_PROVIDED");
 }
 
@@ -447,7 +447,7 @@ fn assert_verify_result(result: &CoseVerifyResult, expected: &Value, name: &str)
 
 /// The `sign1-verify.json` general vectors carry an attached payload, so the
 /// reference verifies them via `cose_sign1_verify` (external_aad arg, attached
-/// or detached payload). The Rust CIP-309 verifier mandates a detached payload,
+/// or detached payload). The Rust Label 309 verifier mandates a detached payload,
 /// so reproduce the general RFC 9052 verify here over the same primitives.
 fn verify_general(v: &Value) -> CoseVerifyResult {
     let message = h(s(&v["message_hex"]));
@@ -504,7 +504,7 @@ fn cose_sign1_verify_general_rfc_corpus() {
 }
 
 #[test]
-fn cose_sign1_cip309_verify_corpus() {
+fn cose_sign1_label309_verify_corpus() {
     let corpus = load("cose/sign1-verify.json");
     let vs = vectors(&corpus, "cardano_poe_vectors");
     assert_eq!(vs.len(), 4, "cardano_poe verify corpus size");
@@ -514,7 +514,7 @@ fn cose_sign1_cip309_verify_corpus() {
             .get("expected_signer_key_hex")
             .and_then(Value::as_str)
             .map(h);
-        let result = cose_sign1_cip309_verify(
+        let result = cose_sign1_label309_verify(
             &h(s(&v["message_hex"])),
             &h(s(&v["detached_record_body_cbor_hex"])),
             expected_signer_key.as_deref(),
@@ -556,14 +556,14 @@ fn cose_sign1_strict_ed25519_low_order_within_cose() {
 }
 
 #[test]
-fn cose_sign1_cip309_verify_rejects_mutated_body() {
+fn cose_sign1_label309_verify_rejects_mutated_body() {
     let corpus = load("cose/sign1-build.json");
     for v in vectors(&corpus, "cardano_poe_vectors") {
         let name = s(&v["name"]);
         let mut body = h(s(&v["record_body_cbor_hex"]));
         let last = body.len() - 1;
         body[last] ^= 0xff;
-        let result = cose_sign1_cip309_verify(&h(s(&v["expected_cose_sign1_hex"])), &body, None);
+        let result = cose_sign1_label309_verify(&h(s(&v["expected_cose_sign1_hex"])), &body, None);
         match result {
             CoseVerifyResult::Err(code) => {
                 assert_eq!(code.code(), "SIGNATURE_INVALID", "{name}");
@@ -612,7 +612,7 @@ fn detached_round_trips_and_decode_is_byte_stable() {
         let name = s(&v["name"]);
         let cose = h(s(&v["expected_cose_sign1_hex"]));
         let decoded = decode_cose_sign1(&cose).unwrap();
-        // CIP-309 records carry a detached (null) payload.
+        // Label 309 records carry a detached (null) payload.
         assert!(decoded.payload.is_none(), "{name}: payload is detached");
         // The protected header decodes to {1:-8, 4:<32B>}; re-encoding the whole
         // COSE_Sign1 from the decoded parts reproduces the original bytes.
@@ -675,7 +675,7 @@ fn hashed_mode_accept_and_negatives() {
 
         // Accept a valid hashed-mode COSE_Sign1.
         let hashed_cose = build_hashed_mode_cose(&pubkey, &seed, &body);
-        let ok = cose_sign1_cip309_verify(&hashed_cose, &body, None);
+        let ok = cose_sign1_label309_verify(&hashed_cose, &body, None);
         assert!(ok.is_ok(), "{name}: valid hashed-mode accepted");
 
         // Reject when the "hashed" flag is stripped (verifier then expects the
@@ -688,7 +688,7 @@ fn hashed_mode_accept_and_negatives() {
         let sig_structure = build_sig_structure(&protected_bytes, &[], &digest);
         let signature = ed25519_sign(&seed, &sig_structure);
         let stripped = encode_cose_sign1(&protected, &CoseHeader::new(), None, &signature).unwrap();
-        let res = cose_sign1_cip309_verify(&stripped, &body, None);
+        let res = cose_sign1_label309_verify(&stripped, &body, None);
         match res {
             CoseVerifyResult::Err(code) => {
                 assert_eq!(code.code(), "SIGNATURE_INVALID", "{name}: flag stripped");
@@ -704,19 +704,19 @@ fn hashed_mode_accept_and_negatives() {
             &[0xab; 64],
         )
         .unwrap();
-        let res = cose_sign1_cip309_verify(&bogus, &body, None);
+        let res = cose_sign1_label309_verify(&bogus, &body, None);
         assert!(!res.is_ok(), "{name}: bogus hashed signature rejected");
 
         // Non-hashed path remains accepted unchanged.
-        let plain = cose_sign1_cip309_build(
+        let plain = cose_sign1_label309_build(
             &protected,
             &CoseHeader::new(),
             &body,
-            Cip309Signer::Seed(&seed),
+            Label309Signer::Seed(&seed),
         )
         .unwrap();
         assert!(
-            cose_sign1_cip309_verify(&plain, &body, None).is_ok(),
+            cose_sign1_label309_verify(&plain, &body, None).is_ok(),
             "{name}: non-hashed path unchanged"
         );
     }
@@ -786,9 +786,9 @@ fn integer_header_label_beyond_i64_range_verifies_like_the_reference() {
             "protected header bytes match the reference"
         );
 
-        // Sign the CIP-309 Sig_structure over the verbatim protected bytes, then
+        // Sign the Label 309 Sig_structure over the verbatim protected bytes, then
         // assemble the detached-payload COSE_Sign1 the same way the reference does.
-        let sig_structure = build_cip309_sig_structure(&protected_bytes, &body);
+        let sig_structure = build_label309_sig_structure(&protected_bytes, &body);
         let signature = ed25519_sign(&seed, &sig_structure);
         let cose = CborValue::Array(vec![
             CborValue::bytes(protected_bytes.clone()),
@@ -810,7 +810,7 @@ fn integer_header_label_beyond_i64_range_verifies_like_the_reference() {
         assert_eq!(decoded.protected_header.alg(), Some(-8));
         assert_eq!(decoded.protected_header.kid(), Some(pubkey));
 
-        let result = cose_sign1_cip309_verify(&cose_bytes, &body, None);
+        let result = cose_sign1_label309_verify(&cose_bytes, &body, None);
         match result {
             CoseVerifyResult::Ok { signer_key, alg } => {
                 assert_eq!(signer_key, pubkey, "signer key");

@@ -8,7 +8,7 @@ TS KAT (`*.kat.test.ts`) and the Python KAT (`test_*.py`) tests; divergence betw
 two implementations is caught by the repository's parity check.
 
 The KAT vectors and the cross-implementation parity contract are specified by the
-CIP-309 conformance test-vector corpus.
+Label 309 conformance test-vector corpus.
 
 ## Layout
 
@@ -46,7 +46,7 @@ check.
 ## Editing an existing fixture
 
 Fixtures are byte-pinned. Any edit requires a corresponding amendment to the
-CIP-309 conformance test-vector corpus. PRs that change a fixture without a matching
+Label 309 conformance test-vector corpus. PRs that change a fixture without a matching
 spec edit are review-blocked.
 
 ## TS-only carve-outs

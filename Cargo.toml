@@ -1,15 +1,15 @@
 [package]
 name = "cardanowall"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["CardanoWall <hello@cardanowall.com>"]
-description = "Rust SDK for the CIP-309 Proof-of-Existence standard."
-repository = "https://github.com/cardanowall/cip309-rs"
-homepage = "https://github.com/cardanowall/cip309-rs"
+description = "Rust SDK for the Label 309 Proof-of-Existence standard."
+repository = "https://github.com/cardanowall/label-309-rs"
+homepage = "https://github.com/cardanowall/label-309-rs"
 documentation = "https://docs.rs/cardanowall"
 readme = "README.md"
-keywords = ["cardano", "cip-309", "proof-of-existence", "verifier", "sdk"]
+keywords = ["cardano", "label-309", "proof-of-existence", "verifier", "sdk"]
 categories = ["cryptography", "api-bindings"]
 
 # Standalone crate: this lives inside a JavaScript/pnpm monorepo that has no

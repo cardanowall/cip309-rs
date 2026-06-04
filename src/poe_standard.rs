@@ -1,4 +1,4 @@
-//! CIP-309 v1 Proof-of-Existence record wire format.
+//! Label 309 v1 Proof-of-Existence record wire format.
 //!
 //! This module is the wire-format core: the typed record model, the canonical
 //! CBOR encoder, the structural validator, and the error-code catalogue. It is a
@@ -30,7 +30,7 @@ use crate::cbor::{decode_canonical_cbor, encode_canonical_cbor, CborValue};
 // Error-code catalogue
 // ===========================================================================
 
-/// One code from the CIP-309 validation error-code taxonomy.
+/// One code from the Label 309 validation error-code taxonomy.
 ///
 /// The variants split into two parts:
 ///
@@ -385,7 +385,7 @@ impl ErrorCode {
 // Record model
 // ===========================================================================
 
-/// A CIP-309 v1 Proof-of-Existence record (the encoder's input).
+/// A Label 309 v1 Proof-of-Existence record (the encoder's input).
 ///
 /// The base keys mirror the wire format: `v`, `crit`, `sigs`, `items`,
 /// `merkle`, `supersedes`. Every key not in that base set is an extension key,
@@ -1477,7 +1477,7 @@ fn validate_one_uri(chunks: &CborValue, issues: &mut Vec<ValidationIssue>) {
         if !is_valid_cid(cid) {
             issues.push(issue(
                 ErrorCode::InvalidUri,
-                "ipfs:// URI is not a valid CID under the CIP-309 profile".to_string(),
+                "ipfs:// URI is not a valid CID under the Label 309 profile".to_string(),
             ));
         }
     }

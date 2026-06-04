@@ -8,7 +8,7 @@
 //! - [`publish_prehashed`] — the caller already holds the digest(s).
 //! - [`publish_sealed`] — encrypt the content to the recipient public keys
 //!   (age-style sealed envelope), upload the ciphertext to Arweave via
-//!   `/uploads`, build a CIP-309 record with the resulting `ar://` URI, and
+//!   `/uploads`, build a Label 309 record with the resulting `ar://` URI, and
 //!   submit.
 //! - [`publish_merkle`] — commit N leaf hashes under one RFC 9162 root, upload
 //!   the canonical leaves-list to Arweave, and bind the root + leaf count.

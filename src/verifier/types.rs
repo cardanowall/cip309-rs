@@ -1,4 +1,4 @@
-//! Public types for the CIP-309 standalone verifier.
+//! Public types for the Label 309 standalone verifier.
 //!
 //! The verifier is service-independent: it reads a Cardano transaction's
 //! label-309 metadata, validates the record structurally, and runs profile-gated
@@ -19,7 +19,7 @@ pub use crate::verifier::fetch::{
 
 /// The wire-canonical network identifier surfaced on every report.
 ///
-/// CIP-309 product policy is Cardano mainnet only; the value is fixed so a
+/// Label 309 product policy is Cardano mainnet only; the value is fixed so a
 /// downstream consumer never has to infer which network a record was anchored
 /// on. The `cardano_network` input governs only path-2 stake-byte derivation and
 /// does not change this field.
@@ -475,7 +475,7 @@ impl UriFailureReason {
 /// One vkey witness on the carrying transaction.
 ///
 /// Distinct from a record-level [`SignatureCheck`]: this describes who authorised
-/// and paid for the anchoring transaction, not the optional CIP-309 authorship
+/// and paid for the anchoring transaction, not the optional Label 309 authorship
 /// claim. A failed `signature_valid` is INFORMATIONAL — it never changes the
 /// verifier's verdict (the content claim does not depend on who paid the fee).
 #[derive(Debug, Clone, PartialEq, Eq)]

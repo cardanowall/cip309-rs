@@ -64,7 +64,7 @@ import { describe, it } from 'vitest';
 import { encodeCanonicalCbor, type CanonicalCborValue } from '@cardanowall/crypto-core/cbor';
 import {
   CARDANO_POE_SIG_DOMAIN_PREFIX_BYTES,
-  coseSign1Cip309Build,
+  coseSign1Label309Build,
   parseCoseKeyEd25519,
   type CoseHeader,
 } from '@cardanowall/crypto-core/cose';
@@ -174,7 +174,7 @@ function buildSyntheticPositive(wallet: Wallet): PositiveFixture {
     [1, -8],
     ['address', stakeAddr],
   ]);
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader,
     unprotectedHeader: new Map(),
     recordBodyCbor,
@@ -246,7 +246,7 @@ function buildTamperedAddress(wallet: Wallet, positive: PositiveFixture): Tamper
     [1, -8],
     ['address', addressClaim],
   ]);
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader,
     unprotectedHeader: new Map(),
     recordBodyCbor,
@@ -301,7 +301,7 @@ function buildMissingAddress(wallet: Wallet, positive: PositiveFixture): Missing
   // `src/verifier/signatures.ts` collapses the missing-address case to
   // WALLET_ADDRESS_MISMATCH.
   const protectedHeader: CoseHeader = new Map<number | string, unknown>([[1, -8]]);
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader,
     unprotectedHeader: new Map(),
     recordBodyCbor,
@@ -362,7 +362,7 @@ function buildWrongNetworkHeader(
     [1, -8],
     ['address', addressClaim],
   ]);
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader,
     unprotectedHeader: new Map(),
     recordBodyCbor,

@@ -1,4 +1,4 @@
-// Regenerator for CIP-309-shaped fixtures consumed by canonical-cbor + COSE
+// Regenerator for Label 309-shaped fixtures consumed by canonical-cbor + COSE
 // KAT tests. Runs only when BUILD_FIXTURES=1 is set in the environment:
 //
 //   BUILD_FIXTURES=1 pnpm --filter @cardanowall/crypto-core exec vitest run _build-cose-fixtures
@@ -19,8 +19,8 @@ import { describe, it } from 'vitest';
 import { encodeCanonicalCbor, type CanonicalCborValue } from '../../src/cbor/canonical';
 import {
   CARDANO_POE_SIG_DOMAIN_PREFIX,
-  buildCip309SigStructure,
-  coseSign1Cip309Build,
+  buildLabel309SigStructure,
+  coseSign1Label309Build,
 } from '../../src/cose/sign1';
 import { signEd25519 } from '../../src/sig/ed25519';
 
@@ -115,7 +115,7 @@ function buildSigStructureFixture(): void {
       [4, SIGNER_PUBLIC_KEY],
     ]) as unknown as CanonicalCborValue,
   );
-  const sigStructure = buildCip309SigStructure({
+  const sigStructure = buildLabel309SigStructure({
     bodyProtectedBytes: protectedBytes,
     recordBodyCbor: bodyCbor,
   });
@@ -155,12 +155,12 @@ function buildSign1BuildFixture(): void {
       [4, SIGNER_PUBLIC_KEY],
     ]) as unknown as CanonicalCborValue,
   );
-  const sigStructure = buildCip309SigStructure({
+  const sigStructure = buildLabel309SigStructure({
     bodyProtectedBytes: protectedBytes,
     recordBodyCbor: bodyCbor,
   });
   const signature = signEd25519({ seed: SIGNER_SECRET_KEY, message: sigStructure });
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader: new Map<number | string, unknown>([
       [1, -8],
       [4, SIGNER_PUBLIC_KEY],
@@ -171,7 +171,7 @@ function buildSign1BuildFixture(): void {
   });
   const newVector = {
     name: 'cardano-poe-record-sig-v1-a2-in-signature-kid',
-    source: 'CIP-309 reference COSE_Sign1 vector',
+    source: 'Label 309 reference COSE_Sign1 vector',
     signer_secret_key_hex: bytesToHex(SIGNER_SECRET_KEY),
     signer_public_key_hex: bytesToHex(SIGNER_PUBLIC_KEY),
     protected_header_int_int_pairs: [[1, -8]] as Array<[number, number]>,
@@ -205,7 +205,7 @@ function buildSign1VerifyFixture(): void {
     cardano_poe_vectors: Array<Record<string, unknown>>;
   };
   const bodyCbor = encodeCanonicalCbor(A2_RECORD_BODY);
-  const cose = coseSign1Cip309Build({
+  const cose = coseSign1Label309Build({
     protectedHeader: new Map<number | string, unknown>([
       [1, -8],
       [4, SIGNER_PUBLIC_KEY],
@@ -227,7 +227,7 @@ function buildSign1VerifyFixture(): void {
 
 const SHOULD_BUILD = process.env['BUILD_FIXTURES'] === '1';
 
-describe('crypto-core CIP-309 fixture builder (BUILD_FIXTURES=1 to enable)', () => {
+describe('crypto-core Label 309 fixture builder (BUILD_FIXTURES=1 to enable)', () => {
   it.runIf(SHOULD_BUILD)('regenerates canonical + COSE fixtures', () => {
     buildCanonicalRoundtripFixture();
     buildSigStructureFixture();

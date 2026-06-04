@@ -163,7 +163,7 @@ form, etc.), the KAT test surfaces the regression as
 The reviewer either:
 
 1. Pushes the wallet vendor to fix and rolls back the wallet version; OR
-2. Amends CIP-309 to accommodate the new encoding (a normative spec
+2. Amends Label 309 to accommodate the new encoding (a normative spec
    change); OR
 3. Re-captures the positive fixture from the new wallet build using the
    protocol above, and re-runs `UPDATE=1` to regenerate the tamper variants

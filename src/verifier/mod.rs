@@ -1,6 +1,6 @@
 //! Public and recipient verifiers over Cardano transaction metadata.
 //!
-//! The verifier validates a CIP-309 record drawn from a Cardano transaction's
+//! The verifier validates a Label 309 record drawn from a Cardano transaction's
 //! metadata without trusting the publisher, the operator, or any issuer server.
 //! A record must verify only from the transaction bytes, an optional copy of the
 //! content, and a public blockchain explorer.

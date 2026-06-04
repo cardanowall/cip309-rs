@@ -1,4 +1,4 @@
-//! CIP-309 v1 off-host signing helper.
+//! Label 309 v1 off-host signing helper.
 //!
 //! The signing key never enters this module: it touches only public data — the
 //! record bytes and the 32-byte signer public key on the way in, the canonical
@@ -28,7 +28,7 @@ use blake2::Blake2b;
 
 use crate::cbor::CborValue;
 use crate::cose::{
-    build_cip309_sig_structure, build_sig_structure, encode_cose_sign1, CoseHeader,
+    build_label309_sig_structure, build_sig_structure, encode_cose_sign1, CoseHeader,
     CARDANO_POE_SIG_DOMAIN_PREFIX,
 };
 use crate::poe_standard::{chunk_bytes, encode_record_body_for_signing, PoeRecord, SigEntry};
@@ -38,7 +38,7 @@ const ED25519_SIGNATURE_LENGTH: usize = 64;
 const COSE_HEADER_ALG_LABEL: i64 = 1;
 const COSE_HEADER_KID_LABEL: i64 = 4;
 const HASHED_MODE_HEADER_KEY: &str = "hashed";
-/// EdDSA, the only signature algorithm CIP-309 v1 records carry.
+/// EdDSA, the only signature algorithm Label 309 v1 records carry.
 const COSE_ALG_EDDSA: i64 = -8;
 
 /// A validation failure raised by the off-host signing helper.
@@ -156,7 +156,7 @@ pub fn prepare_sig_structure(
     let protected_header_bytes = path1_protected_header_bytes(signer_pubkey);
     let record_body_cbor = encode_record_body_for_signing(record).unwrap_or_default();
     let sig_structure_bytes =
-        build_cip309_sig_structure(&protected_header_bytes, &record_body_cbor);
+        build_label309_sig_structure(&protected_header_bytes, &record_body_cbor);
     Ok(PreparedSigStructure {
         sig_structure_bytes,
         protected_header_bytes,

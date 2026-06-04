@@ -1,6 +1,6 @@
 //! Hand-rolled canonical CBOR encoder and strict canonical decoder.
 //!
-//! CIP-309 records, signing bodies, and every embedded byte string that feeds a
+//! Label 309 records, signing bodies, and every embedded byte string that feeds a
 //! signature or a MAC are serialised as canonical CBOR. "Canonical" here is RFC
 //! 8949 §4.2.1 Core Deterministic Encoding: definite-length items only,
 //! shortest-form integer and length arguments, and map keys sorted ascending by
@@ -23,7 +23,7 @@
 //!   input (indefinite length, non-shortest integers, unsorted or duplicate map
 //!   keys, floats, simple values, tags, trailing data, bad UTF-8).
 //! - [`decode_cbor_permissive`] — a tolerant reader for the outer Cardano
-//!   transaction envelope, which is not constrained to canonical form. CIP-309
+//!   transaction envelope, which is not constrained to canonical form. Label 309
 //!   records themselves MUST go through [`decode_canonical_cbor`].
 
 use std::cmp::Ordering;
@@ -32,7 +32,7 @@ use thiserror::Error;
 
 /// Canonical-CBOR decode error.
 ///
-/// The CIP-309 taxonomy folds every canonical-decode violation into the single
+/// The Label 309 taxonomy folds every canonical-decode violation into the single
 /// code [`MALFORMED_CBOR`](CanonicalCborError::MALFORMED_CBOR): indefinite-length
 /// (streaming) items, non-shortest integers, unsorted or duplicate map keys,
 /// floats, simple values, tags, trailing bytes, truncation, invalid UTF-8.
@@ -552,7 +552,7 @@ impl Decoder<'_> {
 /// to peel the transaction structure so the label-309 byte string can be
 /// re-encoded canonically and handed to the strict decoder.
 ///
-/// CIP-309 records themselves MUST NOT be read with this decoder; they go
+/// Label 309 records themselves MUST NOT be read with this decoder; they go
 /// through [`decode_canonical_cbor`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissiveValue {

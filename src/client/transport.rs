@@ -55,7 +55,7 @@ pub enum RequestBody {
 /// serialised by hand with this boundary. The token is opaque and never appears
 /// in any field value, so a fixed value is safe; the gateway parses the boundary
 /// out of the `Content-Type` header.
-const MULTIPART_BOUNDARY: &str = "cip309sdkrsboundaryV1aaaaaaaaaaaa";
+const MULTIPART_BOUNDARY: &str = "label309sdkrsboundaryV1aaaaaaaaaa";
 
 /// Serialise multipart fields into the raw `multipart/form-data` body bytes.
 fn encode_multipart(fields: &[MultipartField]) -> Vec<u8> {

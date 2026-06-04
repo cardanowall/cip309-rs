@@ -4,7 +4,7 @@
 // projected extension fields. A second group drives the same mapping through a
 // real publish/quote call so the namespace error path is covered end to end.
 
-fn parse(status: u16, body: serde_json::Value) -> Cip309HttpError {
+fn parse(status: u16, body: serde_json::Value) -> Label309HttpError {
     parse_http_error(ParseHttpErrorArgs {
         http_status: status,
         body: Some(body),
@@ -13,7 +13,7 @@ fn parse(status: u16, body: serde_json::Value) -> Cip309HttpError {
     })
 }
 
-fn parse_with(status: u16, body: serde_json::Value, request_id: Option<&str>, retry: Option<u64>) -> Cip309HttpError {
+fn parse_with(status: u16, body: serde_json::Value, request_id: Option<&str>, retry: Option<u64>) -> Label309HttpError {
     parse_http_error(ParseHttpErrorArgs {
         http_status: status,
         body: Some(body),
@@ -294,8 +294,8 @@ fn unknown_code_falls_through_to_other_with_verbatim_body() {
 // Same mapping through the namespace path (end to end)
 // ---------------------------------------------------------------------------
 
-/// Extract the typed `Cip309HttpError` from a `ClientError`, panicking otherwise.
-fn http_err(err: ClientError) -> Cip309HttpError {
+/// Extract the typed `Label309HttpError` from a `ClientError`, panicking otherwise.
+fn http_err(err: ClientError) -> Label309HttpError {
     match err {
         ClientError::Http(boxed) => *boxed,
         other => panic!("expected ClientError::Http, got {other:?}"),

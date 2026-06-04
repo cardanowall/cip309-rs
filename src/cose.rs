@@ -1,8 +1,8 @@
-//! COSE_Sign1 construction and verification (RFC 9052) for CIP-309 record
+//! COSE_Sign1 construction and verification (RFC 9052) for Label 309 record
 //! signatures, plus the Ed25519 primitive the signatures ride on and the
 //! COSE_Key decoder used to resolve out-of-band signer keys.
 //!
-//! Record-level authorship in CIP-309 is expressed by optional `COSE_Sign1`
+//! Record-level authorship in Label 309 is expressed by optional `COSE_Sign1`
 //! signatures — never required. A signature commits to the canonical-CBOR of the
 //! record body (with the `sigs` field removed) under a fixed domain separator,
 //! so a verifier can recompute the signed bytes from the record alone. The
@@ -15,17 +15,17 @@
 //!
 //! The public surface mirrors the other two SDKs:
 //!
-//! - [`build_sig_structure`] / [`build_cip309_sig_structure`] — the RFC 9052
-//!   §4.4 `Sig_structure` and its CIP-309 specialisation.
+//! - [`build_sig_structure`] / [`build_label309_sig_structure`] — the RFC 9052
+//!   §4.4 `Sig_structure` and its Label 309 specialisation.
 //! - [`encode_cose_sign1`] / [`decode_cose_sign1`] — the untagged 4-element
 //!   `COSE_Sign1` wire codec.
-//! - [`cose_sign1_cip309_build`] — sign a record body, in-process, from a raw
+//! - [`cose_sign1_label309_build`] — sign a record body, in-process, from a raw
 //!   Ed25519 seed or an injected signer closure.
-//! - [`cose_sign1_cip309_prepare`] / [`cose_sign1_cip309_assemble`] — the
+//! - [`cose_sign1_label309_prepare`] / [`cose_sign1_label309_assemble`] — the
 //!   off-host split: `prepare` returns the exact bytes an external signer must
 //!   Ed25519-sign; `assemble` folds the returned 64-byte signature into the
 //!   final `COSE_Sign1`.
-//! - [`cose_sign1_cip309_verify`] — verify a record signature, including the
+//! - [`cose_sign1_label309_verify`] — verify a record signature, including the
 //!   CIP-8 hashed-payload mode.
 //! - [`parse_cose_key_ed25519`] — decode an OKP/Ed25519 `COSE_Key` to its raw
 //!   32-byte public key.
@@ -39,7 +39,7 @@ use crate::cbor::{decode_canonical_cbor, encode_canonical_cbor, CanonicalCborErr
 // Constants
 // ---------------------------------------------------------------------------
 
-/// CIP-309 v1 record-signature domain separator.
+/// Label 309 v1 record-signature domain separator.
 ///
 /// This 25-byte UTF-8 string is prepended to the canonical record body to form
 /// the signed payload (`to_sign`). It is embedded in the payload rather than in
@@ -77,7 +77,7 @@ const _: () = assert!(CARDANO_POE_SIG_DOMAIN_PREFIX.len() == 25);
 // Ed25519 primitive
 // ---------------------------------------------------------------------------
 
-/// Ed25519 sign/verify with the exact rule set the CIP-309 SDKs require.
+/// Ed25519 sign/verify with the exact rule set the Label 309 SDKs require.
 ///
 /// The Rust module map has no standalone signature module; the Ed25519 primitive
 /// the COSE layer needs lives here. Verification is **strict** per RFC 8032
@@ -222,7 +222,7 @@ fn blake2b224(input: &[u8]) -> [u8; 28] {
 /// A COSE header label: an integer (registered labels) or a text key.
 ///
 /// COSE registers most header parameters under small integers (`1` = alg,
-/// `4` = kid), but CIP-309's hashed-payload mode is selected by the text key
+/// `4` = kid), but Label 309's hashed-payload mode is selected by the text key
 /// `"hashed"` in the unprotected header. Modelling labels as int-or-text mirrors
 /// the `Map<number | string, unknown>` headers of the TypeScript and Python
 /// twins exactly, and keeps both kinds encodable as canonical-CBOR map keys.
@@ -241,7 +241,7 @@ pub enum CoseLabel {
     /// An integer label (the common COSE case). Held as `i128` so the full CBOR
     /// integer range `-2^64 ..= 2^64 - 1` fits without narrowing loss.
     Int(i128),
-    /// A text label (used by CIP-309's `"hashed"` flag).
+    /// A text label (used by Label 309's `"hashed"` flag).
     Text(String),
 }
 
@@ -357,7 +357,7 @@ impl CoseHeader {
 
     /// The signature algorithm (COSE label 1), if present and an integer.
     ///
-    /// CIP-309 v1 records carry `alg = -8` (EdDSA) in the protected header.
+    /// Label 309 v1 records carry `alg = -8` (EdDSA) in the protected header.
     #[must_use]
     pub fn alg(&self) -> Option<i64> {
         cbor_int_value(self.get_int(COSE_HEADER_LABEL_ALG))
@@ -366,7 +366,7 @@ impl CoseHeader {
     /// The 32-byte key identifier (COSE label 4), if present and exactly 32
     /// bytes.
     ///
-    /// In CIP-309 the `kid` is the raw 32-byte Ed25519 public key, not a hash or
+    /// In Label 309 the `kid` is the raw 32-byte Ed25519 public key, not a hash or
     /// a prefixed identifier. A `kid` of any other length is treated as absent.
     #[must_use]
     pub fn kid(&self) -> Option<[u8; 32]> {
@@ -446,8 +446,8 @@ impl CoseHeader {
 /// Build the raw RFC 9052 §4.4 `Sig_structure` and encode it as canonical CBOR.
 ///
 /// This is the general-purpose builder: the caller controls `external_aad` and
-/// `payload` exactly. For CIP-309 record signing use
-/// [`build_cip309_sig_structure`], which enforces the v1 invariants
+/// `payload` exactly. For Label 309 record signing use
+/// [`build_label309_sig_structure`], which enforces the v1 invariants
 /// (`external_aad = h''` and the 25-byte domain prefix on the payload).
 ///
 /// The structure is the 4-element array
@@ -471,8 +471,8 @@ pub fn build_sig_structure(
     encode_canonical_cbor(&structure).expect("Sig_structure encodes")
 }
 
-/// The CIP-309 `to_sign` payload: the domain prefix followed by the record body.
-fn cip309_to_sign(record_body_cbor: &[u8]) -> Vec<u8> {
+/// The Label 309 `to_sign` payload: the domain prefix followed by the record body.
+fn label309_to_sign(record_body_cbor: &[u8]) -> Vec<u8> {
     let mut to_sign =
         Vec::with_capacity(CARDANO_POE_SIG_DOMAIN_PREFIX.len() + record_body_cbor.len());
     to_sign.extend_from_slice(CARDANO_POE_SIG_DOMAIN_PREFIX.as_bytes());
@@ -480,7 +480,7 @@ fn cip309_to_sign(record_body_cbor: &[u8]) -> Vec<u8> {
     to_sign
 }
 
-/// Build the CIP-309 v1 `Sig_structure` for a record body.
+/// Build the Label 309 v1 `Sig_structure` for a record body.
 ///
 /// Specialises [`build_sig_structure`] to the v1 invariants:
 ///
@@ -493,8 +493,11 @@ fn cip309_to_sign(record_body_cbor: &[u8]) -> Vec<u8> {
 /// `body_protected_bytes` is the COSE_Sign1 protected-header bytes verbatim
 /// (`0x40` when the protected header is empty).
 #[must_use]
-pub fn build_cip309_sig_structure(body_protected_bytes: &[u8], record_body_cbor: &[u8]) -> Vec<u8> {
-    let to_sign = cip309_to_sign(record_body_cbor);
+pub fn build_label309_sig_structure(
+    body_protected_bytes: &[u8],
+    record_body_cbor: &[u8],
+) -> Vec<u8> {
+    let to_sign = label309_to_sign(record_body_cbor);
     build_sig_structure(body_protected_bytes, &[], &to_sign)
 }
 
@@ -508,9 +511,9 @@ pub fn build_cip309_sig_structure(body_protected_bytes: &[u8], record_body_cbor:
 ///
 /// - `protected` is a byte string carrying the canonical-CBOR of the protected
 ///   header, **or** the zero-length byte string `0x40` when the protected header
-///   is empty (RFC 9052 §3 / CIP-309 mandate — never `0x41 0xA0`).
+///   is empty (RFC 9052 §3 / Label 309 mandate — never `0x41 0xA0`).
 /// - `unprotected` is a CBOR map (possibly empty, `0xA0`).
-/// - `payload` is the detached `null` (`0xF6`) for CIP-309 records, or an
+/// - `payload` is the detached `null` (`0xF6`) for Label 309 records, or an
 ///   attached byte string for the general RFC 9052 form.
 /// - `signature` is the 64-byte Ed25519 signature.
 ///
@@ -558,7 +561,7 @@ pub struct CoseSign1Decoded {
 
 /// Decode an untagged `COSE_Sign1` 4-element array.
 ///
-/// Enforces the CIP-309 wire constraints: a 4-element top-level array, a
+/// Enforces the Label 309 wire constraints: a 4-element top-level array, a
 /// byte-string protected header, a map unprotected header, a payload that is
 /// either a byte string or `null`, and a 64-byte signature. An empty protected
 /// header MUST be the zero-length byte string `0x40`; the 1-byte form `0x41 0xA0`
@@ -657,7 +660,7 @@ pub enum CoseVerifyErrorCode {
     /// The `COSE_Sign1` is structurally malformed (bad array shape, non-canonical
     /// CBOR, wrong field types, an empty protected header encoded as a map, …).
     MalformedSigCose,
-    /// The `COSE_Sign1` carries an attached payload where CIP-309 mandates a
+    /// The `COSE_Sign1` carries an attached payload where Label 309 mandates a
     /// detached (`null`) payload — including a zero-length byte string `h''`.
     MalformedSigCoseSign1,
     /// The protected-header algorithm is not EdDSA (`-8`).
@@ -695,7 +698,7 @@ pub enum CoseVerifyResult {
     Ok {
         /// The 32-byte Ed25519 public key that produced the signature.
         signer_key: [u8; 32],
-        /// The signature algorithm (always `-8`, EdDSA, in CIP-309 v1).
+        /// The signature algorithm (always `-8`, EdDSA, in Label 309 v1).
         alg: i64,
     },
     /// The signature did not verify; carries the stable error code.
@@ -710,7 +713,7 @@ impl CoseVerifyResult {
     }
 }
 
-/// Errors from the CIP-309 record-signature builder.
+/// Errors from the Label 309 record-signature builder.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CoseSign1BuildError {
     /// Neither a secret seed nor a signer closure was provided. Also returned
@@ -737,16 +740,16 @@ impl CoseSign1BuildError {
 }
 
 // ---------------------------------------------------------------------------
-// CIP-309 record-signature build
+// Label 309 record-signature build
 // ---------------------------------------------------------------------------
 
-/// How to produce the 64-byte Ed25519 signature in [`cose_sign1_cip309_build`].
+/// How to produce the 64-byte Ed25519 signature in [`cose_sign1_label309_build`].
 ///
 /// Exactly one variant is permitted. The seed path is used by tests, by the
 /// Python/TypeScript parity harness, and by the off-host signing helper; the
 /// closure path keeps a private key inside an unlock-store closure so the raw
 /// seed never escapes its scope (composer-side use).
-pub enum Cip309Signer<'a> {
+pub enum Label309Signer<'a> {
     /// Sign with the raw 32-byte Ed25519 seed.
     Seed(&'a [u8; 32]),
     /// Sign by invoking a closure over the assembled `Sig_structure` bytes. The
@@ -754,7 +757,7 @@ pub enum Cip309Signer<'a> {
     Closure(&'a dyn Fn(&[u8]) -> Vec<u8>),
 }
 
-/// Build a CIP-309 v1 record signature as a detached `COSE_Sign1`.
+/// Build a Label 309 v1 record signature as a detached `COSE_Sign1`.
 ///
 /// Steps:
 ///
@@ -769,19 +772,19 @@ pub enum Cip309Signer<'a> {
 ///
 /// Returns [`CoseSign1BuildError::SignerNotProvided`] if a closure returns a
 /// non-64-byte value, and [`CanonicalCborError`] only if a header map carries a
-/// duplicate key. The seed/closure exclusivity is encoded in the [`Cip309Signer`]
+/// duplicate key. The seed/closure exclusivity is encoded in the [`Label309Signer`]
 /// enum, so the both-provided case is unrepresentable here.
-pub fn cose_sign1_cip309_build(
+pub fn cose_sign1_label309_build(
     protected_header: &CoseHeader,
     unprotected_header: &CoseHeader,
     record_body_cbor: &[u8],
-    signer: Cip309Signer<'_>,
+    signer: Label309Signer<'_>,
 ) -> Result<Vec<u8>, CoseSign1BuildError> {
     let protected_bytes = encode_protected_bytes(protected_header)?;
-    let sig_structure = build_cip309_sig_structure(&protected_bytes, record_body_cbor);
+    let sig_structure = build_label309_sig_structure(&protected_bytes, record_body_cbor);
     let signature = match signer {
-        Cip309Signer::Seed(seed) => ed25519_sign(seed, &sig_structure).to_vec(),
-        Cip309Signer::Closure(closure) => {
+        Label309Signer::Seed(seed) => ed25519_sign(seed, &sig_structure).to_vec(),
+        Label309Signer::Closure(closure) => {
             let sig = closure(&sig_structure);
             if sig.len() != ED25519_SIGNATURE_LENGTH {
                 return Err(CoseSign1BuildError::SignerNotProvided(format!(
@@ -811,14 +814,14 @@ fn encode_protected_bytes(protected_header: &CoseHeader) -> Result<Vec<u8>, Cose
 // Off-host prepare / assemble
 // ---------------------------------------------------------------------------
 
-/// The output of [`cose_sign1_cip309_prepare`]: everything an external signer and
-/// the subsequent [`cose_sign1_cip309_assemble`] call need.
+/// The output of [`cose_sign1_label309_prepare`]: everything an external signer and
+/// the subsequent [`cose_sign1_label309_assemble`] call need.
 ///
 /// `sig_structure` is the exact bytes the external signer must Ed25519-sign.
 /// `protected_header` and `unprotected_header` are carried so `assemble` can fold
 /// the returned signature into the final `COSE_Sign1` without recomputing them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cip309Prepared {
+pub struct Label309Prepared {
     /// The `Sig_structure` bytes the external signer must Ed25519-sign.
     pub sig_structure: Vec<u8>,
     /// The protected header to embed in the assembled `COSE_Sign1`.
@@ -827,7 +830,7 @@ pub struct Cip309Prepared {
     pub unprotected_header: CoseHeader,
 }
 
-/// Prepare an off-host CIP-309 record signature.
+/// Prepare an off-host Label 309 record signature.
 ///
 /// Returns the exact `Sig_structure` bytes an external signer (a wallet, an HSM,
 /// an air-gapped device) must Ed25519-sign, alongside the headers needed to
@@ -835,29 +838,29 @@ pub struct Cip309Prepared {
 /// internally; the caller passes only the canonical record body (with `sigs`
 /// removed).
 ///
-/// This is the byte-identical split of [`cose_sign1_cip309_build`]: the
+/// This is the byte-identical split of [`cose_sign1_label309_build`]: the
 /// `sig_structure` it returns equals the bytes the build path signs.
 ///
 /// # Errors
 ///
 /// Returns [`CanonicalCborError`] only if the protected header carries a
 /// duplicate key.
-pub fn cose_sign1_cip309_prepare(
+pub fn cose_sign1_label309_prepare(
     protected_header: &CoseHeader,
     unprotected_header: &CoseHeader,
     record_body_cbor: &[u8],
-) -> Result<Cip309Prepared, CanonicalCborError> {
+) -> Result<Label309Prepared, CanonicalCborError> {
     let protected_bytes = protected_header.encode_protected()?;
-    Ok(Cip309Prepared {
-        sig_structure: build_cip309_sig_structure(&protected_bytes, record_body_cbor),
+    Ok(Label309Prepared {
+        sig_structure: build_label309_sig_structure(&protected_bytes, record_body_cbor),
         protected_header: protected_header.clone(),
         unprotected_header: unprotected_header.clone(),
     })
 }
 
-/// Assemble a CIP-309 `COSE_Sign1` from an external 64-byte signature.
+/// Assemble a Label 309 `COSE_Sign1` from an external 64-byte signature.
 ///
-/// Takes the [`Cip309Prepared`] returned by [`cose_sign1_cip309_prepare`] and the
+/// Takes the [`Label309Prepared`] returned by [`cose_sign1_label309_prepare`] and the
 /// 64-byte signature the external signer produced over `prepared.sig_structure`,
 /// and emits the final detached-payload `COSE_Sign1`.
 ///
@@ -865,8 +868,8 @@ pub fn cose_sign1_cip309_prepare(
 ///
 /// Returns [`CoseSign1BuildError::SignerNotProvided`] if `signature` is not
 /// exactly 64 bytes, and folds a duplicate-key header failure into the same code.
-pub fn cose_sign1_cip309_assemble(
-    prepared: &Cip309Prepared,
+pub fn cose_sign1_label309_assemble(
+    prepared: &Label309Prepared,
     signature: &[u8],
 ) -> Result<Vec<u8>, CoseSign1BuildError> {
     if signature.len() != ED25519_SIGNATURE_LENGTH {
@@ -885,10 +888,10 @@ pub fn cose_sign1_cip309_assemble(
 }
 
 // ---------------------------------------------------------------------------
-// CIP-309 record-signature verify
+// Label 309 record-signature verify
 // ---------------------------------------------------------------------------
 
-/// Verify a CIP-309 v1 record signature.
+/// Verify a Label 309 v1 record signature.
 ///
 /// `message` is the encoded `COSE_Sign1`. `detached_record_body_cbor` is the
 /// verifier-recomputed canonical record body (with `sigs` removed); the 25-byte
@@ -910,7 +913,7 @@ pub fn cose_sign1_cip309_assemble(
 ///    full `to_sign` payload.
 /// 6. Strict Ed25519 verify (→ [`CoseVerifyErrorCode::SignatureInvalid`]).
 #[must_use]
-pub fn cose_sign1_cip309_verify(
+pub fn cose_sign1_label309_verify(
     message: &[u8],
     detached_record_body_cbor: &[u8],
     expected_signer_key: Option<&[u8]>,
@@ -920,7 +923,7 @@ pub fn cose_sign1_cip309_verify(
         Err(_) => return CoseVerifyResult::Err(CoseVerifyErrorCode::MalformedSigCose),
     };
 
-    // CIP-309 mandates a detached (null) payload. Any attached payload —
+    // Label 309 mandates a detached (null) payload. Any attached payload —
     // including a zero-length byte string h'' — is rejected.
     if decoded.payload.is_some() {
         return CoseVerifyResult::Err(CoseVerifyErrorCode::MalformedSigCoseSign1);
@@ -956,11 +959,11 @@ pub fn cose_sign1_cip309_verify(
         Some(CborValue::Bool(true))
     );
     let sig_structure = if hashed {
-        let to_sign = cip309_to_sign(detached_record_body_cbor);
+        let to_sign = label309_to_sign(detached_record_body_cbor);
         let digest = blake2b224(&to_sign);
         build_sig_structure(&decoded.protected_bytes, &[], &digest)
     } else {
-        build_cip309_sig_structure(&decoded.protected_bytes, detached_record_body_cbor)
+        build_label309_sig_structure(&decoded.protected_bytes, detached_record_body_cbor)
     };
 
     if ed25519_verify(&signer_key, &sig_structure, &decoded.signature) {
@@ -994,7 +997,7 @@ fn cbor_int_value(value: Option<&CborValue>) -> Option<i64> {
 ///
 /// CIP-30 wallets that do not place a raw Ed25519 public key in the COSE_Sign1
 /// protected header instead deliver the signer key as a separate
-/// `cbor<COSE_Key>` blob (surfaced on a CIP-309 record under `sigs[i].cose_key`).
+/// `cbor<COSE_Key>` blob (surfaced on a Label 309 record under `sigs[i].cose_key`).
 /// This helper decodes one such blob and returns the 32-byte public key, or
 /// `None` when the blob is malformed, uses an unexpected key type / curve, has a
 /// wrong-length `x`, or carries an algorithm other than EdDSA.
@@ -1102,9 +1105,9 @@ mod tests {
             .with_int(COSE_HEADER_LABEL_ALG, CborValue::int(COSE_ALG_EDDSA))
             .with_int(COSE_HEADER_LABEL_KID, CborValue::bytes(pk.to_vec()));
         let body = crate::hex::decode("a16161182a").unwrap();
-        let prepared = cose_sign1_cip309_prepare(&protected, &CoseHeader::new(), &body).unwrap();
+        let prepared = cose_sign1_label309_prepare(&protected, &CoseHeader::new(), &body).unwrap();
         let protected_bytes = encode_canonical_cbor(&protected.to_cbor()).unwrap();
-        let direct = build_cip309_sig_structure(&protected_bytes, &body);
+        let direct = build_label309_sig_structure(&protected_bytes, &body);
         assert_eq!(prepared.sig_structure, direct);
     }
 }
