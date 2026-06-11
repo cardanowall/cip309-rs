@@ -9,6 +9,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > release. Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-06-12
+
+### Breaking
+
+- `records::verify` no longer accepts `decryption` entries. Recipient verification — decrypting sealed items and re-checking plaintext hashes — is a local operation of the verifier; the HTTP client never transmits decryption credentials to any gateway. Hosted verify endpoints act as public verifiers only.
+
+### Fixed
+
+- `verify_uris` was never accepted by conforming gateways; the verify request now carries the correct `fetch_content` flag.
+
 ## [0.4.0] - 2026-06-11
 
 ### Changed

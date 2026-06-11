@@ -124,10 +124,11 @@ pub struct ResumableUploadInput {
     /// Optional MIME type recorded on the storage data item's `Content-Type` tag.
     pub content_type: Option<String>,
     /// The single-shot/chunked switch threshold in bytes. `None` uses
-    /// [`DEFAULT_RESUMABLE_THRESHOLD_BYTES`].
+    /// [`DEFAULT_RESUMABLE_THRESHOLD_BYTES`](crate::client::DEFAULT_RESUMABLE_THRESHOLD_BYTES).
     pub threshold_bytes: Option<u64>,
     /// The client's intended chunk size in bytes. `None` uses
-    /// [`DEFAULT_RESUMABLE_CHUNK_BYTES`]. The server's authoritative
+    /// [`DEFAULT_RESUMABLE_CHUNK_BYTES`](crate::client::DEFAULT_RESUMABLE_CHUNK_BYTES).
+    /// The server's authoritative
     /// `max_chunk_bytes` always clamps this down when it is smaller.
     pub chunk_bytes: Option<u64>,
     /// An existing session id to resume. When set, the helper GETs the session
@@ -550,25 +551,21 @@ pub struct AccountBalance {
 // POST /api/v1/records/{tx_hash}/verify
 // ---------------------------------------------------------------------------
 
-/// A single decryption request for `client.records.verify(...)`.
-#[derive(Debug, Clone)]
-pub struct PoeVerifyDecryption {
-    /// The item index to decrypt.
-    pub item_idx: u64,
-    /// The recipient X25519/X-Wing secret key (lowercase hex), for slot
-    /// decryption.
-    pub recipient_secret_key: Option<String>,
-    /// The passphrase, for passphrase decryption.
-    pub passphrase: Option<String>,
-}
-
-/// Input to `client.records.verify(...)`.
+/// Request body for the hosted verify endpoint (`client.records.verify(...)`).
+///
+/// The endpoint is a PUBLIC verifier — structural validation plus
+/// record-level signature verification over public chain data. It accepts no
+/// decryption credentials: a body carrying any is rejected with 400
+/// validation-failed, and sealed (enc-bearing) items report as unverifiable
+/// without decryption. Recipient verification (sealed-envelope decrypt +
+/// plaintext-hash recheck) runs locally — use the `verifier` module's
+/// `decryption` input, which never leaves the process.
 #[derive(Debug, Clone, Default)]
 pub struct PoeVerifyInput {
-    /// Toggle URI hash-equivalence checks.
-    pub verify_uris: Option<bool>,
-    /// Per-item decryption requests.
-    pub decryption: Option<Vec<PoeVerifyDecryption>>,
+    /// The master content-fetch switch (item URIs and Merkle leaves lists
+    /// alike). The server defaults it to `true`; `Some(false)` skips content
+    /// re-fetching — affected claims then report `not_checked`.
+    pub fetch_content: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

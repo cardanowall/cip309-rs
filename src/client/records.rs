@@ -113,6 +113,14 @@ impl<'t> RecordsNamespace<'t> {
     /// verbatim. The client exposes the JSON document directly (rather than the
     /// in-process verifier type, which carries non-deserializable fields).
     ///
+    /// This is the hosted PUBLIC verifier: it accepts no decryption
+    /// credentials, and sealed items report as unverifiable without
+    /// decryption. To verify as a recipient (decrypt + plaintext-hash
+    /// recheck), run the `verifier` module locally with its `decryption`
+    /// input — keys never leave the process. Optional
+    /// `fetch_content: Some(false)` skips content re-fetching; affected
+    /// claims report `not_checked`.
+    ///
     /// # Errors
     ///
     /// Returns a typed [`ClientError`] on any non-2xx response.
@@ -165,37 +173,11 @@ fn verify_input_to_json(input: Option<&PoeVerifyInput>) -> serde_json::Value {
         return serde_json::Value::Object(serde_json::Map::new());
     };
     let mut map = serde_json::Map::new();
-    if let Some(verify_uris) = input.verify_uris {
+    if let Some(fetch_content) = input.fetch_content {
         map.insert(
-            "verify_uris".to_string(),
-            serde_json::Value::Bool(verify_uris),
+            "fetch_content".to_string(),
+            serde_json::Value::Bool(fetch_content),
         );
-    }
-    if let Some(decryptions) = &input.decryption {
-        let arr = decryptions
-            .iter()
-            .map(|d| {
-                let mut entry = serde_json::Map::new();
-                entry.insert(
-                    "item_idx".to_string(),
-                    serde_json::Value::Number(d.item_idx.into()),
-                );
-                if let Some(sk) = &d.recipient_secret_key {
-                    entry.insert(
-                        "recipient_secret_key".to_string(),
-                        serde_json::Value::String(sk.clone()),
-                    );
-                }
-                if let Some(pass) = &d.passphrase {
-                    entry.insert(
-                        "passphrase".to_string(),
-                        serde_json::Value::String(pass.clone()),
-                    );
-                }
-                serde_json::Value::Object(entry)
-            })
-            .collect();
-        map.insert("decryption".to_string(), serde_json::Value::Array(arr));
     }
     serde_json::Value::Object(map)
 }

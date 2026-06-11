@@ -236,7 +236,7 @@ fn records_verify_posts_input_and_returns_report_json() {
     let (client, ptr) = client_with("http://test.example", Some(&bearer_key()), transport);
     let out = client
         .records()
-        .verify(&"a".repeat(64), Some(&PoeVerifyInput { verify_uris: Some(true), decryption: None }))
+        .verify(&"a".repeat(64), Some(&PoeVerifyInput { fetch_content: Some(false) }))
         .unwrap();
     assert_eq!(out["verdict"], "valid");
     assert_eq!(out["exit_code"], 0);
@@ -247,8 +247,13 @@ fn records_verify_posts_input_and_returns_report_json() {
         format!("http://test.example/api/v1/records/{}/verify", "a".repeat(64))
     );
     assert_eq!(captured.method, HttpMethod::Post);
+    // Body MUST round-trip the caller-supplied flag — proves the body is
+    // actually sent over the wire (not mock-asserted against itself). The
+    // endpoint is the hosted PUBLIC verifier: `fetch_content` is the ONLY
+    // accepted field, so this also pins that the client wire body carries no
+    // decryption credentials.
     let sent: serde_json::Value = serde_json::from_str(captured.body.as_json()).unwrap();
-    assert_eq!(sent, serde_json::json!({ "verify_uris": true }));
+    assert_eq!(sent, serde_json::json!({ "fetch_content": false }));
 }
 
 #[test]

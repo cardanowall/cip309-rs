@@ -2,7 +2,7 @@
 //! 16.0.0. Do not edit by hand.
 //!
 //! Derived from Unicode data files, copyright (c) 2024 Unicode, Inc., used
-//! under the UNICODE LICENSE V3 (https://www.unicode.org/license.txt).
+//! under the UNICODE LICENSE V3 (<https://www.unicode.org/license.txt>).
 
 /// Fully expanded compatibility (NFKD) decompositions, Hangul excluded.
 /// Entry: <cp>=<cp> <cp>...; all numbers uppercase hex; entries sorted, ';'-joined.

@@ -327,7 +327,7 @@ pub struct ZeroConfirmationDepthError;
 ///
 /// `record_body` is the reassembled canonical record body (the chunk-array
 /// transport already concatenated; see
-/// [`reassemble_label_309_value`](crate::verifier::cbor_walker::reassemble_label_309_value)).
+/// [`reassemble_label_309_value`]).
 /// The caller vouches that the bytes came from the label-309 metadata of a
 /// real Cardano transaction and supplies the chain facts the resolve step
 /// would have established. The chain-resolution fields of `input`
