@@ -70,6 +70,48 @@ fn envelope_projection_preserves_problem_and_splits_extensions() {
 }
 
 #[test]
+fn all_three_402_funding_codes_map_to_insufficient_funds() {
+    // The general 402 parser must collapse every funding/affordability code to
+    // the same InsufficientFunds kind, matching the TypeScript SDK and the
+    // resumable create path (which treats any 402 as a funding error). A
+    // non-resumable call to any 402-capable endpoint must therefore surface the
+    // funding kind regardless of which of the three codes the gateway emits.
+    for code in [
+        "insufficient-funds",
+        "insufficient-storage-credit",
+        "no-funding-grant",
+    ] {
+        let err = parse(
+            402,
+            problem_body(serde_json::json!({
+                "code": code,
+                "status": 402,
+                "title": "Payment Required",
+                "balance_usd_micros": "50000",
+                "required_usd_micros": "180000",
+                "top_up_url": "/billing/top-up",
+            })),
+        );
+        // The verbatim code is preserved on the problem document...
+        assert_eq!(err.code(), code);
+        // ...but the typed kind is the single funding condition with projected
+        // money fields, identical across all three codes.
+        match err.kind() {
+            HttpErrorKind::InsufficientFunds {
+                balance_usd_micros,
+                required_usd_micros,
+                top_up_url,
+            } => {
+                assert_eq!(*balance_usd_micros, Some(50_000), "balance for {code}");
+                assert_eq!(*required_usd_micros, Some(180_000), "required for {code}");
+                assert_eq!(top_up_url.as_deref(), Some("/billing/top-up"), "top_up_url for {code}");
+            }
+            other => panic!("expected InsufficientFunds for {code}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn request_id_falls_back_to_trace_id_when_header_absent() {
     let err = parse(
         500,

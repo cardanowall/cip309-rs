@@ -2,7 +2,7 @@
 // high-level publish-helper coverage. Assertions target request shape, parsed
 // responses, page entries, and typed errors — never log strings.
 
-use cardanowall::poe_standard::validate_poe_record;
+use cardanowall::poe_standard::{validate_poe_record, ValidatorOptions};
 
 /// A full RecordResource row, the projection records.list / records.get share.
 fn record_resource_row(tx_hash: &str) -> serde_json::Value {
@@ -478,7 +478,7 @@ fn publish_content_signs_and_posts_single_item_record() {
     assert_eq!(sent["quote_id"], QUOTE_ID);
     // Round-trip the posted record through the structural validator.
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let result = validate_poe_record(&record_bytes);
+    let result = validate_poe_record(&record_bytes, &ValidatorOptions::default());
     let record = match result {
         cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
         cardanowall::poe_standard::ValidateResult::Fail { issues } => {
@@ -510,7 +510,7 @@ fn publish_content_unsigned_omits_sigs() {
         .unwrap();
     let sent: serde_json::Value = serde_json::from_str(mock(ptr).first().body.as_json()).unwrap();
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let record = match validate_poe_record(&record_bytes) {
+    let record = match validate_poe_record(&record_bytes, &ValidatorOptions::default()) {
         cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
         other => panic!("validation failed: {other:?}"),
     };
@@ -533,7 +533,7 @@ fn publish_content_supports_blake2b_256() {
         .unwrap();
     let sent: serde_json::Value = serde_json::from_str(mock(ptr).first().body.as_json()).unwrap();
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let record = match validate_poe_record(&record_bytes) {
+    let record = match validate_poe_record(&record_bytes, &ValidatorOptions::default()) {
         cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
         other => panic!("validation failed: {other:?}"),
     };
@@ -558,7 +558,7 @@ fn publish_prehashed_validates_and_posts_supplied_digest() {
         .unwrap();
     let sent: serde_json::Value = serde_json::from_str(mock(ptr).first().body.as_json()).unwrap();
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let record = match validate_poe_record(&record_bytes) {
+    let record = match validate_poe_record(&record_bytes, &ValidatorOptions::default()) {
         cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
         other => panic!("validation failed: {other:?}"),
     };
@@ -608,6 +608,7 @@ fn publish_sealed_encrypts_uploads_and_publishes_with_ar_uri() {
             kem: Some(SealedKemChoice::X25519),
             signer: None,
             idempotency_key: None,
+            chunk_bytes: None,
         })
         .unwrap();
     // Two calls: uploads then publish.
@@ -615,16 +616,33 @@ fn publish_sealed_encrypts_uploads_and_publishes_with_ar_uri() {
     let publish_req = mock(ptr).nth(1);
     let sent: serde_json::Value = serde_json::from_str(publish_req.body.as_json()).unwrap();
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let record = match validate_poe_record(&record_bytes) {
-        cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
-        other => panic!("validation failed: {other:?}"),
+    // Decode the posted record with the independent CBOR oracle and assert the
+    // sealed envelope's wire shape directly.
+    let record: ciborium::Value = ciborium::from_reader(record_bytes.as_slice()).unwrap();
+    let lookup = |map: &ciborium::Value, key: &str| -> Option<ciborium::Value> {
+        map.as_map().and_then(|pairs| {
+            pairs
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(key))
+                .map(|(_, v)| v.clone())
+        })
     };
-    let item = &record.items.unwrap()[0];
-    assert!(item.enc.is_some());
-    let enc = item.enc.as_ref().unwrap();
-    assert_eq!(enc.kem.as_deref(), Some("x25519"));
-    // Classical slots carry epk; the URI is chunked from the ar:// upload.
-    assert!(item.uris.is_some());
+    let item = lookup(&record, "items").unwrap().as_array().unwrap()[0].clone();
+    let enc = lookup(&item, "enc").expect("the published item carries an enc envelope");
+    assert_eq!(lookup(&enc, "kem").unwrap().as_text(), Some("x25519"));
+    assert_eq!(
+        lookup(&enc, "aead").unwrap().as_text(),
+        Some("chacha20-poly1305-stream64k")
+    );
+    assert_eq!(lookup(&enc, "nonce").unwrap().as_bytes().unwrap().len(), 24);
+    assert_eq!(lookup(&enc, "slots_mac").unwrap().as_bytes().unwrap().len(), 32);
+    // One classical slot, carrying a 32-byte epk and a 48-byte wrap.
+    let slots = lookup(&enc, "slots").unwrap().as_array().unwrap().to_vec();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(lookup(&slots[0], "epk").unwrap().as_bytes().unwrap().len(), 32);
+    assert_eq!(lookup(&slots[0], "wrap").unwrap().as_bytes().unwrap().len(), 48);
+    // The ar:// upload URI lands on the item.
+    assert!(lookup(&item, "uris").is_some());
 }
 
 #[test]
@@ -639,6 +657,7 @@ fn publish_sealed_rejects_empty_and_wrong_length_recipients() {
         kem: None,
         signer: None,
         idempotency_key: None,
+        chunk_bytes: None,
     });
     assert!(matches!(
         empty.unwrap_err(),
@@ -657,6 +676,7 @@ fn publish_sealed_rejects_empty_and_wrong_length_recipients() {
         kem: Some(SealedKemChoice::X25519),
         signer: None,
         idempotency_key: None,
+        chunk_bytes: None,
     });
     assert!(matches!(
         wrong.unwrap_err(),
@@ -668,8 +688,13 @@ fn publish_sealed_rejects_empty_and_wrong_length_recipients() {
 
 #[test]
 fn publish_sealed_escalates_partial_upload_failure() {
+    // The single-shot /uploads route returns a per-file rejection with a SPECIFIC
+    // code + detail. The resumable path runs this small blob single-shot; the
+    // failure must surface as a PartialUploadError whose failed[0] carries the
+    // VERBATIM original code + detail (not a flattened synthetic "upload-failed"),
+    // so the CLI and callers see the same diagnostic the single-shot route emits.
     let uploads_body = serde_json::json!({
-        "uploads": [{ "idx": 0, "ok": false, "error": { "code": "upload-failed", "detail": "arweave timeout" } }],
+        "uploads": [{ "idx": 0, "ok": false, "error": { "code": "storage-provider-rejected", "detail": "arweave timeout" } }],
     });
     let transport = Box::new(MockTransport::single(StubResponse::json(200, uploads_body)));
     let (client, _) = client_with("http://test", Some(&bearer_key()), transport);
@@ -683,11 +708,22 @@ fn publish_sealed_escalates_partial_upload_failure() {
             kem: Some(SealedKemChoice::X25519),
             signer: None,
             idempotency_key: None,
+            chunk_bytes: None,
         })
         .unwrap_err();
     match err {
         cardanowall::client::PublishHelperError::PartialUpload(p) => {
+            // The index-0 contract the CLI relies on is preserved.
             assert_eq!(p.failed_indices(), vec![0]);
+            // The original per-file code + detail survive verbatim.
+            match &p.failed[0] {
+                cardanowall::client::UploadEntry::Failure { idx, error, .. } => {
+                    assert_eq!(*idx, 0);
+                    assert_eq!(error.code, "storage-provider-rejected");
+                    assert_eq!(error.detail, "arweave timeout");
+                }
+                other => panic!("expected a Failure entry, got {other:?}"),
+            }
         }
         other => panic!("expected PartialUpload, got {other:?}"),
     }
@@ -715,6 +751,7 @@ fn publish_merkle_binds_root_and_leaf_count() {
             hash_alg: None,
             signer: Some(&signer),
             idempotency_key: None,
+            chunk_bytes: None,
         })
         .unwrap();
     assert_eq!(out.leaf_count, 4);
@@ -724,7 +761,7 @@ fn publish_merkle_binds_root_and_leaf_count() {
     let publish_req = mock(ptr).nth(1);
     let sent: serde_json::Value = serde_json::from_str(publish_req.body.as_json()).unwrap();
     let record_bytes = hex::decode(sent["record"].as_str().unwrap()).unwrap();
-    let record = match validate_poe_record(&record_bytes) {
+    let record = match validate_poe_record(&record_bytes, &ValidatorOptions::default()) {
         cardanowall::poe_standard::ValidateResult::Ok { record, .. } => *record,
         other => panic!("validation failed: {other:?}"),
     };
@@ -746,6 +783,7 @@ fn publish_merkle_rejects_empty_leaves() {
             hash_alg: None,
             signer: None,
             idempotency_key: None,
+            chunk_bytes: None,
         })
         .unwrap_err();
     assert!(matches!(

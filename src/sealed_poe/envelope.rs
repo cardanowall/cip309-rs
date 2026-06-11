@@ -10,15 +10,14 @@
 //! `slots` / `nonce` / `slots_mac`, an unknown KEM, or a slot missing the KEM's
 //! required field). Callers then hand the whole returned envelope plus their
 //! [`RecipientKeyBundle`](super::unwrap::RecipientKeyBundle) straight to the
-//! unwrap / trial-decrypt path — they never rebuild slots or reassemble
-//! `kem_ct` themselves.
+//! unwrap / trial-decrypt path — they never rebuild slots themselves.
 //!
 //! Per-slot length checks are NOT done here; they are re-asserted by the unwrap
 //! path's partitioning-oracle pre-checks. This helper is purely the KEM-driven
 //! shape projection.
 
 use super::slots::{
-    Mlkem768X25519Slot, SealedEnvelope, SealedSlots, X25519Slot, AEAD_XCHACHA20_POLY1305,
+    Mlkem768X25519Slot, SealedEnvelope, SealedSlots, X25519Slot, AEAD_CHACHA20_POLY1305_STREAM64K,
     KEM_MLKEM768X25519, KEM_X25519,
 };
 
@@ -29,8 +28,8 @@ use super::slots::{
 pub struct ParsedSlot {
     /// The 32-byte ephemeral X25519 public key (classical slots).
     pub epk: Option<Vec<u8>>,
-    /// The chunked X-Wing ciphertext (hybrid slots).
-    pub kem_ct: Option<Vec<Vec<u8>>>,
+    /// The 1120-byte X-Wing ciphertext (hybrid slots).
+    pub kem_ct: Option<Vec<u8>>,
     /// The AEAD-wrapped CEK (both KEMs).
     pub wrap: Option<Vec<u8>>,
 }
@@ -41,11 +40,11 @@ pub struct ParsedSlot {
 pub struct ParsedEnvelope {
     /// The envelope scheme version, if present.
     pub scheme: Option<i64>,
-    /// The content AEAD algorithm identifier, if present.
+    /// The content-format identifier, if present.
     pub aead: Option<String>,
     /// The KEM algorithm identifier, if present.
     pub kem: Option<String>,
-    /// The content nonce, if present.
+    /// The envelope nonce, if present.
     pub nonce: Option<Vec<u8>>,
     /// The per-recipient slots, if present.
     pub slots: Option<Vec<ParsedSlot>>,
@@ -58,13 +57,13 @@ pub struct ParsedEnvelope {
 /// trial-decrypted.
 ///
 /// Returns `None` for: a `scheme` other than `1`, an `aead` other than
-/// `xchacha20-poly1305`, a missing `nonce` / `slots_mac`, an empty or missing
-/// `slots` list, an unrecognised `kem`, or any slot missing the KEM's required
-/// field. This keeps every consumer's "this item is not for the recipient path
-/// → no match, no crypto" branch.
+/// `chacha20-poly1305-stream64k`, a missing `nonce` / `slots_mac`, an empty or
+/// missing `slots` list, an unrecognised `kem`, or any slot missing the KEM's
+/// required field. This keeps every consumer's "this item is not for the
+/// recipient path → no match, no crypto" branch.
 #[must_use]
 pub fn sealed_envelope_from_parsed(enc: &ParsedEnvelope) -> Option<SealedEnvelope> {
-    if enc.scheme != Some(1) || enc.aead.as_deref() != Some(AEAD_XCHACHA20_POLY1305) {
+    if enc.scheme != Some(1) || enc.aead.as_deref() != Some(AEAD_CHACHA20_POLY1305_STREAM64K) {
         return None;
     }
     let nonce = enc.nonce.clone()?;
@@ -99,7 +98,7 @@ pub fn sealed_envelope_from_parsed(enc: &ParsedEnvelope) -> Option<SealedEnvelop
 
     Some(SealedEnvelope {
         scheme: 1,
-        aead: AEAD_XCHACHA20_POLY1305.to_string(),
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
         kem: kem.to_string(),
         nonce,
         slots: sealed_slots,
@@ -116,7 +115,7 @@ mod tests {
         // Missing kem.
         let mut enc = ParsedEnvelope {
             scheme: Some(1),
-            aead: Some(AEAD_XCHACHA20_POLY1305.to_string()),
+            aead: Some(AEAD_CHACHA20_POLY1305_STREAM64K.to_string()),
             kem: None,
             nonce: Some(vec![0u8; 24]),
             slots: Some(vec![ParsedSlot {
@@ -142,7 +141,7 @@ mod tests {
     fn builds_a_classical_envelope() {
         let enc = ParsedEnvelope {
             scheme: Some(1),
-            aead: Some(AEAD_XCHACHA20_POLY1305.to_string()),
+            aead: Some(AEAD_CHACHA20_POLY1305_STREAM64K.to_string()),
             kem: Some(KEM_X25519.to_string()),
             nonce: Some(vec![1u8; 24]),
             slots: Some(vec![ParsedSlot {

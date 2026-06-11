@@ -112,6 +112,36 @@ pub fn send(
     throw_if_not_ok(response)
 }
 
+/// Send a request and return the raw [`ClientResponse`] for ANY HTTP status,
+/// raising only on a transport/egress failure.
+///
+/// The resumable-upload helper drives a multi-status protocol where several
+/// non-2xx codes are control signals rather than terminal errors: a `402` at
+/// session create surfaces a funding decision, a `409 incomplete-upload` at
+/// complete is a resume cue, and a chunk re-`PUT` may legitimately conflict. Such
+/// callers branch on the status themselves; [`send`] (which raises on every
+/// non-2xx) would collapse those signals into one error path.
+pub fn send_raw(
+    transport: &dyn ClientTransport,
+    url: &str,
+    method: HttpMethod,
+    headers: &[(String, String)],
+    body: &RequestBody,
+) -> Result<ClientResponse, ClientError> {
+    Ok(transport.send(url, method, headers, body)?)
+}
+
+/// Raise the typed [`ClientError::Http`] for a non-2xx [`ClientResponse`],
+/// mirroring [`send`]'s error mapping. Returns the response unchanged on 2xx.
+///
+/// A `send_raw` caller that decides a status is, after all, a terminal error
+/// (e.g. an unrecognised 4xx during the chunk loop) routes it through here so the
+/// failure carries the same RFC 7807 document and request id as every other
+/// client error.
+pub fn into_http_error(response: ClientResponse) -> Result<ClientResponse, ClientError> {
+    throw_if_not_ok(response)
+}
+
 /// Deserialize a success body into `T`.
 pub fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
     serde_json::from_slice(body).map_err(|e| ClientError::Decode(e.to_string()))

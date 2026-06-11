@@ -23,7 +23,9 @@ One subdirectory per primitive family:
 - `cose/` — COSE_Sign1 (build + verify + strict-Ed25519 + Sig_structure)
 - `discovery/` — passphrase envelope discovery tag (HMAC-SHA-256)
 - `sealed-poe/` — multi-recipient sealed-PoE wrap + unwrap (N=1, 3, 32 + negative)
-- `seed-derive/` — seed → Ed25519/X25519/X-Wing derivation
+- `seed-derive/` — seed → Ed25519/X25519/X-Wing derivation + recipient + identity-seed encodings
+- `validator/` — structural-validator corpora (negative, positive, role-dependent, bounds)
+- `carriage/` — label-309 chunk-array transport + auxiliary-data envelope forms
 
 One JSON file per scenario (KAT, roundtrip, negative). Naming convention:
 `<primitive>-<purpose>.json` (e.g. `sha256-kat.json`, `ed25519-zip215.json`,

@@ -1,231 +1,221 @@
 //! Label 309 wire-format parity tests.
 //!
-//! These tests pin the Rust encoder, validator, and chunking helpers against the
-//! same vectors the TypeScript and Python SDKs use:
+//! These tests pin the Rust encoder and structural validator against the same
+//! vectors the TypeScript and Python SDKs replay:
 //!
+//! - the shared validator conformance corpus — rejection vectors (one pinned
+//!   distinct error-code set per failure mode), resource-bound rejections,
+//!   acceptance vectors with their exact info-code sets, and the role-dependent
+//!   unknown-envelope dispositions, each validated under the vector's
+//!   `validator_options`;
 //! - the frozen maximal record vector (`cbor_hex` + `body_cbor_hex`) — the
 //!   single most important record-level byte oracle;
-//! - one positive KAT per wire surface, asserting acceptance + byte-exact
-//!   re-encode round-trip;
-//! - one negative KAT per structural error code, asserting the exact code;
-//! - the hybrid (X-Wing) slot-shape negatives;
-//! - the error-code catalogue invariants and the chunking helpers.
+//! - catalogue invariants for the error-code registry projection (entry order
+//!   is the cross-implementation sort key) and the issue-path ordering rules.
 
 mod common;
+
+use std::collections::BTreeSet;
 
 use cardanowall::cbor::{encode_canonical_cbor, CborValue};
 use cardanowall::hex;
 use cardanowall::poe_standard::{
-    bytes_chunk_array_concat, chunk_bytes, chunk_uri, encode_poe_record,
-    encode_record_body_for_signing, is_valid_cid, reconstruct_chunked_uri, validate_poe_record,
-    EncryptionEnvelope, ErrorCode, ItemEntry, MerkleCommit, PassphraseBlock, PoeRecord,
-    ReconstructUriResult, Severity, SigEntry, Slot, ValidateResult, STRUCTURAL_ERROR_CODES,
-    VERIFIER_ERROR_CODES,
+    encode_poe_record, encode_record_body_for_signing, validate_poe_record, Argon2ParamsCeiling,
+    EncScheme1, EncryptionEnvelope, ErrorCode, ItemEntry, MerkleCommit, PassphraseBlock,
+    PathSegment, PoeRecord, Severity, SigEntry, Slot, ValidateResult, ValidatorOptions,
+    ValidatorRole, CARRIAGE_ERROR_CODES, ERROR_CODES, STRUCTURAL_ERROR_CODES, VERIFIER_ERROR_CODES,
 };
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Conformance corpus replay
 // ---------------------------------------------------------------------------
 
-fn hash32(byte: u8) -> Vec<u8> {
-    vec![byte; 32]
+fn load_vectors(file: &str) -> Vec<Value> {
+    let path = common::crypto_core_fixtures().join(file);
+    let corpus = common::read_fixture_json(&path);
+    corpus["vectors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{file} carries a vectors array"))
+        .clone()
 }
 
-fn repeat_byte(len: usize, byte: u8) -> Vec<u8> {
-    vec![byte; len]
-}
-
-/// Chunk a flat byte string into <=64-byte chunks (the on-wire `kem_ct` shape).
-fn chunk64(value: &[u8]) -> Vec<Vec<u8>> {
-    value.chunks(64).map(<[u8]>::to_vec).collect()
-}
-
-const MLKEM768X25519_ENC_LENGTH: usize = 1120;
-
-fn assert_emits(record_bytes: &[u8], code: ErrorCode) {
-    let result = validate_poe_record(record_bytes);
-    assert!(!result.is_ok(), "expected reject for {}", code.code());
-    assert!(
-        result.codes().contains(&code),
-        "expected {} among emitted codes {:?}",
-        code.code(),
-        result.codes().iter().map(|c| c.code()).collect::<Vec<_>>()
-    );
-}
-
-fn assert_sole_code(record_bytes: &[u8], code: ErrorCode) {
-    let result = validate_poe_record(record_bytes);
-    assert!(!result.is_ok(), "expected reject for {}", code.code());
-    let codes = result.codes();
-    assert!(codes.contains(&code), "missing {}", code.code());
-    assert_eq!(
-        codes.len(),
-        1,
-        "expected sole code {} but got {:?}",
-        code.code(),
-        codes.iter().map(|c| c.code()).collect::<Vec<_>>()
-    );
-}
-
-/// Build a record whose single item carries the given `enc` envelope value.
-/// `enc` is supplied as a raw `CborValue::Map` so the negative cases can craft
-/// arbitrary (even malformed) envelope shapes the typed builder cannot express.
-fn record_with_enc(enc: CborValue) -> Vec<u8> {
-    let record = CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (
-                    CborValue::text("hashes"),
-                    CborValue::Map(vec![(
-                        CborValue::text("sha2-256"),
-                        CborValue::Bytes(hash32(0xab)),
-                    )]),
-                ),
-                (CborValue::text("enc"), enc),
-            ])]),
-        ),
-    ]);
-    encode_canonical_cbor(&record).expect("encode record_with_enc")
-}
-
-/// A well-formed classical (x25519) sealed envelope as a raw CBOR map; negative
-/// cases mutate individual fields.
-fn sealed_base_pairs() -> Vec<(CborValue, CborValue)> {
-    vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("aead"),
-            CborValue::text("xchacha20-poly1305"),
-        ),
-        (CborValue::text("kem"), CborValue::text("x25519")),
-        (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
-        ),
-        (
-            CborValue::text("slots"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (CborValue::text("epk"), CborValue::Bytes(repeat_byte(32, 0))),
-                (
-                    CborValue::text("wrap"),
-                    CborValue::Bytes(repeat_byte(48, 0)),
-                ),
-            ])]),
-        ),
-        (
-            CborValue::text("slots_mac"),
-            CborValue::Bytes(repeat_byte(32, 0)),
-        ),
-    ]
-}
-
-fn sealed_base() -> CborValue {
-    CborValue::Map(sealed_base_pairs())
-}
-
-/// Replace (or insert) a key in a CBOR map's pair list.
-fn map_set(pairs: &mut Vec<(CborValue, CborValue)>, key: &str, value: CborValue) {
-    if let Some(slot) = pairs
-        .iter_mut()
-        .find(|(k, _)| matches!(k, CborValue::Text(t) if t == key))
-    {
-        slot.1 = value;
-    } else {
-        pairs.push((CborValue::text(key), value));
-    }
-}
-
-fn map_remove(pairs: &mut Vec<(CborValue, CborValue)>, key: &str) {
-    pairs.retain(|(k, _)| !matches!(k, CborValue::Text(t) if t == key));
-}
-
-fn sealed_hybrid_pairs() -> Vec<(CborValue, CborValue)> {
-    vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("aead"),
-            CborValue::text("xchacha20-poly1305"),
-        ),
-        (CborValue::text("kem"), CborValue::text("mlkem768x25519")),
-        (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
-        ),
-        (
-            CborValue::text("slots"),
-            CborValue::Array(vec![hybrid_slot(MLKEM768X25519_ENC_LENGTH)]),
-        ),
-        (
-            CborValue::text("slots_mac"),
-            CborValue::Bytes(repeat_byte(32, 0)),
-        ),
-    ]
-}
-
-fn hybrid_slot(kem_ct_len: usize) -> CborValue {
-    CborValue::Map(vec![
-        (
-            CborValue::text("kem_ct"),
-            CborValue::Array(
-                chunk64(&repeat_byte(kem_ct_len, 0))
-                    .into_iter()
-                    .map(CborValue::Bytes)
-                    .collect(),
-            ),
-        ),
-        (
-            CborValue::text("wrap"),
-            CborValue::Bytes(repeat_byte(48, 0)),
-        ),
-    ])
-}
-
-/// Build a canonical COSE_Sign1 `[protected, {}, payload, sig64]`.
-fn build_cose_sign1(alg: i64, kid: Option<Vec<u8>>, attached_payload: bool) -> Vec<u8> {
-    let mut protected_pairs = vec![(CborValue::Unsigned(1), CborValue::int(alg))];
-    if let Some(kid) = kid {
-        protected_pairs.push((CborValue::Unsigned(4), CborValue::Bytes(kid)));
-    }
-    let protected_bytes =
-        encode_canonical_cbor(&CborValue::Map(protected_pairs)).expect("encode protected");
-    let payload = if attached_payload {
-        CborValue::Bytes(Vec::new())
-    } else {
-        CborValue::Null
+/// Project a vector's `validator_options` onto [`ValidatorOptions`]. Absent
+/// fields keep the defaults; `passphraseParamsCeiling: null` disables the
+/// ceiling.
+fn fixture_options(vector: &Value) -> ValidatorOptions {
+    let mut options = ValidatorOptions::default();
+    let Some(raw) = vector.get("validator_options") else {
+        return options;
     };
-    encode_canonical_cbor(&CborValue::Array(vec![
-        CborValue::Bytes(protected_bytes),
-        CborValue::Map(Vec::new()),
-        payload,
-        CborValue::Bytes(repeat_byte(64, 0x99)),
-    ]))
-    .expect("encode cose_sign1")
+    if let Some(extensions) = raw
+        .get("supportedCriticalExtensions")
+        .and_then(Value::as_array)
+    {
+        options.supported_critical_extensions = extensions
+            .iter()
+            .map(|e| e.as_str().expect("extension name is a string").to_string())
+            .collect();
+    }
+    if let Some(max_slots) = raw.get("maxSlots").and_then(Value::as_u64) {
+        options.max_slots = usize::try_from(max_slots).expect("maxSlots fits usize");
+    }
+    if let Some(max_bytes) = raw.get("maxEncEnvelopeBytes").and_then(Value::as_u64) {
+        options.max_enc_envelope_bytes =
+            usize::try_from(max_bytes).expect("maxEncEnvelopeBytes fits usize");
+    }
+    if let Some(ceiling) = raw.get("passphraseParamsCeiling") {
+        options.passphrase_params_ceiling = if ceiling.is_null() {
+            None
+        } else {
+            Some(Argon2ParamsCeiling {
+                m: ceiling["m"].as_u64().expect("ceiling m"),
+                t: ceiling["t"].as_u64().expect("ceiling t"),
+                p: ceiling["p"].as_u64().expect("ceiling p"),
+            })
+        };
+    }
+    options
 }
 
-/// Build a `cbor<COSE_Key>` int-keyed map; `private` adds the forbidden -4 label.
-fn build_cose_key(private: bool) -> Vec<u8> {
-    let mut pairs = vec![
-        (CborValue::Unsigned(1), CborValue::Unsigned(1)),
-        (CborValue::int(-1), CborValue::Unsigned(6)),
-        (CborValue::int(-2), CborValue::Bytes(hash32(0x55))),
-    ];
-    if private {
-        pairs.push((CborValue::int(-4), CborValue::Bytes(hash32(0xaa))));
+fn expected_code_set(vector: &Value, field: &str) -> BTreeSet<String> {
+    vector[field]
+        .as_array()
+        .map(|codes| {
+            codes
+                .iter()
+                .map(|c| c.as_str().expect("code is a string").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn code_strings(codes: &BTreeSet<ErrorCode>) -> BTreeSet<String> {
+    codes.iter().map(|c| c.code().to_string()).collect()
+}
+
+/// Replay one negative/bounds corpus file: the distinct error-severity code
+/// set must equal the vector's `expected_error_codes` exactly (an empty
+/// expected set pins an accepted record).
+fn replay_negative_corpus(file: &str) {
+    for vector in load_vectors(file) {
+        let name = vector["name"].as_str().expect("vector name");
+        let bytes = hex::decode(vector["cbor_hex"].as_str().expect("cbor_hex")).expect("hex");
+        let options = fixture_options(&vector);
+        let result = validate_poe_record(&bytes, &options);
+        let expected = expected_code_set(&vector, "expected_error_codes");
+        if expected.is_empty() {
+            assert!(result.is_ok(), "{file}/{name}: expected acceptance");
+            continue;
+        }
+        assert!(!result.is_ok(), "{file}/{name}: expected rejection");
+        assert_eq!(
+            code_strings(&result.error_codes()),
+            expected,
+            "{file}/{name}: distinct error-code set mismatch"
+        );
     }
-    encode_canonical_cbor(&CborValue::Map(pairs)).expect("encode cose_key")
+}
+
+#[test]
+fn validator_negative_corpus_replays() {
+    replay_negative_corpus("validator/validator-negative.json");
+}
+
+#[test]
+fn validator_bounds_negative_corpus_replays() {
+    replay_negative_corpus("validator/validator-bounds-negative.json");
+}
+
+#[test]
+fn validator_positive_corpus_replays() {
+    for vector in load_vectors("validator/validator-positive.json") {
+        let name = vector["name"].as_str().expect("vector name");
+        let bytes = hex::decode(vector["cbor_hex"].as_str().expect("cbor_hex")).expect("hex");
+        assert!(
+            expected_code_set(&vector, "expected_error_codes").is_empty(),
+            "{name}: a positive vector pins an empty error set"
+        );
+        let result = validate_poe_record(&bytes, &ValidatorOptions::default());
+        let ValidateResult::Ok { warnings, info, .. } = result else {
+            panic!("{name}: expected acceptance, got {result:?}");
+        };
+        let expected_info = expected_code_set(&vector, "expected_info_codes");
+        let actual_info: BTreeSet<String> =
+            info.iter().map(|i| i.code.code().to_string()).collect();
+        assert_eq!(actual_info, expected_info, "{name}: info-code set mismatch");
+        assert!(warnings.is_empty(), "{name}: unexpected warnings");
+    }
+}
+
+#[test]
+fn enc_unsupported_roles_corpus_replays_both_readings() {
+    for vector in load_vectors("validator/enc-unsupported-roles.json") {
+        let name = vector["name"].as_str().expect("vector name");
+        let bytes = hex::decode(vector["cbor_hex"].as_str().expect("cbor_hex")).expect("hex");
+        for (role_name, role) in [
+            ("public", ValidatorRole::Public),
+            ("recipient_or_strict", ValidatorRole::RecipientOrStrict),
+        ] {
+            let expectation = &vector["expected_by_role"][role_name];
+            let options = ValidatorOptions {
+                role,
+                ..ValidatorOptions::default()
+            };
+            let result = validate_poe_record(&bytes, &options);
+            assert_eq!(
+                result.is_ok(),
+                expectation["valid"].as_bool().expect("valid flag"),
+                "{name} ({role_name}): verdict mismatch"
+            );
+            let expected_errors: BTreeSet<String> = expectation["error_codes"]
+                .as_array()
+                .expect("error_codes")
+                .iter()
+                .map(|c| c.as_str().expect("code").to_string())
+                .collect();
+            let expected_info: BTreeSet<String> = expectation["info_codes"]
+                .as_array()
+                .expect("info_codes")
+                .iter()
+                .map(|c| c.as_str().expect("code").to_string())
+                .collect();
+            assert_eq!(
+                code_strings(&result.error_codes()),
+                expected_errors,
+                "{name} ({role_name}): error-code set mismatch"
+            );
+            assert_eq!(
+                code_strings(&result.info_codes()),
+                expected_info,
+                "{name} ({role_name}): info-code set mismatch"
+            );
+        }
+    }
+}
+
+#[test]
+fn role_default_is_public() {
+    let vectors = load_vectors("validator/enc-unsupported-roles.json");
+    let vector = &vectors[0];
+    let bytes = hex::decode(vector["cbor_hex"].as_str().expect("cbor_hex")).expect("hex");
+    let result = validate_poe_record(&bytes, &ValidatorOptions::default());
+    assert_eq!(
+        result.is_ok(),
+        vector["expected_by_role"]["public"]["valid"]
+            .as_bool()
+            .expect("valid flag")
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Frozen record vector (the record-level byte oracle)
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the typed `PoeRecord` from the fixture JSON, mirroring the
-/// TypeScript `buildRecord` in `encoder.vector.test.ts`: `_hex` fields decode to
-/// bytes, chunked-bytes arrays are arrays of hex strings, and every top-level
-/// key the reconstructor does not consume is a verbatim extension key.
+/// Reconstruct the typed `PoeRecord` from the fixture JSON: `_hex` fields
+/// decode to bytes, `uris` are plain strings, `cose_sign1_hex` is a single hex
+/// string, and every top-level key the reconstructor does not consume is a
+/// verbatim extension key.
 fn build_record_from_fixture(record_json: &Value) -> PoeRecord {
     let obj = record_json.as_object().expect("record is an object");
     let mut record = PoeRecord {
@@ -256,8 +246,11 @@ fn build_record_from_fixture(record_json: &Value) -> PoeRecord {
         record.sigs = Some(
             sigs.iter()
                 .map(|s| SigEntry {
-                    cose_sign1: hex_chunk_array(&s["cose_sign1_hex"]),
-                    cose_key: s.get("cose_key_hex").map(hex_chunk_array),
+                    cose_sign1: hex::decode(s["cose_sign1_hex"].as_str().unwrap()).unwrap(),
+                    cose_key: s
+                        .get("cose_key_hex")
+                        .and_then(Value::as_str)
+                        .map(|k| hex::decode(k).unwrap()),
                 })
                 .collect(),
         );
@@ -295,14 +288,7 @@ fn build_item_from_fixture(item: &Value) -> ItemEntry {
         .collect();
     let uris = item.get("uris").and_then(Value::as_array).map(|uris| {
         uris.iter()
-            .map(|chunks| {
-                chunks
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|c| c.as_str().unwrap().to_string())
-                    .collect()
-            })
+            .map(|u| u.as_str().unwrap().to_string())
             .collect()
     });
     let enc = item.get("enc").map(|enc| {
@@ -310,13 +296,19 @@ fn build_item_from_fixture(item: &Value) -> ItemEntry {
             slots
                 .iter()
                 .map(|s| Slot {
-                    epk: Some(hex::decode(s["epk_hex"].as_str().unwrap()).unwrap()),
-                    kem_ct: None,
+                    epk: s
+                        .get("epk_hex")
+                        .and_then(Value::as_str)
+                        .map(|h| hex::decode(h).unwrap()),
+                    kem_ct: s
+                        .get("kem_ct_hex")
+                        .and_then(Value::as_str)
+                        .map(|h| hex::decode(h).unwrap()),
                     wrap: Some(hex::decode(s["wrap_hex"].as_str().unwrap()).unwrap()),
                 })
                 .collect()
         });
-        EncryptionEnvelope {
+        EncryptionEnvelope::Scheme1(EncScheme1 {
             scheme: enc["scheme"].as_u64().unwrap(),
             aead: enc["aead"].as_str().unwrap().to_string(),
             nonce: hex::decode(enc["nonce_hex"].as_str().unwrap()).unwrap(),
@@ -327,24 +319,15 @@ fn build_item_from_fixture(item: &Value) -> ItemEntry {
                 .and_then(Value::as_str)
                 .map(|s| hex::decode(s).unwrap()),
             passphrase: None,
-        }
+        })
     });
     ItemEntry { hashes, uris, enc }
 }
 
-fn hex_chunk_array(value: &Value) -> Vec<Vec<u8>> {
-    value
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| hex::decode(c.as_str().unwrap()).unwrap())
-        .collect()
-}
-
 /// Convert a JSON value into a `CborValue` for an extension key. JSON integers
 /// become unsigned/negative ints, strings become text, objects become maps,
-/// arrays become arrays. The fixture's extension keys are `x-note` (string) and
-/// `x-meta` ({a:1, bb:2}).
+/// arrays become arrays. The fixture's extension keys are `x-note` (string)
+/// and `x-meta` ({a:1, bb:2}).
 fn json_to_cbor(value: &Value) -> CborValue {
     match value {
         Value::String(s) => CborValue::text(s.clone()),
@@ -389,26 +372,50 @@ fn frozen_record_vector_reproduces_full_and_body_cbor() {
         "record body CBOR (body_cbor_hex, sigs stripped) must match byte-for-byte"
     );
 
-    // The frozen vector is an ENCODE oracle, not a validation oracle: it carries
-    // `crit: ["x-note"]`, and v1 implements zero extensions, so every shape-valid
-    // crit entry is EXTENSION_UNSUPPORTED_CRITICAL (error-severity). The validator
-    // therefore rejects this record by design — assert that exact verdict so the
-    // crit-handling path stays pinned alongside the byte oracle.
-    let result = validate_poe_record(&full);
-    assert!(!result.is_ok());
-    assert!(result
-        .codes()
+    // The vector validates clean only under the fixture's validator options
+    // (the record carries `crit: ["x-note"]`); a default-configured validator
+    // rejects it with EXTENSION_UNSUPPORTED_CRITICAL — by design.
+    let result = validate_poe_record(&full, &fixture_options(&fixture));
+    assert!(
+        result.is_ok(),
+        "the frozen vector validates under its pinned options: {result:?}"
+    );
+
+    let default_result = validate_poe_record(&full, &ValidatorOptions::default());
+    assert!(!default_result.is_ok());
+    assert!(default_result
+        .error_codes()
         .contains(&ErrorCode::ExtensionUnsupportedCritical));
 
     // Extension keys are the load-bearing case: assert the vector still pins
     // them so a future fixture edit cannot silently stop testing the path.
     assert!(record.extensions.iter().any(|(k, _)| k == "x-note"));
     assert!(record.extensions.iter().any(|(k, _)| k == "x-meta"));
+
+    // The accepted record re-encodes to the same bytes (the round-trip
+    // property over the decoded record).
+    let ValidateResult::Ok {
+        record: decoded, ..
+    } = validate_poe_record(&full, &fixture_options(&fixture))
+    else {
+        unreachable!();
+    };
+    assert_eq!(encode_poe_record(&decoded).unwrap(), full);
 }
 
 // ---------------------------------------------------------------------------
-// Positive KAT corpus
+// Encoder round-trips (positive corpus over the typed builder)
 // ---------------------------------------------------------------------------
+
+fn hash32(byte: u8) -> Vec<u8> {
+    vec![byte; 32]
+}
+
+fn repeat_byte(len: usize, byte: u8) -> Vec<u8> {
+    vec![byte; len]
+}
+
+const AEAD_ID: &str = "chacha20-poly1305-stream64k";
 
 fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
     vec![
@@ -435,25 +442,7 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
                     alg: "rfc9162-sha256".to_string(),
                     root: hash32(0x77),
                     leaf_count: 8,
-                    uris: None,
-                }]),
-                ..PoeRecord::default()
-            },
-        ),
-        (
-            "hybrid-items-merkle",
-            PoeRecord {
-                v: 1,
-                items: Some(vec![ItemEntry {
-                    hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-                    uris: None,
-                    enc: None,
-                }]),
-                merkle: Some(vec![MerkleCommit {
-                    alg: "rfc9162-sha256".to_string(),
-                    root: hash32(0x88),
-                    leaf_count: 16,
-                    uris: None,
+                    uris: Some(vec![format!("ar://{}", "A".repeat(43))]),
                 }]),
                 ..PoeRecord::default()
             },
@@ -476,14 +465,11 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
             PoeRecord {
                 v: 1,
                 items: Some(vec![ItemEntry {
-                    hashes: vec![
-                        ("sha2-256".to_string(), hash32(0xab)),
-                        ("blake2b-256".to_string(), hash32(0x22)),
-                    ],
+                    hashes: vec![("sha2-256".to_string(), hash32(0xab))],
                     uris: None,
-                    enc: Some(EncryptionEnvelope {
+                    enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
                         scheme: 1,
-                        aead: "xchacha20-poly1305".to_string(),
+                        aead: AEAD_ID.to_string(),
                         nonce: repeat_byte(24, 0),
                         kem: Some("x25519".to_string()),
                         slots: Some(vec![
@@ -500,7 +486,7 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
                         ]),
                         slots_mac: Some(repeat_byte(32, 0x07)),
                         passphrase: None,
-                    }),
+                    })),
                 }]),
                 ..PoeRecord::default()
             },
@@ -511,20 +497,22 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
                 v: 1,
                 items: Some(vec![ItemEntry {
                     hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-                    uris: None,
-                    enc: Some(EncryptionEnvelope {
+                    uris: Some(vec![
+                        "ipfs://QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH".to_string(),
+                    ]),
+                    enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
                         scheme: 1,
-                        aead: "xchacha20-poly1305".to_string(),
+                        aead: AEAD_ID.to_string(),
                         nonce: repeat_byte(24, 0),
                         kem: Some("mlkem768x25519".to_string()),
                         slots: Some(vec![Slot {
                             epk: None,
-                            kem_ct: Some(chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11))),
+                            kem_ct: Some(repeat_byte(1120, 0x11)),
                             wrap: Some(repeat_byte(48, 0x02)),
                         }]),
                         slots_mac: Some(repeat_byte(32, 0x07)),
                         passphrase: None,
-                    }),
+                    })),
                 }]),
                 ..PoeRecord::default()
             },
@@ -536,9 +524,9 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
                 items: Some(vec![ItemEntry {
                     hashes: vec![("sha2-256".to_string(), hash32(0xab))],
                     uris: None,
-                    enc: Some(EncryptionEnvelope {
+                    enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
                         scheme: 1,
-                        aead: "xchacha20-poly1305".to_string(),
+                        aead: AEAD_ID.to_string(),
                         nonce: repeat_byte(24, 0),
                         kem: None,
                         slots: None,
@@ -552,33 +540,7 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
                                 ("p".to_string(), 1),
                             ],
                         }),
-                    }),
-                }]),
-                ..PoeRecord::default()
-            },
-        ),
-        (
-            "items-with-ar-uri",
-            PoeRecord {
-                v: 1,
-                items: Some(vec![ItemEntry {
-                    hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-                    uris: Some(vec![chunk_uri(&format!("ar://{}", "A".repeat(43)))]),
-                    enc: None,
-                }]),
-                ..PoeRecord::default()
-            },
-        ),
-        (
-            "items-with-ipfs-cidv0-uri",
-            PoeRecord {
-                v: 1,
-                items: Some(vec![ItemEntry {
-                    hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-                    uris: Some(vec![chunk_uri(
-                        "ipfs://QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
-                    )]),
-                    enc: None,
+                    })),
                 }]),
                 ..PoeRecord::default()
             },
@@ -590,13 +552,12 @@ fn positive_corpus() -> Vec<(&'static str, PoeRecord)> {
 fn positive_corpus_accepts_and_round_trips() {
     for (name, record) in positive_corpus() {
         let encoded = encode_poe_record(&record).unwrap();
-        let result = validate_poe_record(&encoded);
-        assert!(result.is_ok(), "{name} should validate");
+        let result = validate_poe_record(&encoded, &ValidatorOptions::default());
         let ValidateResult::Ok {
             record: decoded, ..
         } = result
         else {
-            unreachable!();
+            panic!("{name} should validate: {result:?}");
         };
         // validate(encode(R)).record re-encodes to the same bytes.
         let reencoded = encode_poe_record(&decoded).unwrap();
@@ -605,178 +566,23 @@ fn positive_corpus_accepts_and_round_trips() {
 }
 
 #[test]
-fn signed_record_with_real_cose_sign1_validates() {
-    let cose = build_cose_sign1(-8, None, false);
-    let record = PoeRecord {
-        v: 1,
-        items: Some(vec![ItemEntry {
-            hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-            uris: None,
-            enc: None,
-        }]),
-        sigs: Some(vec![SigEntry {
-            cose_sign1: chunk_bytes(&cose),
-            cose_key: None,
-        }]),
-        ..PoeRecord::default()
-    };
-    let result = validate_poe_record(&encode_poe_record(&record).unwrap());
-    assert!(result.is_ok());
-}
-
-#[test]
-fn unsupported_sig_alg_is_info_not_failure() {
-    // alg = -7 (ES256) is not in {-8, -19}; SIGNATURE_UNSUPPORTED is info-only.
-    let cose = build_cose_sign1(-7, None, false);
-    let record = PoeRecord {
-        v: 1,
-        items: Some(vec![ItemEntry {
-            hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-            uris: None,
-            enc: None,
-        }]),
-        sigs: Some(vec![SigEntry {
-            cose_sign1: chunk_bytes(&cose),
-            cose_key: None,
-        }]),
-        ..PoeRecord::default()
-    };
-    let result = validate_poe_record(&encode_poe_record(&record).unwrap());
-    assert!(
-        result.is_ok(),
-        "unsupported sig alg must not fail the record"
-    );
-    assert!(result.codes().contains(&ErrorCode::SignatureUnsupported));
-}
-
-#[test]
-fn extension_keys_are_accepted() {
+fn opaque_envelope_round_trips_verbatim() {
+    // An envelope under an unsupported kem degrades to the opaque reading in
+    // the public role: the record is accepted (ENC_UNSUPPORTED info) and the
+    // decoded record preserves the envelope verbatim, so re-encoding
+    // reproduces the original bytes (a signed body would re-verify).
     let record = CborValue::Map(vec![
         (CborValue::text("v"), CborValue::Unsigned(1)),
         (
             CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![(
-                CborValue::text("hashes"),
-                CborValue::Map(vec![(
-                    CborValue::text("sha2-256"),
-                    CborValue::Bytes(hash32(0xab)),
-                )]),
-            )])]),
-        ),
-        (
-            CborValue::text("x-vendor-flag"),
-            CborValue::text("experiment"),
-        ),
-    ]);
-    let bytes = encode_canonical_cbor(&record).unwrap();
-    assert!(validate_poe_record(&bytes).is_ok());
-}
-
-// ---------------------------------------------------------------------------
-// Negative KAT corpus (one per structural error code)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn negative_corpus_emits_expected_codes() {
-    // MALFORMED_CBOR — a stray break byte sequence.
-    assert_emits(&hex::decode("ffffffff").unwrap(), ErrorCode::MalformedCbor);
-
-    // SCHEMA_TYPE_MISMATCH — items is a text string, not an array.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), CborValue::text("not-an-array")),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaTypeMismatch);
-
-    // SCHEMA_MISSING_REQUIRED — empty map (no v).
-    let bytes = encode_canonical_cbor(&CborValue::Map(Vec::new())).unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaMissingRequired);
-
-    // SCHEMA_UNKNOWN_FIELD — a non-extension typo key.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("supersedess"),
-            CborValue::Bytes(repeat_byte(32, 0)),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaUnknownField);
-
-    // SCHEMA_INVALID_LITERAL — v = 2.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(2)),
-        (CborValue::text("items"), valid_items()),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaInvalidLiteral);
-
-    // SCHEMA_EMPTY_RECORD — items=[] and merkle=[].
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), CborValue::Array(Vec::new())),
-        (CborValue::text("merkle"), CborValue::Array(Vec::new())),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaEmptyRecord);
-
-    // HASH_DIGEST_LENGTH_MISMATCH — 31-byte sha2-256.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![(
-                CborValue::text("hashes"),
-                CborValue::Map(vec![(
-                    CborValue::text("sha2-256"),
-                    CborValue::Bytes(repeat_byte(31, 0)),
-                )]),
-            )])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::HashDigestLengthMismatch);
-
-    // UNSUPPORTED_HASH_ALG — md5.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![(
-                CborValue::text("hashes"),
-                CborValue::Map(vec![(
-                    CborValue::text("md5"),
-                    CborValue::Bytes(repeat_byte(16, 0)),
-                )]),
-            )])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::UnsupportedHashAlg);
-
-    // UNSUPPORTED_MERKLE_COMMIT_ALG.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("merkle"),
             CborValue::Array(vec![CborValue::Map(vec![
-                (CborValue::text("alg"), CborValue::text("custom-merkle")),
-                (CborValue::text("root"), CborValue::Bytes(hash32(0xab))),
-                (CborValue::text("leaf_count"), CborValue::Unsigned(4)),
-            ])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::UnsupportedMerkleCommitAlg);
-
-    // INVALID_URI — https scheme.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![
+                (
+                    CborValue::text("enc"),
+                    CborValue::Map(vec![
+                        (CborValue::text("future"), CborValue::Bytes(vec![0x01; 8])),
+                        (CborValue::text("scheme"), CborValue::Unsigned(2)),
+                    ]),
+                ),
                 (
                     CborValue::text("hashes"),
                     CborValue::Map(vec![(
@@ -784,682 +590,234 @@ fn negative_corpus_emits_expected_codes() {
                         CborValue::Bytes(hash32(0xab)),
                     )]),
                 ),
-                (
-                    CborValue::text("uris"),
-                    CborValue::Array(vec![CborValue::Array(vec![CborValue::text(
-                        "https://example.org/x",
-                    )])]),
-                ),
             ])]),
         ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::InvalidUri);
+    ]);
+    let bytes = encode_canonical_cbor(&record).unwrap();
+    let result = validate_poe_record(&bytes, &ValidatorOptions::default());
+    let ValidateResult::Ok {
+        record: decoded,
+        info,
+        ..
+    } = result
+    else {
+        panic!("opaque envelope must be accepted in the public role: {result:?}");
+    };
+    assert!(info.iter().any(|i| i.code == ErrorCode::EncUnsupported));
+    let item = &decoded.items.as_ref().unwrap()[0];
+    assert!(matches!(item.enc, Some(EncryptionEnvelope::Opaque(_))));
+    assert_eq!(encode_poe_record(&decoded).unwrap(), bytes);
+}
 
-    // UNAUTHENTICATED_CIPHER_FORBIDDEN.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "aead", CborValue::text("aes-256-cbc"));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::UnauthenticatedCipherForbidden,
-    );
+#[test]
+fn passphrase_ceiling_none_disables_the_policy_check() {
+    let record = PoeRecord {
+        v: 1,
+        items: Some(vec![ItemEntry {
+            hashes: vec![("sha2-256".to_string(), hash32(0xab))],
+            uris: None,
+            enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
+                scheme: 1,
+                aead: AEAD_ID.to_string(),
+                nonce: repeat_byte(24, 0),
+                kem: None,
+                slots: None,
+                slots_mac: None,
+                passphrase: Some(PassphraseBlock {
+                    alg: "argon2id".to_string(),
+                    salt: repeat_byte(16, 0),
+                    // Above the default ceiling {m: 2097152, t: 16, p: 8} but
+                    // inside the wire range.
+                    params: vec![
+                        ("m".to_string(), 4_194_304),
+                        ("t".to_string(), 32),
+                        ("p".to_string(), 16),
+                    ],
+                }),
+            })),
+        }]),
+        ..PoeRecord::default()
+    };
+    let bytes = encode_poe_record(&record).unwrap();
 
-    // UNSUPPORTED_AEAD_ALG.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "aead", CborValue::text("twofish-gcm"));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::UnsupportedAeadAlg,
-    );
+    // Default options: the ceiling is enforced.
+    let default_result = validate_poe_record(&bytes, &ValidatorOptions::default());
+    assert!(default_result
+        .error_codes()
+        .contains(&ErrorCode::EncPassphraseParamsExceedPolicy));
 
-    // NONCE_LENGTH_MISMATCH.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "nonce", CborValue::Bytes(repeat_byte(12, 0)));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::NonceLengthMismatch,
-    );
+    // Ceiling disabled: the same record passes.
+    let no_ceiling = ValidatorOptions {
+        passphrase_params_ceiling: None,
+        ..ValidatorOptions::default()
+    };
+    assert!(validate_poe_record(&bytes, &no_ceiling).is_ok());
+}
 
-    // UNSUPPORTED_ENVELOPE_SCHEME.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "scheme", CborValue::Unsigned(2));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::UnsupportedEnvelopeScheme,
-    );
+// ---------------------------------------------------------------------------
+// Issue paths and deterministic ordering
+// ---------------------------------------------------------------------------
 
-    // ENC_SLOTS_EMPTY.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "slots", CborValue::Array(Vec::new()));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotsEmpty,
-    );
+fn key(s: &str) -> PathSegment {
+    PathSegment::Key(s.to_string())
+}
 
-    // ENC_SLOT_INVALID_SHAPE — slot missing wrap.
-    let mut enc = sealed_base_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![CborValue::Map(vec![(
-            CborValue::text("epk"),
-            CborValue::Bytes(repeat_byte(32, 0)),
-        )])]),
-    );
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotInvalidShape,
-    );
-
-    // UNSUPPORTED_KEM_ALG.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "kem", CborValue::text("x448"));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::UnsupportedKemAlg,
-    );
-
-    // ENC_KEM_REQUIRED.
-    let mut enc = sealed_base_pairs();
-    map_remove(&mut enc, "kem");
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncKemRequired,
-    );
-
-    // KEM_EPK_LENGTH_MISMATCH.
-    let mut enc = sealed_base_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![CborValue::Map(vec![
-            (CborValue::text("epk"), CborValue::Bytes(repeat_byte(31, 0))),
-            (
-                CborValue::text("wrap"),
-                CborValue::Bytes(repeat_byte(48, 0)),
-            ),
-        ])]),
-    );
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::KemEpkLengthMismatch,
-    );
-
-    // KEM_CT_LENGTH_MISMATCH — hybrid kem_ct reassembles to 1119.
-    let mut enc = sealed_hybrid_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![hybrid_slot(MLKEM768X25519_ENC_LENGTH - 1)]),
-    );
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::KemCtLengthMismatch,
-    );
-
-    // WRAP_LENGTH_MISMATCH.
-    let mut enc = sealed_base_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![CborValue::Map(vec![
-            (CborValue::text("epk"), CborValue::Bytes(repeat_byte(32, 0))),
-            (
-                CborValue::text("wrap"),
-                CborValue::Bytes(repeat_byte(40, 0)),
-            ),
-        ])]),
-    );
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::WrapLengthMismatch,
-    );
-
-    // ENC_SLOTS_MAC_INVALID_LENGTH.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "slots_mac", CborValue::Bytes(repeat_byte(31, 0)));
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotsMacInvalidLength,
-    );
-
-    // ENC_SLOTS_MAC_REQUIRED.
-    let mut enc = sealed_base_pairs();
-    map_remove(&mut enc, "slots_mac");
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotsMacRequired,
-    );
-
-    // ENC_SLOTS_REQUIRED — slots_mac present, slots+kem absent.
-    let mut enc = sealed_base_pairs();
-    map_remove(&mut enc, "slots");
-    map_remove(&mut enc, "kem");
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotsRequired,
-    );
-
-    // ENC_EXCLUSIVITY_VIOLATION — slots AND passphrase.
-    let mut enc = sealed_base_pairs();
-    map_set(
-        &mut enc,
-        "passphrase",
-        argon2id_passphrase(65_536, 3, 1, 16),
-    );
-    assert_emits(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncExclusivityViolation,
-    );
-
-    // ENC_NO_KEY_PATH — neither slots nor passphrase.
-    let enc = CborValue::Map(vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
+#[test]
+fn issue_paths_land_on_the_offending_entry() {
+    // One record, three defects at distinct paths: an unregistered hash alg
+    // inside items[0], a leaf_count of zero inside merkle[0], and a stray
+    // top-level key. The sorted issue list pins both the per-issue path and
+    // the segment-wise order (integer segments before text segments, text by
+    // UTF-8 bytes, prefix first).
+    let record = CborValue::Map(vec![
+        (CborValue::text("v"), CborValue::Unsigned(1)),
         (
-            CborValue::text("aead"),
-            CborValue::text("xchacha20-poly1305"),
+            CborValue::text("items"),
+            CborValue::Array(vec![CborValue::Map(vec![(
+                CborValue::text("hashes"),
+                CborValue::Map(vec![
+                    (CborValue::text("md5"), CborValue::Bytes(vec![0u8; 16])),
+                    (CborValue::text("sha2-256"), CborValue::Bytes(hash32(0xab))),
+                ]),
+            )])]),
         ),
         (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
+            CborValue::text("merkle"),
+            CborValue::Array(vec![CborValue::Map(vec![
+                (CborValue::text("alg"), CborValue::text("rfc9162-sha256")),
+                (CborValue::text("leaf_count"), CborValue::Unsigned(0)),
+                (CborValue::text("root"), CborValue::Bytes(hash32(0x77))),
+            ])]),
+        ),
+        (
+            CborValue::text("zz-typo"),
+            CborValue::Unsigned(1), // "zz-typo" matches the companion namespace…
+        ),
+        (
+            CborValue::text("ZZTYPO"),
+            CborValue::Unsigned(1), // …but an uppercase key does not.
         ),
     ]);
-    assert_emits(&record_with_enc(enc), ErrorCode::EncNoKeyPath);
+    let bytes = encode_canonical_cbor(&record).unwrap();
+    let ValidateResult::Fail { issues } = validate_poe_record(&bytes, &ValidatorOptions::default())
+    else {
+        panic!("expected rejection");
+    };
+    let flat: Vec<(Vec<PathSegment>, ErrorCode)> =
+        issues.iter().map(|i| (i.path.clone(), i.code)).collect();
+    assert_eq!(
+        flat,
+        vec![
+            (vec![key("ZZTYPO")], ErrorCode::SchemaUnknownField),
+            (
+                vec![
+                    key("items"),
+                    PathSegment::Index(0),
+                    key("hashes"),
+                    key("md5")
+                ],
+                ErrorCode::UnsupportedHashAlg
+            ),
+            (
+                vec![key("merkle"), PathSegment::Index(0), key("leaf_count")],
+                ErrorCode::SchemaMerkleLeafCountInvalid
+            ),
+        ]
+    );
+}
 
-    // ENC_REQUIRES_CONTENT_HASH — an enc-bearing item whose hashes map has no
-    // content-hash entry. The predicate is the absence of a content hash,
-    // independent of whether the map is empty or merely non-content. A non-empty
-    // {md5} map also co-fires UNSUPPORTED_HASH_ALG (v1 has no non-content alg);
-    // an empty map also co-fires SCHEMA_TYPE_MISMATCH (the hashes-shape check).
-    // assert_emits tolerates the co-fired code.
-    let record_bytes = encode_canonical_cbor(&CborValue::Map(vec![
+#[test]
+fn same_path_issues_tie_break_by_registry_order() {
+    // slots_mac present without slots co-fires ENC_SLOTS_REQUIRED and
+    // ENC_NO_KEY_PATH at the same `enc` path; the registry order pins
+    // ENC_SLOTS_REQUIRED first.
+    let record = CborValue::Map(vec![
         (CborValue::text("v"), CborValue::Unsigned(1)),
         (
             CborValue::text("items"),
             CborValue::Array(vec![CborValue::Map(vec![
+                (
+                    CborValue::text("enc"),
+                    CborValue::Map(vec![
+                        (CborValue::text("aead"), CborValue::text(AEAD_ID)),
+                        (
+                            CborValue::text("nonce"),
+                            CborValue::Bytes(repeat_byte(24, 0x44)),
+                        ),
+                        (CborValue::text("scheme"), CborValue::Unsigned(1)),
+                        (
+                            CborValue::text("slots_mac"),
+                            CborValue::Bytes(repeat_byte(32, 0xaa)),
+                        ),
+                    ]),
+                ),
+                (
+                    CborValue::text("hashes"),
+                    CborValue::Map(vec![(
+                        CborValue::text("sha2-256"),
+                        CborValue::Bytes(hash32(0xab)),
+                    )]),
+                ),
+            ])]),
+        ),
+    ]);
+    let bytes = encode_canonical_cbor(&record).unwrap();
+    let ValidateResult::Fail { issues } = validate_poe_record(&bytes, &ValidatorOptions::default())
+    else {
+        panic!("expected rejection");
+    };
+    let codes: Vec<ErrorCode> = issues.iter().map(|i| i.code).collect();
+    assert_eq!(
+        codes,
+        vec![ErrorCode::EncSlotsRequired, ErrorCode::EncNoKeyPath]
+    );
+    let enc_path = vec![key("items"), PathSegment::Index(0), key("enc")];
+    assert!(issues.iter().all(|i| i.path == enc_path));
+}
+
+#[test]
+fn failed_records_carry_info_issues_alongside_errors() {
+    // A failing record with an info-severity disposition keeps the info issue
+    // in the failure list — the per-severity views are projections of one
+    // collected set, not separate channels.
+    let record = CborValue::Map(vec![
+        (CborValue::text("v"), CborValue::Unsigned(1)),
+        (
+            CborValue::text("items"),
+            CborValue::Array(vec![CborValue::Map(vec![
+                (
+                    CborValue::text("enc"),
+                    CborValue::Map(vec![(CborValue::text("scheme"), CborValue::Unsigned(2))]),
+                ),
                 (
                     CborValue::text("hashes"),
                     CborValue::Map(vec![(
                         CborValue::text("md5"),
-                        CborValue::Bytes(repeat_byte(16, 0)),
+                        CborValue::Bytes(vec![0u8; 16]),
                     )]),
                 ),
-                (CborValue::text("enc"), sealed_base()),
             ])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&record_bytes, ErrorCode::EncRequiresContentHash);
-
-    // The empty-hashes-map variant must ALSO emit ENC_REQUIRES_CONTENT_HASH
-    // (alongside SCHEMA_TYPE_MISMATCH from the hashes-shape check).
-    let empty_hashes_bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (CborValue::text("hashes"), CborValue::Map(vec![])),
-                (CborValue::text("enc"), sealed_base()),
-            ])]),
-        ),
-    ]))
-    .unwrap();
-    let empty_result = validate_poe_record(&empty_hashes_bytes);
-    assert!(empty_result
-        .codes()
-        .contains(&ErrorCode::EncRequiresContentHash));
-    assert!(empty_result
-        .codes()
-        .contains(&ErrorCode::SchemaTypeMismatch));
-
-    // ENC_PASSPHRASE_ALG_UNSUPPORTED.
-    let enc = CborValue::Map(vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("aead"),
-            CborValue::text("xchacha20-poly1305"),
-        ),
-        (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
-        ),
-        (
-            CborValue::text("passphrase"),
-            CborValue::Map(vec![
-                (CborValue::text("alg"), CborValue::text("pbkdf2-sha-256")),
-                (
-                    CborValue::text("salt"),
-                    CborValue::Bytes(repeat_byte(16, 0)),
-                ),
-                (
-                    CborValue::text("params"),
-                    CborValue::Map(vec![(CborValue::text("i"), CborValue::Unsigned(600_000))]),
-                ),
-            ]),
         ),
     ]);
-    assert_emits(
-        &record_with_enc(enc),
-        ErrorCode::EncPassphraseAlgUnsupported,
+    let bytes = encode_canonical_cbor(&record).unwrap();
+    let result = validate_poe_record(&bytes, &ValidatorOptions::default());
+    assert!(!result.is_ok());
+    let errors = code_strings(&result.error_codes());
+    let info = code_strings(&result.info_codes());
+    assert_eq!(
+        errors,
+        ["ENC_REQUIRES_CONTENT_HASH", "UNSUPPORTED_HASH_ALG"]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
     );
-
-    // ENC_PASSPHRASE_SALT_TOO_SHORT.
-    let enc = passphrase_only_enc(argon2id_passphrase(65_536, 3, 1, 15));
-    assert_emits(&record_with_enc(enc), ErrorCode::EncPassphraseSaltTooShort);
-
-    // ENC_PASSPHRASE_SALT_TOO_LONG.
-    let enc = passphrase_only_enc(argon2id_passphrase(65_536, 3, 1, 65));
-    assert_emits(&record_with_enc(enc), ErrorCode::EncPassphraseSaltTooLong);
-
-    // ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW — m too low.
-    let enc = passphrase_only_enc(argon2id_passphrase(1024, 3, 1, 16));
-    assert_emits(
-        &record_with_enc(enc),
-        ErrorCode::EncPassphraseArgon2ParamsTooLow,
+    assert_eq!(
+        info,
+        ["ENC_UNSUPPORTED"]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
     );
-
-    // MALFORMED_SIG_COSE_SIGN1 — garbage cose_sign1 chunk.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("sigs"),
-            CborValue::Array(vec![CborValue::Map(vec![(
-                CborValue::text("cose_sign1"),
-                CborValue::Array(vec![CborValue::Bytes(vec![0xff, 0xff, 0xff])]),
-            )])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::MalformedSigCoseSign1);
-
-    // SIG_ENTRY_INVALID_SHAPE — a sigs entry that is an array, not a map.
-    // (A sigs entry carrying an EXTRA key instead yields SCHEMA_UNKNOWN_FIELD:
-    // the sig entry is a closed map, so an unrecognised key is an unknown-field
-    // violation rather than a shape violation.)
-    let record_bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("sigs"),
-            CborValue::Array(vec![CborValue::Array(vec![CborValue::Bytes(repeat_byte(
-                10, 0,
-            ))])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&record_bytes, ErrorCode::SigEntryInvalidShape);
-
-    // SIG_ENTRY_INVALID_SHAPE also surfaces from a sigs entry with an extra
-    // field. The sig entry is a closed map `{ cose_sign1, cose_key? }`, so an
-    // unrecognised key is a shape violation — not the generic SCHEMA_UNKNOWN_FIELD
-    // that item/enc/passphrase/merkle raise — matching the TS/Python reference.
-    let record_bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("sigs"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (
-                    CborValue::text("cose_sign1"),
-                    CborValue::Array(vec![CborValue::Bytes(repeat_byte(64, 0))]),
-                ),
-                (
-                    CborValue::text("extra_field"),
-                    CborValue::Bytes(repeat_byte(8, 0)),
-                ),
-            ])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&record_bytes, ErrorCode::SigEntryInvalidShape);
-
-    // SIG_ENTRY_KID_COSE_KEY_CONFLICT — both 32-byte kid and cose_key.
-    let cose = build_cose_sign1(-8, Some(hash32(0x42)), false);
-    let cose_key = build_cose_key(false);
-    let record = PoeRecord {
-        v: 1,
-        items: Some(vec![ItemEntry {
-            hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-            uris: None,
-            enc: None,
-        }]),
-        sigs: Some(vec![SigEntry {
-            cose_sign1: chunk_bytes(&cose),
-            cose_key: Some(chunk_bytes(&cose_key)),
-        }]),
-        ..PoeRecord::default()
-    };
-    assert_emits(
-        &encode_poe_record(&record).unwrap(),
-        ErrorCode::SigEntryKidCoseKeyConflict,
-    );
-
-    // SIG_PRIVATE_KEY_LEAKED — cose_key carries label -4.
-    let cose = build_cose_sign1(-8, None, false);
-    let cose_key = build_cose_key(true);
-    let record = PoeRecord {
-        v: 1,
-        items: Some(vec![ItemEntry {
-            hashes: vec![("sha2-256".to_string(), hash32(0xab))],
-            uris: None,
-            enc: None,
-        }]),
-        sigs: Some(vec![SigEntry {
-            cose_sign1: chunk_bytes(&cose),
-            cose_key: Some(chunk_bytes(&cose_key)),
-        }]),
-        ..PoeRecord::default()
-    };
-    assert_emits(
-        &encode_poe_record(&record).unwrap(),
-        ErrorCode::SigPrivateKeyLeaked,
-    );
-
-    // CHUNK_TOO_LARGE — a 65-byte cose_sign1 chunk.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("sigs"),
-            CborValue::Array(vec![CborValue::Map(vec![(
-                CborValue::text("cose_sign1"),
-                CborValue::Array(vec![CborValue::Bytes(repeat_byte(65, 0))]),
-            )])]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::ChunkTooLarge);
-
-    // SUPERSEDES_TX_INVALID_LENGTH — bytes of the wrong width.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("supersedes"),
-            CborValue::Bytes(repeat_byte(31, 0)),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SupersedesTxInvalidLength);
-
-    // SCHEMA_TYPE_MISMATCH — supersedes carries the wrong TYPE (text, not
-    // bytes). A wrong type and a wrong length are distinct defects.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (CborValue::text("supersedes"), CborValue::text("not-bytes")),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::SchemaTypeMismatch);
-
-    // CRIT_SHAPE_INVALID — crit names a base key.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("crit"),
-            CborValue::Array(vec![CborValue::text("v")]),
-        ),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::CritShapeInvalid);
-
-    // EXTENSION_UNSUPPORTED_CRITICAL — crit names a present extension key.
-    let bytes = encode_canonical_cbor(&CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (
-            CborValue::text("crit"),
-            CborValue::Array(vec![CborValue::text("x-foo")]),
-        ),
-        (CborValue::text("x-foo"), CborValue::text("bar")),
-    ]))
-    .unwrap();
-    assert_emits(&bytes, ErrorCode::ExtensionUnsupportedCritical);
-}
-
-fn valid_items() -> CborValue {
-    CborValue::Array(vec![CborValue::Map(vec![(
-        CborValue::text("hashes"),
-        CborValue::Map(vec![(
-            CborValue::text("sha2-256"),
-            CborValue::Bytes(hash32(0xab)),
-        )]),
-    )])])
-}
-
-fn argon2id_passphrase(m: u64, t: u64, p: u64, salt_len: usize) -> CborValue {
-    CborValue::Map(vec![
-        (CborValue::text("alg"), CborValue::text("argon2id")),
-        (
-            CborValue::text("salt"),
-            CborValue::Bytes(repeat_byte(salt_len, 0)),
-        ),
-        (
-            CborValue::text("params"),
-            CborValue::Map(vec![
-                (CborValue::text("m"), CborValue::Unsigned(m)),
-                (CborValue::text("t"), CborValue::Unsigned(t)),
-                (CborValue::text("p"), CborValue::Unsigned(p)),
-            ]),
-        ),
-    ])
-}
-
-fn passphrase_only_enc(passphrase: CborValue) -> CborValue {
-    CborValue::Map(vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("aead"),
-            CborValue::text("xchacha20-poly1305"),
-        ),
-        (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
-        ),
-        (CborValue::text("passphrase"), passphrase),
-    ])
-}
-
-// ---------------------------------------------------------------------------
-// Hybrid (mlkem768x25519) cross-KEM slot-shape negatives
-// ---------------------------------------------------------------------------
-
-#[test]
-fn hybrid_slot_with_stray_epk_is_sole_invalid_shape() {
-    let mut enc = sealed_hybrid_pairs();
-    let mut slot = vec![
-        (
-            CborValue::text("kem_ct"),
-            CborValue::Array(
-                chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0))
-                    .into_iter()
-                    .map(CborValue::Bytes)
-                    .collect(),
-            ),
-        ),
-        (CborValue::text("epk"), CborValue::Bytes(repeat_byte(32, 0))),
-        (
-            CborValue::text("wrap"),
-            CborValue::Bytes(repeat_byte(48, 0)),
-        ),
-    ];
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![CborValue::Map(std::mem::take(&mut slot))]),
-    );
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotInvalidShape,
-    );
-}
-
-#[test]
-fn classical_slot_with_stray_kem_ct_is_sole_invalid_shape() {
-    let mut enc = sealed_base_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![CborValue::Map(vec![
-            (CborValue::text("epk"), CborValue::Bytes(repeat_byte(32, 0))),
-            (
-                CborValue::text("kem_ct"),
-                CborValue::Array(
-                    chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0))
-                        .into_iter()
-                        .map(CborValue::Bytes)
-                        .collect(),
-                ),
-            ),
-            (
-                CborValue::text("wrap"),
-                CborValue::Bytes(repeat_byte(48, 0)),
-            ),
-        ])]),
-    );
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotInvalidShape,
-    );
-}
-
-#[test]
-fn hybrid_slot_with_oversized_kem_ct_is_sole_length_mismatch() {
-    let mut enc = sealed_hybrid_pairs();
-    map_set(
-        &mut enc,
-        "slots",
-        CborValue::Array(vec![hybrid_slot(MLKEM768X25519_ENC_LENGTH + 64)]),
-    );
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::KemCtLengthMismatch,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Enc resource bounds (slot-count cap + decoded-envelope size)
-// ---------------------------------------------------------------------------
-//
-// Built programmatically (over-bound slot arrays are too large to freeze in the
-// shared corpus). Constants mirror the sealed-PoE unwrap layer
-// (MAX_SLOTS = 1024, decoded-envelope bound 65536 bytes).
-
-const TEST_MAX_SLOTS: usize = 1024;
-const TEST_MAX_DECODED_ENVELOPE_BYTES: usize = 65536;
-const TEST_NONCE_LEN: usize = 24;
-const TEST_SLOTS_MAC_LEN: usize = 32;
-
-/// `n` x25519 slots, each with a distinct epk so the slot-count / byte cap is
-/// what trips, not the duplicate check.
-fn distinct_x25519_slots(n: usize) -> CborValue {
-    let slots = (0..n)
-        .map(|i| {
-            let mut epk = vec![0u8; 32];
-            epk[31] = (i & 0xff) as u8;
-            epk[30] = ((i >> 8) & 0xff) as u8;
-            CborValue::Map(vec![
-                (CborValue::text("epk"), CborValue::Bytes(epk)),
-                (
-                    CborValue::text("wrap"),
-                    CborValue::Bytes(repeat_byte(48, 0x06)),
-                ),
-            ])
-        })
-        .collect();
-    CborValue::Array(slots)
-}
-
-#[test]
-fn enc_slots_too_many_is_sole_code() {
-    // MAX_SLOTS + 1 trips the slot-count cap, which short-circuits the byte
-    // backstop, so ENC_SLOTS_TOO_MANY is the sole emitted code even though the
-    // x25519 array would also exceed the byte bound at that count.
-    let mut enc = sealed_base_pairs();
-    map_set(&mut enc, "slots", distinct_x25519_slots(TEST_MAX_SLOTS + 1));
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncSlotsTooMany,
-    );
-}
-
-#[test]
-fn enc_envelope_too_large_x25519_byte_backstop() {
-    // x25519 per-slot bytes = 32 + 48 = 80. The byte backstop is the tighter
-    // guard at this width (it trips below MAX_SLOTS); one slot over the floor
-    // emits ENC_ENVELOPE_TOO_LARGE, the floor itself validates.
-    let per_slot = 32 + 48;
-    let just_under =
-        (TEST_MAX_DECODED_ENVELOPE_BYTES - TEST_NONCE_LEN - TEST_SLOTS_MAC_LEN) / per_slot;
-    assert!(just_under < TEST_MAX_SLOTS);
-
-    let mut ok = sealed_base_pairs();
-    map_set(&mut ok, "slots", distinct_x25519_slots(just_under));
-    assert!(validate_poe_record(&record_with_enc(CborValue::Map(ok))).is_ok());
-
-    let mut over = sealed_base_pairs();
-    map_set(&mut over, "slots", distinct_x25519_slots(just_under + 1));
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(over)),
-        ErrorCode::EncEnvelopeTooLarge,
-    );
-}
-
-#[test]
-fn enc_envelope_too_large_hybrid_byte_backstop() {
-    // Hybrid per-slot bytes = 1120 + 48 = 1168; the smallest over-bound slot
-    // count is below MAX_SLOTS, so the byte backstop (not the slot cap) fires.
-    let per_slot = MLKEM768X25519_ENC_LENGTH + 48;
-    let over =
-        (TEST_MAX_DECODED_ENVELOPE_BYTES - TEST_NONCE_LEN - TEST_SLOTS_MAC_LEN) / per_slot + 1;
-    assert!(over <= TEST_MAX_SLOTS);
-
-    // Distinct kem_ct per slot so the duplicate check does not fire instead.
-    let slots = (0..over)
-        .map(|i| {
-            let mut body = repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11);
-            body[0] = (i & 0xff) as u8;
-            body[1] = ((i >> 8) & 0xff) as u8;
-            CborValue::Map(vec![
-                (
-                    CborValue::text("kem_ct"),
-                    CborValue::Array(chunk64(&body).into_iter().map(CborValue::Bytes).collect()),
-                ),
-                (
-                    CborValue::text("wrap"),
-                    CborValue::Bytes(repeat_byte(48, 0x09)),
-                ),
-            ])
-        })
-        .collect();
-    let mut enc = sealed_hybrid_pairs();
-    map_set(&mut enc, "slots", CborValue::Array(slots));
-    assert_sole_code(
-        &record_with_enc(CborValue::Map(enc)),
-        ErrorCode::EncEnvelopeTooLarge,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// CBOR decode mapping to MALFORMED_CBOR
-// ---------------------------------------------------------------------------
-
-#[test]
-fn cbor_decode_failures_all_map_to_malformed_cbor() {
-    // Duplicate keys, unsorted keys, indefinite-length, empty input, and garbage
-    // all fold into the single MALFORMED_CBOR code.
-    for hexstr in [
-        "a2616101616102", // {"a":1,"a":2} duplicate keys
-        "a2616201616102", // {"b":1,"a":2} unsorted keys
-        "5fff",           // indefinite-length bytestring
-        "ffffffff",       // garbage / stray break
-    ] {
-        assert_emits(&hex::decode(hexstr).unwrap(), ErrorCode::MalformedCbor);
-    }
-    // Empty input.
-    assert_emits(&[], ErrorCode::MalformedCbor);
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,594 +825,87 @@ fn cbor_decode_failures_all_map_to_malformed_cbor() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn structural_codes_are_unique() {
-    let mut codes: Vec<&str> = STRUCTURAL_ERROR_CODES.iter().map(|c| c.code()).collect();
-    codes.sort_unstable();
-    let len = codes.len();
-    codes.dedup();
-    assert_eq!(codes.len(), len, "STRUCTURAL_ERROR_CODES must be unique");
-    // Pins the catalogue size (44 structural validator codes).
-    assert_eq!(STRUCTURAL_ERROR_CODES.len(), 44);
-}
-
-#[test]
-fn verifier_codes_are_disjoint_from_structural() {
-    let structural: std::collections::BTreeSet<&str> =
-        STRUCTURAL_ERROR_CODES.iter().map(|c| c.code()).collect();
-    for code in VERIFIER_ERROR_CODES {
-        assert!(
-            !structural.contains(code.code()),
-            "{} must not be in both lists",
-            code.code()
-        );
-    }
-    assert_eq!(VERIFIER_ERROR_CODES.len(), 25);
-}
-
-#[test]
-fn severity_classification_matches_reference() {
-    assert_eq!(ErrorCode::SignatureUnsupported.severity(), Severity::Info);
-    assert_eq!(ErrorCode::UriFetchFailed.severity(), Severity::Warning);
-    assert_eq!(ErrorCode::MerkleUnsupported.severity(), Severity::Info);
-    assert_eq!(ErrorCode::OutOfProfileSkipped.severity(), Severity::Info);
-    assert_eq!(
-        ErrorCode::MerkleLeavesUnavailable.severity(),
-        Severity::Warning
-    );
-    // Spot-check a default-error code.
-    assert_eq!(ErrorCode::MalformedCbor.severity(), Severity::Error);
-}
-
-// ---------------------------------------------------------------------------
-// Chunking helpers
-// ---------------------------------------------------------------------------
-
-#[test]
-fn chunk_bytes_splits_on_64_byte_boundaries() {
-    assert_eq!(
-        chunk_bytes(&[]).iter().map(Vec::len).collect::<Vec<_>>(),
-        [0]
-    );
-    assert_eq!(
-        chunk_bytes(&repeat_byte(64, 0))
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>(),
-        [64]
-    );
-    assert_eq!(
-        chunk_bytes(&repeat_byte(65, 0))
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>(),
-        [64, 1]
-    );
-    assert_eq!(
-        chunk_bytes(&repeat_byte(128, 0))
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>(),
-        [64, 64]
-    );
-    assert_eq!(
-        chunk_bytes(&repeat_byte(73, 0))
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>(),
-        [64, 9]
-    );
-}
-
-#[test]
-fn bytes_chunk_array_concat_is_inverse_of_chunk_bytes() {
-    let original: Vec<u8> = (0..200u32).map(|i| (i & 0xff) as u8).collect();
-    let chunks = chunk_bytes(&original);
-    assert_eq!(bytes_chunk_array_concat(&chunks), original);
-    assert_eq!(bytes_chunk_array_concat(&[]), Vec::<u8>::new());
-}
-
-#[test]
-fn reconstruct_chunked_uri_round_trips() {
-    assert_eq!(
-        reconstruct_chunked_uri(&["ar://abcdef".to_string()]),
-        ReconstructUriResult::Ok("ar://abcdef".to_string())
-    );
-    assert_eq!(
-        reconstruct_chunked_uri(&[
-            "ipfs://bafybeigdyrz".to_string(),
-            "t5cfsdpaomk2lq".to_string(),
-            "mhs4vqkrqu2ad34yz4nawtfprz4".to_string(),
-        ]),
-        ReconstructUriResult::Ok(
-            "ipfs://bafybeigdyrzt5cfsdpaomk2lqmhs4vqkrqu2ad34yz4nawtfprz4".to_string()
-        )
-    );
-}
-
-#[test]
-fn chunk_uri_collapses_short_and_splits_on_codepoint_boundaries() {
-    assert_eq!(chunk_uri("ar://abc"), vec!["ar://abc".to_string()]);
-
-    // A >64-byte URI with a multibyte codepoint near the boundary must rejoin
-    // to the original, with every chunk ≤ 64 bytes and no codepoint split.
-    let long = format!("{}\u{1F600}{}", "a".repeat(63), "b".repeat(40));
-    let chunks = chunk_uri(&long);
-    assert_eq!(chunks.concat(), long);
-    for c in &chunks {
-        assert!(c.len() <= 64);
+fn catalogue_is_unique_and_indexed_in_registry_order() {
+    let mut seen = BTreeSet::new();
+    for (i, code) in ERROR_CODES.iter().enumerate() {
+        assert!(seen.insert(code.code()), "duplicate code {}", code.code());
+        assert_eq!(code.registry_index(), i);
+        // SCREAMING_SNAKE_CASE.
+        assert!(code
+            .code()
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'));
     }
 }
 
 #[test]
-fn cid_profile_accepts_cidv0_rejects_base64() {
-    assert!(is_valid_cid(
-        "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH"
-    ));
-    assert!(!is_valid_cid("mAYIKsomethingbase64"));
-    assert!(!is_valid_cid(""));
-}
-
-#[test]
-fn cid_profile_rejects_qm_shaped_string_with_wrong_decoded_multihash() {
-    // A 46-char all-base58btc `Qm…` string that DOES base58-decode to 34 bytes
-    // but whose multihash length byte is 0x1e (30), not 0x20 (32). A regex-only
-    // CIDv0 check (`Qm` + 44 base58 chars) would wrongly accept it; the profile
-    // requires the DECODED bytes to start `[0x12, 0x20, …]`.
-    assert!(!is_valid_cid(
-        "Qm1FMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH"
-    ));
-    // A different `Qm…` string whose decode does begin `[0x12, 0x20, …]` is
-    // accepted — the discriminator is the decoded prefix, not the shape.
-    assert!(is_valid_cid(
-        "QmZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
-    ));
-}
-
-#[test]
-fn cidv0_negative_in_ipfs_uri_yields_invalid_uri() {
-    // The wrong-decode `Qm1…` CID inside an `ipfs://` URI surfaces as INVALID_URI
-    // through the structural validator, not silent acceptance.
-    let uri = "ipfs://Qm1FMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH";
-    let record = CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (
-                    CborValue::text("hashes"),
-                    CborValue::Map(vec![(
-                        CborValue::text("sha2-256"),
-                        CborValue::Bytes(hash32(0xab)),
-                    )]),
-                ),
-                (
-                    CborValue::text("uris"),
-                    CborValue::Array(vec![CborValue::Array(
-                        chunk_uri(uri).into_iter().map(CborValue::Text).collect(),
-                    )]),
-                ),
-            ])]),
-        ),
-    ]);
-    assert_emits(
-        &encode_canonical_cbor(&record).unwrap(),
-        ErrorCode::InvalidUri,
+fn per_layer_views_partition_the_catalogue_in_registry_order() {
+    let union: Vec<ErrorCode> = STRUCTURAL_ERROR_CODES
+        .iter()
+        .chain(CARRIAGE_ERROR_CODES)
+        .chain(VERIFIER_ERROR_CODES)
+        .copied()
+        .collect();
+    assert_eq!(union.len(), ERROR_CODES.len());
+    assert_eq!(
+        union.iter().copied().collect::<BTreeSet<_>>().len(),
+        ERROR_CODES.len()
     );
-}
-
-// ---------------------------------------------------------------------------
-// Python-reference regex/decode parity (extension key, unauthenticated cipher,
-// URI scheme dispatch). The oracle verdicts below were produced by running the
-// Python SDK's classifiers on the same inputs; the hand-rolled Rust port must
-// reproduce each one. These pin the boundaries where the published TypeScript
-// and Python references currently diverge.
-// ---------------------------------------------------------------------------
-
-/// Build a record whose only non-base top-level key is `key`, with otherwise
-/// valid `items`. The extension-key classifier decides the verdict: a key that
-/// matches the extension namespace yields an `OUT_OF_PROFILE_SKIPPED` info on an
-/// otherwise-passing record; a key that does not yields SCHEMA_UNKNOWN_FIELD.
-fn record_with_top_level_key(key: &str) -> Vec<u8> {
-    let record = CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (CborValue::text("items"), valid_items()),
-        (CborValue::text(key), CborValue::text("x")),
-    ]);
-    encode_canonical_cbor(&record).unwrap()
-}
-
-#[test]
-fn extension_key_classifier_matches_python_oracle() {
-    // (input, is_extension_key) — the Python `^(x-.+|[a-z]+-.+)$` oracle, where
-    // `.` excludes U+000A and `$` tolerates a single trailing newline.
-    let oracle: &[(&str, bool)] = &[
-        ("x-note", true),
-        ("x-meta", true),
-        ("x-a", true),
-        ("x-", false),
-        ("x-\n", false),
-        ("x-a\nb", false),
-        ("a-\n", false),
-        ("a-b", true),
-        ("abc-def", true),
-        ("a-", false),
-        ("a--b", true),
-        ("x--b", true),
-        ("X-note", false),
-        ("foo", false),
-        ("foo-", false),
-        ("-foo", false),
-        ("x", false),
-        ("cip-25-extra", true),
-        ("x-note\n", true),
-        ("abc-def\n", true),
-        ("a-b\nc", false),
-        ("1-foo", false),
-        ("x-\r", true),
-        ("x-\rb", true),
-        ("abc-\ndef", false),
-        ("x-é", true),
-        ("é-x", false),
-        ("a-b-c", true),
-        ("x-note\n\n", false),
-    ];
-    for &(key, is_ext) in oracle {
-        let result = validate_poe_record(&record_with_top_level_key(key));
-        if is_ext {
-            assert!(
-                result.is_ok() && result.codes().contains(&ErrorCode::OutOfProfileSkipped),
-                "key {key:?} should be an extension key (OUT_OF_PROFILE_SKIPPED, record ok)",
-            );
-        } else {
-            assert!(
-                !result.is_ok() && result.codes().contains(&ErrorCode::SchemaUnknownField),
-                "key {key:?} should NOT be an extension key (SCHEMA_UNKNOWN_FIELD)",
-            );
+    for view in [
+        STRUCTURAL_ERROR_CODES,
+        CARRIAGE_ERROR_CODES,
+        VERIFIER_ERROR_CODES,
+    ] {
+        let indices: Vec<usize> = view.iter().map(|c| c.registry_index()).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(indices, sorted, "view must preserve registry order");
+    }
+    // Each view's membership matches the per-code part projection.
+    for code in ERROR_CODES {
+        let in_structural = STRUCTURAL_ERROR_CODES.contains(code);
+        let in_carriage = CARRIAGE_ERROR_CODES.contains(code);
+        let in_verifier = VERIFIER_ERROR_CODES.contains(code);
+        match code.part() {
+            cardanowall::poe_standard::ErrorCodePart::A => assert!(in_structural),
+            cardanowall::poe_standard::ErrorCodePart::Carriage => assert!(in_carriage),
+            cardanowall::poe_standard::ErrorCodePart::B => assert!(in_verifier),
         }
     }
 }
 
-/// Build a record whose single item's `enc.aead` is `aead`, with otherwise
-/// valid passphrase-path envelope fields. An unauthenticated cipher surfaces as
-/// UNAUTHENTICATED_CIPHER_FORBIDDEN; any other unknown aead as UNSUPPORTED_AEAD_ALG.
-fn record_with_aead(aead: &str) -> Vec<u8> {
-    record_with_enc(CborValue::Map(vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (CborValue::text("aead"), CborValue::text(aead)),
-        (
-            CborValue::text("nonce"),
-            CborValue::Bytes(repeat_byte(24, 0)),
-        ),
-        (
-            CborValue::text("passphrase"),
-            argon2id_passphrase(65_536, 3, 1, 16),
-        ),
-    ]))
-}
-
 #[test]
-fn unauthenticated_cipher_classifier_matches_python_oracle() {
-    // (aead, is_unauthenticated) — the Python regex oracle, where the `$` in
-    // `([-_]|$)` tolerates a single trailing newline (so `aes-256-cbc\n` is
-    // forbidden) but not a trailing `\r` or an interior newline.
-    let unauthenticated: &[&str] = &[
-        "aes-256-cbc",
-        "aes-cbc",
-        "des-ede3-cbc",
-        "aes-256-ctr",
-        "aes-ecb",
-        "aes-cfb",
-        "aes-ofb",
-        "rc4",
-        "des",
-        "3des",
-        "aes-256-cbc\n",
-        "cbc",
-        "cbc\n",
-        "rc4\n",
-        "des\n",
-        "3des\n",
-        "aes_256_cbc",
-        "AES-256-CBC",
-        "des-x",
-        "rc4-x",
-    ];
-    for &aead in unauthenticated {
-        assert_emits(
-            &record_with_aead(aead),
-            ErrorCode::UnauthenticatedCipherForbidden,
-        );
-    }
-    // Not unauthenticated: an interior newline, a trailing `\r`, an undelimited
-    // token, or a real authenticated cipher. The known AEAD validates; the
-    // unknown-but-not-unauthenticated ones surface as UNSUPPORTED_AEAD_ALG.
-    let not_unauthenticated_unknown: &[&str] = &[
-        "aes-256-cbc\nx",
-        "\ncbc",
-        "cbcx",
-        "aes-256-cbc\r",
-        "aescbc",
-        "aes-256-gcm",
-        "chacha20-poly1305",
-    ];
-    for &aead in not_unauthenticated_unknown {
-        assert_emits(&record_with_aead(aead), ErrorCode::UnsupportedAeadAlg);
-    }
-    // The single registered AEAD is accepted (no aead-level issue).
-    let result = validate_poe_record(&record_with_aead("xchacha20-poly1305"));
-    let codes = result.codes();
-    assert!(
-        !codes.contains(&ErrorCode::UnauthenticatedCipherForbidden)
-            && !codes.contains(&ErrorCode::UnsupportedAeadAlg),
-        "xchacha20-poly1305 must not trip an aead classifier; got {:?}",
-        codes.iter().map(|c| c.code()).collect::<Vec<_>>()
-    );
-}
-
-/// Build a record whose single item carries one `uris` entry = `uri`.
-fn record_with_uri(uri: &str) -> Vec<u8> {
-    let record = CborValue::Map(vec![
-        (CborValue::text("v"), CborValue::Unsigned(1)),
-        (
-            CborValue::text("items"),
-            CborValue::Array(vec![CborValue::Map(vec![
-                (
-                    CborValue::text("hashes"),
-                    CborValue::Map(vec![(
-                        CborValue::text("sha2-256"),
-                        CborValue::Bytes(hash32(0xab)),
-                    )]),
-                ),
-                (
-                    CborValue::text("uris"),
-                    CborValue::Array(vec![CborValue::Array(
-                        chunk_uri(uri).into_iter().map(CborValue::Text).collect(),
-                    )]),
-                ),
-            ])]),
-        ),
-    ]);
-    encode_canonical_cbor(&record).unwrap()
-}
-
-#[test]
-fn uri_scheme_dispatch_matches_python_oracle() {
-    let arweave = format!("ar://{}", "A".repeat(43));
-    let ipfs = "ipfs://QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH";
-
-    // A correctly-cased permitted scheme has its body checked: valid bodies pass.
-    assert!(validate_poe_record(&record_with_uri(&arweave)).is_ok());
-    assert!(validate_poe_record(&record_with_uri(ipfs)).is_ok());
-
-    // A correctly-cased scheme with an invalid body is rejected (body checked).
-    assert_emits(&record_with_uri("ar://tooshort"), ErrorCode::InvalidUri);
-
-    // An UPPER- or mixed-case scheme is case-folded per RFC 3986 §3.1, then its
-    // body IS validated. A valid body under an upper/mixed scheme passes; a
-    // malformed body is rejected exactly as under the lower-cased scheme. Only
-    // the scheme is folded — the txid/CID body keeps its case.
-    let upper_ar = format!("AR://{}", "A".repeat(43));
-    assert!(validate_poe_record(&record_with_uri(&upper_ar)).is_ok());
-    let upper_ipfs = format!("IPFS://{ipfs_rest}", ipfs_rest = &ipfs["ipfs://".len()..]);
-    assert!(validate_poe_record(&record_with_uri(&upper_ipfs)).is_ok());
-    assert_emits(&record_with_uri("AR://short"), ErrorCode::InvalidUri);
-    let mixed_ar = format!("Ar://{}", "A".repeat(43));
-    assert!(validate_poe_record(&record_with_uri(&mixed_ar)).is_ok());
-
-    // An unpermitted scheme (any casing) is rejected by the gate.
-    assert_emits(
-        &record_with_uri("http://example.com"),
-        ErrorCode::InvalidUri,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Typed-encoder byte oracles. The expected canonical bytes were produced by the
-// Python encoder on the equivalent record; the Rust encoder must reproduce them
-// byte-for-byte. These cover the `enc`/slot shapes the frozen vector does not.
-// ---------------------------------------------------------------------------
-
-/// A 32-byte `sha2-256` digest of `0xab`, matching the Python oracle inputs.
-fn oracle_hashes() -> Vec<(String, Vec<u8>)> {
-    vec![("sha2-256".to_string(), repeat_byte(32, 0xab))]
-}
-
-/// Wrap one sealed item into a full single-item record.
-fn sealed_record(enc: EncryptionEnvelope) -> PoeRecord {
-    PoeRecord {
-        v: 1,
-        items: Some(vec![ItemEntry {
-            hashes: oracle_hashes(),
-            uris: None,
-            enc: Some(enc),
-        }]),
-        ..PoeRecord::default()
-    }
-}
-
-#[test]
-fn encoder_classical_slot_matches_python_bytes() {
-    let enc = EncryptionEnvelope {
-        scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
-        nonce: repeat_byte(24, 0x05),
-        kem: Some("x25519".to_string()),
-        slots: Some(vec![Slot {
-            epk: Some(repeat_byte(32, 0x01)),
-            kem_ct: None,
-            wrap: Some(repeat_byte(48, 0x09)),
-        }]),
-        slots_mac: Some(repeat_byte(32, 0x07)),
-        passphrase: None,
+fn severity_defaults_match_the_registry() {
+    use ErrorCode::{
+        EncUnsupported, InsufficientConfirmations, MerkleLeavesUnavailable, MerkleUnsupported,
+        OutOfProfileSkipped, SignatureUnsupported, UriFetchFailed, UriProviderIntegrityMismatch,
     };
-    let expected = "a2617601656974656d7381a263656e63a6636b656d667832353531396461656164727863686163686132302d706f6c7931333035656e6f6e6365581805050505050505050505050505050505050505050505050565736c6f747381a26365706b582001010101010101010101010101010101010101010101010101010101010101016477726170583009090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090966736368656d650169736c6f74735f6d61635820070707070707070707070707070707070707070707070707070707070707070766686173686573a168736861322d3235365820abababababababababababababababababababababababababababababababab";
-    assert_eq!(
-        hex::encode(&encode_poe_record(&sealed_record(enc)).unwrap()),
-        expected,
-        "classical {{epk, wrap}} slot must encode to the Python oracle bytes"
-    );
-}
-
-#[test]
-fn encoder_hybrid_slot_matches_python_bytes() {
-    let enc = EncryptionEnvelope {
-        scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
-        nonce: repeat_byte(24, 0x05),
-        kem: Some("mlkem768x25519".to_string()),
-        slots: Some(vec![Slot {
-            epk: None,
-            kem_ct: Some(chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11))),
-            wrap: Some(repeat_byte(48, 0x09)),
-        }]),
-        slots_mac: Some(repeat_byte(32, 0x07)),
-        passphrase: None,
-    };
-    let expected = "a2617601656974656d7381a263656e63a6636b656d6e6d6c6b656d3736387832353531396461656164727863686163686132302d706f6c7931333035656e6f6e6365581805050505050505050505050505050505050505050505050565736c6f747381a264777261705830090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909666b656d5f6374925840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115820111111111111111111111111111111111111111111111111111111111111111166736368656d650169736c6f74735f6d61635820070707070707070707070707070707070707070707070707070707070707070766686173686573a168736861322d3235365820abababababababababababababababababababababababababababababababab";
-    assert_eq!(
-        hex::encode(&encode_poe_record(&sealed_record(enc)).unwrap()),
-        expected,
-        "hybrid {{kem_ct, wrap}} slot must encode to the Python oracle bytes"
-    );
-}
-
-#[test]
-fn encoder_both_set_slot_is_kem_driven_two_key_map() {
-    // A Slot carrying BOTH `epk` and `kem_ct` must encode to the KEM-driven
-    // 2-key `{kem_ct, wrap}` map (the `epk` is dropped). The expected bytes are
-    // therefore IDENTICAL to the hybrid-slot oracle above — the encoder must not
-    // emit a 3-key map.
-    let both = EncryptionEnvelope {
-        scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
-        nonce: repeat_byte(24, 0x05),
-        kem: Some("mlkem768x25519".to_string()),
-        slots: Some(vec![Slot {
-            epk: Some(repeat_byte(32, 0x01)),
-            kem_ct: Some(chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11))),
-            wrap: Some(repeat_byte(48, 0x09)),
-        }]),
-        slots_mac: Some(repeat_byte(32, 0x07)),
-        passphrase: None,
-    };
-    let hybrid = EncryptionEnvelope {
-        scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
-        nonce: repeat_byte(24, 0x05),
-        kem: Some("mlkem768x25519".to_string()),
-        slots: Some(vec![Slot {
-            epk: None,
-            kem_ct: Some(chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11))),
-            wrap: Some(repeat_byte(48, 0x09)),
-        }]),
-        slots_mac: Some(repeat_byte(32, 0x07)),
-        passphrase: None,
-    };
-    assert_eq!(
-        encode_poe_record(&sealed_record(both)).unwrap(),
-        encode_poe_record(&sealed_record(hybrid)).unwrap(),
-        "a both-set slot must encode identically to the {{kem_ct, wrap}} hybrid slot"
-    );
-    // And the both-set record still validates (the encoder produced a clean
-    // 2-key map, not the 3-key map the validator would reject).
-    assert!(validate_poe_record(
-        &encode_poe_record(&sealed_record(EncryptionEnvelope {
-            scheme: 1,
-            aead: "xchacha20-poly1305".to_string(),
-            nonce: repeat_byte(24, 0x05),
-            kem: Some("mlkem768x25519".to_string()),
-            slots: Some(vec![Slot {
-                epk: Some(repeat_byte(32, 0x01)),
-                kem_ct: Some(chunk64(&repeat_byte(MLKEM768X25519_ENC_LENGTH, 0x11))),
-                wrap: Some(repeat_byte(48, 0x09)),
-            }]),
-            slots_mac: Some(repeat_byte(32, 0x07)),
-            passphrase: None,
-        }))
-        .unwrap()
-    )
-    .is_ok());
-}
-
-#[test]
-fn encoder_passphrase_block_matches_python_bytes() {
-    let enc = EncryptionEnvelope {
-        scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
-        nonce: repeat_byte(24, 0x05),
-        kem: None,
-        slots: None,
-        slots_mac: None,
-        passphrase: Some(PassphraseBlock {
-            alg: "argon2id".to_string(),
-            salt: repeat_byte(16, 0x02),
-            params: vec![
-                ("m".to_string(), 65_536),
-                ("t".to_string(), 3),
-                ("p".to_string(), 1),
-            ],
-        }),
-    };
-    let expected = "a2617601656974656d7381a263656e63a46461656164727863686163686132302d706f6c7931333035656e6f6e6365581805050505050505050505050505050505050505050505050566736368656d65016a70617373706872617365a363616c67686172676f6e3269646473616c74500202020202020202020202020202020266706172616d73a3616d1a0001000061700161740366686173686573a168736861322d3235365820abababababababababababababababababababababababababababababababab";
-    assert_eq!(
-        hex::encode(&encode_poe_record(&sealed_record(enc)).unwrap()),
-        expected,
-        "passphrase block must encode to the Python oracle bytes"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Cross-SDK shared KAT — validator-negative
-// ---------------------------------------------------------------------------
-
-/// Resolve a `SCREAMING_SNAKE_CASE` code string to its [`ErrorCode`], searching
-/// both catalogue arrays. Panics on an unknown string, which surfaces a fixture
-/// that names a code the Rust catalogue does not carry.
-fn error_code_from_str(name: &str) -> ErrorCode {
-    STRUCTURAL_ERROR_CODES
-        .iter()
-        .chain(VERIFIER_ERROR_CODES.iter())
-        .copied()
-        .find(|c| c.code() == name)
-        .unwrap_or_else(|| panic!("fixture names an unregistered error code: {name}"))
-}
-
-#[test]
-fn validator_negative_shared_kat() {
-    // Each vector pins the exact set of ERROR-severity codes the structural
-    // validator must emit; an empty set means the record is valid. Info/warning
-    // issues are not part of the contract, so the comparison filters to errors.
-    let corpus = common::read_fixture_json(
-        &common::crypto_core_fixtures().join("poe-record/validator-negative.json"),
-    );
-    for v in corpus["vectors"].as_array().expect("vectors array") {
-        let name = v["name"].as_str().expect("vector name");
-        let bytes = hex::decode(v["cbor_hex"].as_str().expect("cbor_hex")).expect("valid hex");
-        let expected: std::collections::BTreeSet<ErrorCode> = v["expected_error_codes"]
-            .as_array()
-            .expect("expected_error_codes")
-            .iter()
-            .map(|c| error_code_from_str(c.as_str().expect("code string")))
-            .collect();
-
-        let result = validate_poe_record(&bytes);
-        let actual: std::collections::BTreeSet<ErrorCode> = match &result {
-            ValidateResult::Fail { issues } => issues.iter().map(|i| i.code).collect(),
-            ValidateResult::Ok { .. } => std::collections::BTreeSet::new(),
+    for code in ERROR_CODES {
+        let expected = match code {
+            EncUnsupported
+            | SignatureUnsupported
+            | InsufficientConfirmations
+            | MerkleUnsupported
+            | OutOfProfileSkipped => Severity::Info,
+            UriProviderIntegrityMismatch | UriFetchFailed | MerkleLeavesUnavailable => {
+                Severity::Warning
+            }
+            _ => Severity::Error,
         };
-
-        assert_eq!(
-            result.is_ok(),
-            expected.is_empty(),
-            "{name}: validity verdict (expected codes {:?})",
-            expected.iter().map(|c| c.code()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            actual,
-            expected,
-            "{name}: emitted error codes {:?} != expected {:?}",
-            actual.iter().map(|c| c.code()).collect::<Vec<_>>(),
-            expected.iter().map(|c| c.code()).collect::<Vec<_>>()
-        );
+        assert_eq!(code.severity(), expected, "{}", code.code());
     }
+    // The dual-severity set.
+    let dual: Vec<&ErrorCode> = ERROR_CODES
+        .iter()
+        .filter(|c| c.is_dual_severity())
+        .collect();
+    assert_eq!(
+        dual.iter().map(|c| c.code()).collect::<Vec<_>>(),
+        vec![
+            "ENC_UNSUPPORTED",
+            "MERKLE_LEAVES_UNAVAILABLE",
+            "MERKLE_UNSUPPORTED",
+            "OUT_OF_PROFILE_SKIPPED",
+        ]
+    );
 }

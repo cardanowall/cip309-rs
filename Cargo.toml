@@ -1,6 +1,6 @@
 [package]
 name = "cardanowall"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["CardanoWall <hello@cardanowall.com>"]
@@ -58,11 +58,6 @@ sha2 = "0.11.0"
 sha3 = "0.11.0"
 subtle = "2.6.1"
 thiserror = "2.0.18"
-# NFKC compatibility normalisation for the recipient-decrypt passphrase path,
-# matching the reference SDKs (ICU/`unicodedata` in TS/Python). The lean
-# unicode-rs crate; its `tinyvec` transitive is already resolved via the HTTP
-# client stack.
-unicode-normalization = "0.1"
 # RFC 3986 URL parsing for the verifier's pure deny-host and SSRF guards. Kept
 # out of the `client` feature so scheme/host extraction (and therefore the full
 # egress-policy validation) is available in the transport-free build. Already
@@ -83,3 +78,10 @@ ciborium = "0.2.2"
 # dev-dep entry just makes them reachable from the integration-test crates.
 hmac = "0.13.0"
 sha2 = "0.11.0"
+
+# Argon2id at the registry floors (m = 65536 KiB, t = 3) is memory-hard by
+# design; unoptimized it dominates the test suite's wallclock. Optimizing just
+# the KDF crate keeps debug builds debuggable while the floor-parameter test
+# derivations stay sub-second.
+[profile.dev.package.argon2]
+opt-level = 3

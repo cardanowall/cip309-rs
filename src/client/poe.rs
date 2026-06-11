@@ -17,11 +17,12 @@ use crate::client::http::{
 use crate::client::publish::{
     publish_content, publish_merkle, publish_prehashed, publish_sealed, PublishHelperError,
 };
+use crate::client::resumable::{upload_resumable, ResumableUploadError};
 use crate::client::transport::{MultipartField, RequestBody};
 use crate::client::types::{
     PublishBatchInput, PublishBatchResponse, PublishContentInput, PublishInput, PublishMerkleInput,
     PublishMerkleResponse, PublishPrehashedInput, PublishResponse, PublishSealedInput, QuoteInput,
-    QuoteResponse, UploadsInput, UploadsResponse,
+    QuoteResponse, ResumableUploadInput, ResumableUploadResult, UploadsInput, UploadsResponse,
 };
 use crate::verifier::fetch::HttpMethod;
 
@@ -107,6 +108,42 @@ impl<'t> PoeNamespace<'t> {
             &RequestBody::Multipart(fields),
         )?;
         decode(&response.body)
+    }
+
+    /// Upload one blob, automatically choosing the single-shot or resumable
+    /// (chunked) path by size.
+    ///
+    /// A source at or below the threshold (default 48 MiB) rides the existing
+    /// single-shot [`uploads`](Self::uploads) path unchanged. A larger source
+    /// runs the content-addressed session flow: it declares the whole-file
+    /// SHA-256 + size up front (unlocking dedup + affordability before any bytes
+    /// flow), `PUT`s each chunk under its own integrity digest, and `complete`s
+    /// the session, which assembles the file and hands it into the gateway's
+    /// normal storage pipeline. The whole-file hash is streamed, so a multi-GB
+    /// source is never buffered in memory.
+    ///
+    /// Resume an interrupted upload by passing the original `session_id` in
+    /// [`ResumableUploadInput::resume_session_id`]: the helper fetches the
+    /// session, re-sends only the chunks the server is still missing, and
+    /// completes.
+    ///
+    /// The threshold and the client's intended chunk size are both options
+    /// defaulting to 48 MiB (comfortably under the ~100 MB body cap a CDN/proxy
+    /// commonly imposes); the server's authoritative `max_chunk_bytes` from the
+    /// create response always clamps the effective chunk size down when it is
+    /// tighter. Chunks are sent sequentially with per-chunk retry; see the module
+    /// docs for the rationale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResumableUploadError`] on a read failure, a create-time funding
+    /// rejection, a terminal upload failure, a malformed response, or an
+    /// HTTP/transport error.
+    pub fn upload_resumable(
+        &self,
+        input: &ResumableUploadInput,
+    ) -> Result<ResumableUploadResult, ResumableUploadError> {
+        upload_resumable(&self.config, input)
     }
 
     /// Submit one finalised canonical-CBOR record.

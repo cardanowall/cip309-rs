@@ -45,8 +45,11 @@ pub enum RequestBody {
     None,
     /// A compact-JSON string body.
     Json(String),
-    /// A multipart form body (the `/uploads` path).
+    /// A multipart form body (the single-shot `/uploads` path).
     Multipart(Vec<MultipartField>),
+    /// A raw binary body (the resumable-upload chunk `PUT` path). Carries the
+    /// chunk's `application/octet-stream` bytes without the multipart framing.
+    Bytes(Vec<u8>),
 }
 
 /// The fixed multipart boundary the client emits.
@@ -165,13 +168,16 @@ impl ReqwestClientTransport {
 }
 
 /// A `FetchTransport` that performs a blocking `reqwest` request, carries the
-/// out-of-band multipart payload, and stashes the two error-mapping headers as
-/// it reads the response.
+/// out-of-band binary payload, and stashes the two error-mapping headers as it
+/// reads the response.
 struct HeaderCapturingTransport {
-    /// The pre-serialised multipart body and its boundary content-type, set on
-    /// the `/uploads` path. `reqwest`'s `multipart` feature is not enabled, so
-    /// the body is hand-encoded and sent as raw bytes here.
-    multipart: Option<(Vec<u8>, String)>,
+    /// A pre-serialised binary request body and its content-type, carried out of
+    /// band because the egress's string `body` channel cannot hold raw bytes.
+    /// Two callers use it: the single-shot `/uploads` multipart body (hand-encoded
+    /// because `reqwest`'s `multipart` feature is not enabled), and the
+    /// resumable-upload chunk `PUT`'s `application/octet-stream` body. When set,
+    /// it carries an explicit content-type the header list omits.
+    binary_body: Option<(Vec<u8>, String)>,
     captured: Mutex<ResponseHeaders>,
 }
 
@@ -199,13 +205,15 @@ impl FetchTransport for HeaderCapturingTransport {
         let method = match opts.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
         };
         let mut req = client.request(method, url);
         for (k, v) in &opts.headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        if let Some((raw, content_type)) = &self.multipart {
-            // The boundary content-type carries the multipart boundary; the
+        if let Some((raw, content_type)) = &self.binary_body {
+            // The content-type is carried with the out-of-band binary body (the
+            // multipart boundary, or `application/octet-stream` for a chunk); the
             // header list deliberately omits any content-type for this path.
             req = req
                 .header("content-type", content_type.as_str())
@@ -286,7 +294,7 @@ impl ClientTransport for ReqwestClientTransport {
         headers: &[(String, String)],
         body: &RequestBody,
     ) -> Result<ClientResponse, OutboundError> {
-        let (string_body, multipart) = match body {
+        let (string_body, binary_body) = match body {
             RequestBody::None => (None, None),
             RequestBody::Json(s) => (Some(s.clone()), None),
             RequestBody::Multipart(fields) => {
@@ -294,9 +302,13 @@ impl ClientTransport for ReqwestClientTransport {
                 let content_type = format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}");
                 (None, Some((raw, content_type)))
             }
+            RequestBody::Bytes(bytes) => (
+                None,
+                Some((bytes.clone(), "application/octet-stream".to_string())),
+            ),
         };
         let inner = HeaderCapturingTransport {
-            multipart,
+            binary_body,
             captured: Mutex::new(ResponseHeaders::default()),
         };
         let mut audit = Vec::new();

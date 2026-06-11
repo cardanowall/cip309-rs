@@ -22,16 +22,18 @@
 
 use crate::client::http::{ClientError, NamespaceConfig};
 use crate::client::off_host_sign::{assemble_cose_sign1, prepare_sig_structure};
-use crate::client::transport::{MultipartField, RequestBody};
+use crate::client::resumable::{upload_resumable, ResumableUploadError};
+use crate::client::transport::RequestBody;
 use crate::client::types::{
     MerkleLeaf, PublishContentInput, PublishMerkleInput, PublishMerkleResponse,
-    PublishPrehashedInput, PublishResponse, PublishSealedInput, SealedKemChoice, SupportedHashAlg,
-    UploadEntry, UploadsResponse,
+    PublishPrehashedInput, PublishResponse, PublishSealedInput, ResumableSource,
+    ResumableUploadInput, SealedKemChoice, SupportedHashAlg, UploadEntry, UploadError,
+    UploadsResponse,
 };
 use crate::hash::{blake2b256, sha256};
 use crate::merkle::{encode_leaves_list, merkle_root, MERKLE_ALG_ID};
 use crate::poe_standard::{
-    chunk_uri, encode_poe_record, EncryptionEnvelope, ItemEntry, MerkleCommit, PoeRecord, Slot,
+    encode_poe_record, EncScheme1, EncryptionEnvelope, ItemEntry, MerkleCommit, PoeRecord, Slot,
 };
 use crate::sealed_poe::{ecies_sealed_poe_wrap_secure, SealedKem, SealedSlots, WrapArgs};
 use crate::verifier::fetch::HttpMethod;
@@ -223,54 +225,94 @@ fn post_publish(
     Ok(parsed)
 }
 
-/// POST blobs to `/uploads`; escalate any per-file failure into
-/// [`PartialUploadError`].
-fn post_uploads(
+/// Upload one storage blob and return its `ar://` URI.
+///
+/// The blob is driven through the resumable helper, which is size-gated: a blob
+/// at or under the resumable threshold rides the byte-stable single-shot
+/// multipart `/uploads` path; a larger blob (e.g. a multi-GB sealed ciphertext)
+/// uploads in resumable chunks, so an interrupted transfer resumes from the
+/// server's `missing` set rather than restarting. `chunk_bytes` tunes the
+/// client's intended chunk size; the server's `max_chunk_bytes` always clamps it
+/// down when tighter.
+///
+/// A resumable failure is projected back onto the publish-helper error contract:
+/// a terminal upload failure becomes a single-entry [`PartialUploadError`] (the
+/// helpers upload exactly one blob, so the failed index is always `0`) so callers
+/// can retry; a create-time funding rejection and any HTTP/transport error flow
+/// through as [`PublishHelperError::Http`]; a read or protocol failure surfaces as
+/// [`PublishHelperError::Crypto`].
+fn upload_blob(
     config: &NamespaceConfig<'_>,
-    blobs: &[Vec<u8>],
+    blob: Vec<u8>,
+    chunk_bytes: Option<u64>,
     idempotency_key: Option<&str>,
-) -> Result<UploadsResponse, PublishHelperError> {
-    let mut fields = vec![MultipartField {
-        name: "target".to_string(),
-        filename: None,
-        content_type: None,
-        value: STORAGE_TARGET_ARWEAVE.as_bytes().to_vec(),
-    }];
-    for (idx, bytes) in blobs.iter().enumerate() {
-        fields.push(MultipartField {
-            name: format!("file_{idx}"),
-            filename: Some(format!("file_{idx}.bin")),
-            content_type: Some("application/octet-stream".to_string()),
-            value: bytes.clone(),
-        });
+) -> Result<String, PublishHelperError> {
+    let input = ResumableUploadInput {
+        target: STORAGE_TARGET_ARWEAVE.to_string(),
+        source: ResumableSource::Bytes(blob),
+        content_type: Some("application/octet-stream".to_string()),
+        threshold_bytes: None,
+        chunk_bytes,
+        resume_session_id: None,
+        idempotency_key: idempotency_key.map(str::to_string),
+    };
+    match upload_resumable(config, &input) {
+        Ok(result) => Ok(result.uri),
+        Err(err) => Err(map_resumable_error(err)),
     }
-    let headers =
-        crate::client::http::multipart_headers(config.api_key.as_deref(), idempotency_key);
-    let url = format!("{}/api/v1/poe/uploads", config.base_url);
-    let response = crate::client::http::send(
-        config.transport,
-        &url,
-        HttpMethod::Post,
-        &headers,
-        &RequestBody::Multipart(fields),
-    )?;
-    let result: UploadsResponse = crate::client::http::decode(&response.body)?;
-    if result.uploads.iter().any(|u| !u.is_ok()) {
-        return Err(PartialUploadError::new(result).into());
-    }
-    Ok(result)
 }
 
-/// The first success URI of an uploads response.
-fn first_success_uri(response: &UploadsResponse) -> Result<String, PublishHelperError> {
-    response
-        .uploads
-        .iter()
-        .find_map(|u| match u {
-            UploadEntry::Success { uri, .. } => Some(uri.clone()),
-            UploadEntry::Failure { .. } => None,
-        })
-        .ok_or_else(|| PublishHelperError::Crypto("uploads response carried no success URI".into()))
+/// Project a [`ResumableUploadError`] onto the publish-helper error contract.
+///
+/// The single most important mapping: an upload failure becomes a single-entry
+/// [`PartialUploadError`] so the existing caller contract (retry the failed
+/// indices) is preserved even though a single-blob resumable upload has at most
+/// one failure. A single-shot per-file rejection carries its verbatim `code` +
+/// `detail` through unchanged, so `publish_sealed` / `publish_merkle` surface the
+/// exact same diagnostic the single-shot `/uploads` route emitted. A terminal
+/// chunked-attempt release (whose only diagnostic on the wire is a free-text
+/// reason) maps to the synthetic `upload-failed` code carrying that reason.
+fn map_resumable_error(err: ResumableUploadError) -> PublishHelperError {
+    match err {
+        // The single-shot path's per-file rejection: preserve code + detail.
+        ResumableUploadError::UploadRejected(error) => {
+            PartialUploadError::new(single_failed_upload(error)).into()
+        }
+        // A released chunked attempt: the wire carries only a free-text reason.
+        ResumableUploadError::Failed(detail) => {
+            PartialUploadError::new(single_failed_upload(UploadError {
+                code: "upload-failed".to_string(),
+                detail,
+            }))
+            .into()
+        }
+        ResumableUploadError::InsufficientFunds(boxed) => ClientError::Http(boxed).into(),
+        ResumableUploadError::Http(client) => client.into(),
+        ResumableUploadError::Source(detail) => {
+            PublishHelperError::Crypto(format!("upload source could not be read: {detail}"))
+        }
+        // A source shorter than the server-declared grid is a read-side problem
+        // the caller must fix (pass the full source), not a gateway failure.
+        err @ ResumableUploadError::SourceTruncated { .. } => {
+            PublishHelperError::Crypto(format!("upload source could not be read: {err}"))
+        }
+        ResumableUploadError::Decode(detail) | ResumableUploadError::Protocol(detail) => {
+            PublishHelperError::Crypto(format!("upload protocol error: {detail}"))
+        }
+    }
+}
+
+/// A synthetic single-file uploads response carrying one failure at index `0`, so
+/// a terminal single-blob upload escalates through the established
+/// [`PartialUploadError`] shape the CLI relies on (`failed[0]`).
+fn single_failed_upload(error: UploadError) -> UploadsResponse {
+    UploadsResponse {
+        uploads: vec![UploadEntry::Failure {
+            idx: 0,
+            ok: false,
+            error,
+        }],
+    }
 }
 
 /// Anchor a single content blob by its digest (hash-only).
@@ -382,27 +424,33 @@ pub fn publish_sealed(
         SealedKemChoice::X25519 => SealedKem::X25519,
         SealedKemChoice::Mlkem768X25519 => SealedKem::Mlkem768X25519,
     };
+    // The item's hash claim is an input to the wrap: its digest is bound into
+    // the slot-set MAC, so the envelope commits to exactly the `hashes` map
+    // this record will carry.
+    let item_hashes: std::collections::BTreeMap<String, Vec<u8>> =
+        [(hash_alg.as_str().to_string(), plaintext_digest.clone())].into();
     let sealed = ecies_sealed_poe_wrap_secure(WrapArgs {
         plaintext: &input.content,
         recipient_public_keys: &input.recipients,
+        hashes: &item_hashes,
         kem: Some(sealed_kem),
         ..WrapArgs::default()
     })
     .map_err(|e| PublishHelperError::Crypto(e.to_string()))?;
 
-    let uploads = post_uploads(
+    let uri = upload_blob(
         config,
-        &[sealed.ciphertext],
+        sealed.ciphertext,
+        input.chunk_bytes,
         input.idempotency_key.as_deref(),
     )?;
-    let uri = first_success_uri(&uploads)?;
 
     let envelope = build_envelope(&sealed.envelope);
     let record = PoeRecord {
         v: 1,
         items: Some(vec![ItemEntry {
             hashes: vec![(hash_alg.as_str().to_string(), plaintext_digest)],
-            uris: Some(vec![chunk_uri(&uri)]),
+            uris: Some(vec![uri]),
             enc: Some(envelope),
         }]),
         ..PoeRecord::default()
@@ -431,12 +479,14 @@ fn build_envelope(env: &crate::sealed_poe::SealedEnvelope) -> EncryptionEnvelope
             .iter()
             .map(|s| Slot {
                 epk: None,
+                // The record carries `kem_ct` as the single 1120-byte X-Wing
+                // encapsulation, exactly as the crypto layer holds it.
                 kem_ct: Some(s.kem_ct.clone()),
                 wrap: Some(s.wrap.clone()),
             })
             .collect(),
     };
-    EncryptionEnvelope {
+    EncryptionEnvelope::Scheme1(EncScheme1 {
         scheme: u64::try_from(env.scheme).unwrap_or(1),
         aead: env.aead.clone(),
         nonce: env.nonce.clone(),
@@ -444,7 +494,7 @@ fn build_envelope(env: &crate::sealed_poe::SealedEnvelope) -> EncryptionEnvelope
         slots: Some(slots),
         slots_mac: Some(env.slots_mac.clone()),
         passphrase: None,
-    }
+    })
 }
 
 /// Commit N leaf hashes under one Merkle root, upload the leaves-list, and
@@ -485,14 +535,18 @@ pub fn publish_merkle(
     let leaves_list = encode_leaves_list(&leaves, &root, None)
         .map_err(|e| PublishHelperError::Crypto(e.to_string()))?;
 
-    let uploads = post_uploads(config, &[leaves_list], input.idempotency_key.as_deref())?;
-    let uri = first_success_uri(&uploads)?;
+    let uri = upload_blob(
+        config,
+        leaves_list,
+        input.chunk_bytes,
+        input.idempotency_key.as_deref(),
+    )?;
 
     let merkle_entry = MerkleCommit {
         alg: MERKLE_ALG_ID.to_string(),
         root: root.to_vec(),
         leaf_count: leaves.len() as u64,
-        uris: Some(vec![chunk_uri(&uri)]),
+        uris: Some(vec![uri.clone()]),
     };
     let record = PoeRecord {
         v: 1,

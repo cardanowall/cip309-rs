@@ -7,9 +7,9 @@
 //! continues. `merkle[]` is read structurally at every profile and never produces
 //! a skip here.
 
-use crate::poe_standard::{ErrorCode, PoeRecord};
+use crate::poe_standard::{ErrorCode, PathSegment, PoeRecord};
 
-use crate::verifier::types::{PathSegment, Profile, VerifierIssue};
+use crate::verifier::types::{Profile, VerifierIssue};
 
 /// `true` iff `actual` reads at least the surface of `required`.
 #[must_use]

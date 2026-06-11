@@ -1,23 +1,24 @@
 //! Multi-recipient sealed-PoE wrap: age-style ECIES (classical X25519) and
-//! the X-Wing hybrid KEM, both producing one AEAD-bound envelope shape.
+//! the X-Wing hybrid KEM, both producing one envelope shape.
 //!
 //! A sealed PoE encrypts its plaintext ONCE under a random content-encryption
-//! key (CEK) with XChaCha20-Poly1305, then wraps that CEK to each recipient in
-//! a per-recipient slot. The two KEM branches share the envelope shape and are
-//! discriminated by the envelope `kem` field:
+//! key (CEK) in the `chacha20-poly1305-stream64k` segmented STREAM format,
+//! then wraps that CEK to each recipient in a per-recipient slot. The two KEM
+//! branches share the envelope shape and are discriminated by the envelope
+//! `kem` field:
 //!
 //! - `x25519`: classical age-style ECIES. Each slot carries a 32-byte
 //!   ephemeral public key (`epk`) and the 48-byte wrapped CEK (`wrap`).
-//! - `mlkem768x25519`: X-Wing hybrid. Each slot carries the chunked 1120-byte
-//!   X-Wing ciphertext (`kem_ct`) and the 48-byte wrapped CEK. No per-slot
-//!   `epk`.
+//! - `mlkem768x25519`: X-Wing hybrid. Each slot carries the 1120-byte X-Wing
+//!   ciphertext (`kem_ct`, a single byte string) and the 48-byte wrapped CEK.
+//!   No per-slot `epk`.
 //!
-//! The `slots_mac` is an HMAC over the 32-byte `slots_hash` (the SHA-256 of the
-//! header-bound slots transcript), keyed by an HKDF expansion of the CEK. The
-//! content is then encrypted under a CEK-derived `payload_key` with a structured
-//! AAD that carries both `slots_hash` and `slots_mac`, so a verifier that
-//! recovers the CEK can detect any tampering with the on-chain header or slots
-//! (including a hybrid `kem_ct`).
+//! The `slots_mac` is an HMAC over the 32-byte `slots_hash` (the SHA-256 of
+//! the slots transcript, which binds the header fields, the shuffled slot set,
+//! and the item's `hashes_hash`), keyed by an HKDF expansion of the CEK. The
+//! content carries no per-chunk AAD: it is bound to the header transitively,
+//! because `payload_key` derives from the CEK and the CEK is committed by
+//! `slots_mac`.
 //!
 //! Randomness for the anonymity shuffle, and for any absent CEK / nonce /
 //! ephemeral material, comes from a caller-supplied [`RandomSource`] closure —
@@ -27,25 +28,27 @@
 //! every secret explicitly and disable the shuffle, so the closure is never
 //! consulted on the deterministic path.
 
+use std::collections::BTreeMap;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::Zeroize;
 
 use crate::kdf::hkdf_sha256;
 
-use super::aead::{chacha20_poly1305_encrypt, xchacha20_poly1305_encrypt};
+use super::aead::chacha20_poly1305_encrypt;
 use super::errors::{EciesSealedPoeError, EciesSealedPoeErrorCode};
 use super::kem::{
     mlkem768x25519_encapsulate, x25519_ecdh, x25519_public_key, MLKEM768X25519_ENC_LENGTH,
     MLKEM768X25519_ESEED_LENGTH, MLKEM768X25519_PUBLIC_KEY_LENGTH,
 };
 use super::slots::{
-    chunk_kem_ct, join_kem_ct, Mlkem768X25519Slot, SealedEnvelope, SealedPoeOutput, SealedSlots,
-    X25519Slot, AEAD_XCHACHA20_POLY1305, KEM_MLKEM768X25519, KEM_X25519,
+    Mlkem768X25519Slot, SealedEnvelope, SealedPoeOutput, SealedSlots, X25519Slot,
+    AEAD_CHACHA20_POLY1305_STREAM64K, KEM_MLKEM768X25519, KEM_X25519,
 };
+use super::stream::stream_seal;
 use super::transcript::{
-    ad_content_slots, assert_plaintext_within_bound, compute_slots_hash, slots_payload_key,
-    xwing_kek_salt,
+    compute_slots_hash, item_hashes_hash, slots_payload_key, x25519_kek_salt, xwing_kek_salt,
 };
 
 /// The classical per-slot KEK derivation label, reused verbatim as the per-slot
@@ -60,9 +63,15 @@ pub const CARDANO_POE_HKDF_INFO_KEK_MLKEM768X25519: &[u8] = b"cardano-poe-kek-ml
 /// The `slots_mac` HMAC-key derivation label. 24 bytes.
 pub const CARDANO_POE_HKDF_INFO_SLOTS_MAC: &[u8] = b"cardano-poe-slots-mac-v1";
 
+const _: () = {
+    assert!(CARDANO_POE_HKDF_INFO_KEK.len() == 18);
+    assert!(CARDANO_POE_HKDF_INFO_KEK_MLKEM768X25519.len() == 33);
+    assert!(CARDANO_POE_HKDF_INFO_SLOTS_MAC.len() == 24);
+};
+
 /// The all-zero 12-byte nonce the per-slot ChaCha20-Poly1305 wrap uses. The
-/// KEK is single-use (a fresh ephemeral/encapsulation per slot), so a fixed
-/// nonce is safe.
+/// KEK is single-use (a fresh ephemeral/encapsulation per slot, salted by the
+/// envelope-unique `enc.nonce`), so a fixed nonce is safe.
 const ZERO_NONCE_12: [u8; 12] = [0u8; 12];
 
 const X25519_KEY_LENGTH: usize = 32;
@@ -70,6 +79,10 @@ const CEK_LENGTH: usize = 32;
 const NONCE_LENGTH: usize = 24;
 const WRAP_LENGTH: usize = 48;
 const SLOTS_MAC_LENGTH: usize = 32;
+
+/// The empty hashes map behind `WrapArgs::default()`. Production callers and
+/// vectors always supply the item's real `hashes`.
+static EMPTY_HASHES: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
 /// The KEM branch to seal under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,23 +128,27 @@ pub type RandomSource<'r> = &'r mut dyn FnMut(&mut [u8]);
 /// Inputs to the sealed-PoE wrap ([`ecies_sealed_poe_wrap_secure`] and
 /// [`ecies_sealed_poe_wrap_with_rng`]).
 ///
-/// `kem` selects the branch (defaulting to classical X25519). `cek`, `nonce`,
+/// `hashes` is the item's content-hash map (algorithm identifier → digest
+/// bytes); its digest is bound into the slots transcript, so the on-chain
+/// `slots_mac` commits the envelope to this item's hash claim. `kem` selects
+/// the branch (defaulting to classical X25519). `cek`, `nonce`,
 /// `ephemeral_secrets`, and `eseeds` are deterministic overrides used to
 /// reproduce known-answer vectors; production callers leave them `None` so the
 /// supplied [`RandomSource`] draws fresh material. `skip_shuffle` disables the
 /// anonymity shuffle, again only for deterministic vectors.
-#[derive(Default)]
 pub struct WrapArgs<'a> {
     /// The plaintext to seal.
     pub plaintext: &'a [u8],
     /// One recipient public key per slot. X25519 keys are 32 bytes; X-Wing keys
     /// are 1216 bytes.
     pub recipient_public_keys: &'a [Vec<u8>],
+    /// The item's content-hash map, bound into the slots transcript.
+    pub hashes: &'a BTreeMap<String, Vec<u8>>,
     /// The KEM branch. Defaults to [`SealedKem::X25519`] when `None`.
     pub kem: Option<SealedKem>,
     /// Deterministic 32-byte CEK override.
     pub cek: Option<&'a [u8]>,
-    /// Deterministic 24-byte content-nonce override.
+    /// Deterministic 24-byte nonce override.
     pub nonce: Option<&'a [u8]>,
     /// Deterministic X25519 ephemeral scalars (classical branch only), one per
     /// recipient.
@@ -141,6 +158,22 @@ pub struct WrapArgs<'a> {
     pub eseeds: Option<&'a [Vec<u8>]>,
     /// When `true`, skip the anonymity shuffle so slot order is deterministic.
     pub skip_shuffle: bool,
+}
+
+impl Default for WrapArgs<'_> {
+    fn default() -> Self {
+        Self {
+            plaintext: &[],
+            recipient_public_keys: &[],
+            hashes: &EMPTY_HASHES,
+            kem: None,
+            cek: None,
+            nonce: None,
+            ephemeral_secrets: None,
+            eseeds: None,
+            skip_shuffle: false,
+        }
+    }
 }
 
 /// The rejection-sampling ceiling for an unbiased index in `[0, m)`.
@@ -193,6 +226,7 @@ fn wrap_slot_x25519(
     pub_r: &[u8],
     priv_eph: Option<&[u8]>,
     cek: &[u8],
+    nonce: &[u8],
     slot_idx: usize,
     fill: &mut dyn FnMut(&mut [u8]),
 ) -> Result<X25519Slot, EciesSealedPoeError> {
@@ -226,10 +260,9 @@ fn wrap_slot_x25519(
             format!("recipient_public_keys[{slot_idx}] X25519 ECDH failed: {e}"),
         )
     })?;
-    // age v1 stanza salt is `epk || pub_R`.
-    let mut salt = Vec::with_capacity(epk.len() + pub_r.len());
-    salt.extend_from_slice(&epk);
-    salt.extend_from_slice(pub_r);
+    // The labelled-hash salt binds the envelope nonce, the slot's ephemeral,
+    // and the recipient public key.
+    let salt = x25519_kek_salt(nonce, &epk, pub_r);
     let mut kek = hkdf_sha256(&shared, &salt, CARDANO_POE_HKDF_INFO_KEK, 32)
         .expect("32-byte HKDF output is within the RFC 5869 maximum");
     shared.zeroize();
@@ -249,6 +282,7 @@ fn wrap_slot_mlkem768x25519(
     pub_r: &[u8],
     eseed: &[u8],
     cek: &[u8],
+    nonce: &[u8],
     slot_idx: usize,
 ) -> Result<Mlkem768X25519Slot, EciesSealedPoeError> {
     let encaps = mlkem768x25519_encapsulate(pub_r, eseed).map_err(|e| {
@@ -258,12 +292,11 @@ fn wrap_slot_mlkem768x25519(
         )
     })?;
     debug_assert_eq!(encaps.enc.len(), MLKEM768X25519_ENC_LENGTH);
-    // The hybrid KEK salt binds the slot's own reassembled X-Wing ciphertext and
-    // the recipient public key, mirroring the classical `epk || pub_R` salt: the
-    // ciphertext anchors the KEK to a slot-unique value and `pub_R` binds it to
-    // the specific recipient. It is computed outside the KEM, over the slot's
-    // wire bytes, so it holds X-Wing as a black-box KEM.
-    let salt = xwing_kek_salt(&encaps.enc, pub_r);
+    // The labelled-hash salt binds the envelope nonce, the slot's own X-Wing
+    // ciphertext (a slot-unique value), and the recipient public key — the
+    // same three bindings as the classical salt, computed outside the KEM over
+    // the slot's wire bytes so it holds X-Wing as a black-box KEM.
+    let salt = xwing_kek_salt(nonce, &encaps.enc, pub_r);
     let mut kek = hkdf_sha256(
         &encaps.ss,
         &salt,
@@ -280,7 +313,7 @@ fn wrap_slot_mlkem768x25519(
     kek.zeroize();
     debug_assert_eq!(wrap.len(), WRAP_LENGTH);
     Ok(Mlkem768X25519Slot {
-        kem_ct: chunk_kem_ct(&encaps.enc),
+        kem_ct: encaps.enc.to_vec(),
         wrap,
     })
 }
@@ -291,9 +324,9 @@ fn wrap_slot_mlkem768x25519(
 /// `hmac_key = HKDF-SHA256(ikm = CEK, salt = "", info =
 /// "cardano-poe-slots-mac-v1")`; `slots_mac = HMAC-SHA256(hmac_key,
 /// slots_hash)`. The transcript is pre-hashed to `slots_hash` (header fields +
-/// canonicalised slot set, including the entire chunked `kem_ct` on the hybrid
-/// path); pre-hashing only changes the HMAC message from the full transcript to
-/// its SHA-256, leaving the CEK-keyed commitment intact.
+/// the shuffled slot set + the item's `hashes_hash`); pre-hashing only changes
+/// the HMAC message from the full transcript to its SHA-256, leaving the
+/// CEK-keyed commitment intact.
 fn compute_slots_mac(cek: &[u8], slots_hash: &[u8]) -> [u8; SLOTS_MAC_LENGTH] {
     let mut hmac_key = hkdf_sha256(cek, &[], CARDANO_POE_HKDF_INFO_SLOTS_MAC, 32)
         .expect("32-byte HKDF output is within the RFC 5869 maximum");
@@ -307,23 +340,20 @@ fn compute_slots_mac(cek: &[u8], slots_hash: &[u8]) -> [u8; SLOTS_MAC_LENGTH] {
 
 /// Per-slot KEK-uniqueness gate. The zero-nonce per-slot wrap is sound only when
 /// every slot's KEK is unique; the KEK is a deterministic function of the slot's
-/// KEM material (the x25519 `epk` and recipient public key, or the reassembled
-/// hybrid `kem_ct` and recipient public key), so two slots carrying identical
-/// KEM material against the same recipient repeat the (KEK, nonce) pair. Reject
-/// an envelope with duplicate per-slot KEM material — a duplicate `epk` for
-/// x25519, a duplicate reassembled `kem_ct` for the hybrid path — at the
-/// producer before committing anything to the wire.
+/// KEM material (the x25519 `epk` and recipient public key, or the hybrid
+/// `kem_ct` and recipient public key), so two slots carrying identical KEM
+/// material against the same recipient repeat the (KEK, nonce) pair. Reject an
+/// envelope with duplicate per-slot KEM material — a duplicate `epk` for
+/// x25519, a duplicate `kem_ct` for the hybrid path — at the producer before
+/// committing anything to the wire.
 fn assert_unique_slot_kem_material(slots: &SealedSlots) -> Result<(), EciesSealedPoeError> {
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    let materials: Vec<Vec<u8>> = match slots {
-        SealedSlots::X25519(slots) => slots.iter().map(|s| s.epk.clone()).collect(),
-        SealedSlots::Mlkem768X25519(slots) => {
-            slots.iter().map(|s| join_kem_ct(&s.kem_ct)).collect()
-        }
-    };
-    let field = match slots {
-        SealedSlots::X25519(_) => "epk",
-        SealedSlots::Mlkem768X25519(_) => "kem_ct",
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let (materials, field): (Vec<&[u8]>, &str) = match slots {
+        SealedSlots::X25519(slots) => (slots.iter().map(|s| s.epk.as_slice()).collect(), "epk"),
+        SealedSlots::Mlkem768X25519(slots) => (
+            slots.iter().map(|s| s.kem_ct.as_slice()).collect(),
+            "kem_ct",
+        ),
     };
     for (i, material) in materials.into_iter().enumerate() {
         if !seen.insert(material) {
@@ -342,10 +372,11 @@ fn assert_unique_slot_kem_material(slots: &SealedSlots) -> Result<(), EciesSeale
 /// operating-system CSPRNG. **This is the primary wrap API.**
 ///
 /// Produces the sealed envelope (header material destined for the on-chain
-/// metadata) and the content ciphertext (destined for off-chain storage). The
-/// CEK encrypts the plaintext once; it is then wrapped per recipient.
+/// metadata) and the segmented-STREAM content ciphertext (destined for
+/// off-chain storage). The CEK encrypts the plaintext once; it is then wrapped
+/// per recipient.
 ///
-/// The CEK, content nonce, per-recipient ephemeral material, and the anonymity
+/// The CEK, nonce, per-recipient ephemeral material, and the anonymity
 /// shuffle are all sourced from [`getrandom`] (the OS CSPRNG). Because the
 /// entropy source is fixed here, there is no way to accidentally wire up a weak
 /// RNG; a host that needs deterministic material for a known-answer or HSM test
@@ -425,11 +456,6 @@ pub fn ecies_sealed_poe_wrap_with_rng(
             format!("recipient_public_keys.len()={n} must be >= 1"),
         ));
     }
-
-    // Reject a plaintext at or above the single-shot keystream capacity before
-    // any KEM or AEAD work, so an over-large input never reaches the content
-    // cipher.
-    assert_plaintext_within_bound(args.plaintext.len() as u64)?;
 
     let expected_pub_len = match kem {
         SealedKem::X25519 => X25519_KEY_LENGTH,
@@ -543,7 +569,7 @@ pub fn ecies_sealed_poe_wrap_with_rng(
             let mut slots = Vec::with_capacity(n);
             for (i, pub_r) in args.recipient_public_keys.iter().enumerate() {
                 let priv_eph = args.ephemeral_secrets.map(|e| e[i].as_slice());
-                slots.push(wrap_slot_x25519(pub_r, priv_eph, cek, i, rng)?);
+                slots.push(wrap_slot_x25519(pub_r, priv_eph, cek, nonce, i, rng)?);
             }
             SealedSlots::X25519(slots)
         }
@@ -560,7 +586,7 @@ pub fn ecies_sealed_poe_wrap_with_rng(
                         &fresh
                     }
                 };
-                let slot = wrap_slot_mlkem768x25519(pub_r, eseed, cek, i);
+                let slot = wrap_slot_mlkem768x25519(pub_r, eseed, cek, nonce, i);
                 fresh.zeroize();
                 slots.push(slot?);
             }
@@ -570,8 +596,8 @@ pub fn ecies_sealed_poe_wrap_with_rng(
 
     // Per-slot KEK uniqueness is the safety condition for the zero-nonce wrap.
     // Duplicate per-slot KEM material (a repeated x25519 epk, or a repeated
-    // reassembled hybrid kem_ct) would repeat the (KEK, nonce) pair, so reject
-    // it at the producer before committing anything to the wire.
+    // hybrid kem_ct) would repeat the (KEK, nonce) pair, so reject it at the
+    // producer before committing anything to the wire.
     assert_unique_slot_kem_material(&slots)?;
 
     // Anonymity invariant: post-wrap CSPRNG shuffle so wire ordering encodes no
@@ -585,19 +611,26 @@ pub fn ecies_sealed_poe_wrap_with_rng(
         }
     }
 
-    // `slots_hash` is the SHA-256 of the header-bound slots transcript. It is
-    // computed once here, fed into both the slot-set MAC and the content AAD.
-    let slots_hash = compute_slots_hash(kem.as_str(), nonce, &slots);
+    // `slots_hash` is the SHA-256 of the slots transcript: the header fields,
+    // the shuffled slot set, and the digest of the item's hashes map. Computed
+    // once here and fed into the slot-set MAC.
+    let hashes_hash = item_hashes_hash(args.hashes)?;
+    let slots_hash = compute_slots_hash(
+        AEAD_CHACHA20_POLY1305_STREAM64K,
+        kem.as_str(),
+        nonce,
+        &slots,
+        &hashes_hash,
+    );
     let slots_mac = compute_slots_mac(cek, &slots_hash);
 
     // Content is encrypted under a derived `payload_key` (a separate HKDF leaf
-    // of the CEK keyed on the nonce), never under the CEK directly, so the wrap
-    // layer and the content layer never key the same primitive on the same
-    // bytes. The AAD re-binds the slots-path header and carries both
-    // `slots_hash` and `slots_mac`.
+    // of the CEK salted by the envelope-unique nonce), never under the CEK
+    // directly, so the wrap layer and the content layer never key the same
+    // primitive on the same bytes. The STREAM chunks carry no per-chunk AAD:
+    // the header is bound transitively through the CEK commitment.
     let mut payload_key = slots_payload_key(cek, nonce);
-    let ad_content = ad_content_slots(kem.as_str(), nonce, &slots_hash, &slots_mac);
-    let ciphertext = xchacha20_poly1305_encrypt(&payload_key, nonce, &ad_content, args.plaintext);
+    let ciphertext = stream_seal(&payload_key, args.plaintext);
 
     payload_key.zeroize();
     owned_cek.zeroize();
@@ -605,7 +638,7 @@ pub fn ecies_sealed_poe_wrap_with_rng(
     Ok(SealedPoeOutput {
         envelope: SealedEnvelope {
             scheme: 1,
-            aead: AEAD_XCHACHA20_POLY1305.to_string(),
+            aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
             kem: kem.as_str().to_string(),
             nonce: nonce.to_vec(),
             slots,
@@ -678,10 +711,16 @@ mod tests {
         // nonce, and slot bytes. (A zeroed/weak RNG would make these identical.)
         let recipient = x25519_public_key(&[3u8; X25519_KEY_LENGTH]).unwrap();
         let recipients = vec![recipient.to_vec()];
+        let hashes = {
+            let mut map = BTreeMap::new();
+            map.insert("sha2-256".to_string(), vec![0x11u8; 32]);
+            map
+        };
         let mk = || {
             ecies_sealed_poe_wrap_secure(WrapArgs {
                 plaintext: b"hello sealed poe",
                 recipient_public_keys: &recipients,
+                hashes: &hashes,
                 ..Default::default()
             })
             .unwrap()

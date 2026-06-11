@@ -33,15 +33,7 @@ use cardanowall::verifier::fetch::{
 #[test]
 fn default_constants_are_pinned() {
     assert_eq!(DEFAULT_OUTBOUND_MAX_BYTES, 64 * 1024 * 1024, "64 MiB");
-    assert_eq!(
-        DENY_HOSTS_DEFAULT,
-        [
-            "cardanowall.com",
-            "*.cardanowall.com",
-            "localhost",
-            "127.0.0.1"
-        ]
-    );
+    assert_eq!(DENY_HOSTS_DEFAULT, ["localhost", "127.0.0.1"]);
 }
 
 // ===========================================================================
@@ -52,25 +44,28 @@ fn default_constants_are_pinned() {
 #[test]
 fn deny_host_full_matrix() {
     // exact
-    assert!(matches_deny_list("cardanowall.com", &["cardanowall.com"]));
-    assert!(!matches_deny_list("other.com", &["cardanowall.com"]));
+    assert!(matches_deny_list("operator.example", &["operator.example"]));
+    assert!(!matches_deny_list("other.example", &["operator.example"]));
 
     // wildcard subdomain (single + multi label), not bare
     assert!(matches_deny_list(
-        "api.cardanowall.com",
-        &["*.cardanowall.com"]
+        "api.operator.example",
+        &["*.operator.example"]
     ));
     assert!(matches_deny_list(
-        "nested.api.cardanowall.com",
-        &["*.cardanowall.com"]
+        "nested.api.operator.example",
+        &["*.operator.example"]
     ));
     assert!(!matches_deny_list(
-        "cardanowall.com",
-        &["*.cardanowall.com"]
+        "operator.example",
+        &["*.operator.example"]
     ));
 
     // case + trailing-dot
-    assert!(matches_deny_list("CardanoWall.com.", &["cardanowall.com"]));
+    assert!(matches_deny_list(
+        "Operator.Example.",
+        &["operator.example"]
+    ));
 
     // localhost aliases
     assert!(matches_deny_list("[::1]", &["localhost"]));
@@ -84,21 +79,15 @@ fn deny_host_full_matrix() {
 
     // public control + empty list
     assert!(!matches_deny_list("8.8.8.8", &["localhost", "127.0.0.1"]));
-    assert!(!matches_deny_list("cardanowall.com", &[] as &[&str]));
+    assert!(!matches_deny_list("operator.example", &[] as &[&str]));
     assert!(!matches_deny_list("127.0.0.1", &[] as &[&str]));
 
-    // the default deny list, applied
-    assert!(matches_deny_list(
-        "api.cardanowall.com",
-        &DENY_HOSTS_DEFAULT
-    ));
-    assert!(matches_deny_list(
-        "nested.api.cardanowall.com",
-        &DENY_HOSTS_DEFAULT
-    ));
+    // the default deny list, applied: loopback closed, public hosts pass
     assert!(matches_deny_list("localhost", &DENY_HOSTS_DEFAULT));
     assert!(matches_deny_list("127.5.5.5", &DENY_HOSTS_DEFAULT));
+    assert!(matches_deny_list("[::1]", &DENY_HOSTS_DEFAULT));
     assert!(!matches_deny_list("8.8.8.8", &DENY_HOSTS_DEFAULT));
+    assert!(!matches_deny_list("operator.example", &DENY_HOSTS_DEFAULT));
 }
 
 // ===========================================================================
@@ -315,7 +304,7 @@ mod real_socket {
         // Audit row shape: one row, all six fields, snake-case purpose token.
         assert_eq!(audit.len(), 1);
         let row = &audit[0];
-        assert_eq!(row.status, 200);
+        assert_eq!(row.status, Some(200));
         assert_eq!(row.bytes, "hello-world".len() as u64);
         assert_eq!(row.method, HttpMethod::Get);
         assert_eq!(row.purpose.as_str(), "arweave");
@@ -394,7 +383,8 @@ mod real_socket {
         .unwrap_err();
         assert_eq!(err.code(), "SERVICE_INDEPENDENCE_VIOLATION");
         assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].status, 0);
+        // No response was received: the schema-required status is null.
+        assert_eq!(audit[0].status, None);
     }
 
     // ===========================================================================

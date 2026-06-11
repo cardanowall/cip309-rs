@@ -1,86 +1,70 @@
 //! Public types for the Label 309 standalone verifier.
 //!
-//! The verifier is service-independent: it reads a Cardano transaction's
-//! label-309 metadata, validates the record structurally, and runs profile-gated
-//! signature, decryption, and Merkle checks — trusting no publisher and no
-//! issuer server. The [`VerifyReport`] it produces is the wire body of a verify
-//! response; it serialises (via [`super::serialize::verify_report_to_dict`]) to
-//! the byte-identical JSON the TypeScript and Python SDKs emit for the same
-//! transaction.
+//! The verifier is service-independent: it resolves a Cardano transaction
+//! through public explorers, hash-binds the fetched bytes to the requested
+//! transaction reference, validates the record structurally, and runs
+//! profile-gated signature, content, Merkle, and decryption checks — trusting
+//! no publisher and no issuer server. The [`VerifyReport`] it produces follows
+//! the published verify-report JSON Schema: the schema's keys and enums are the
+//! cross-implementation contract, and this module's types are their typed form.
 
 use std::collections::BTreeMap;
 
-use crate::poe_standard::{ErrorCode, PoeRecord, Severity};
+use crate::poe_standard::{ErrorCode, PathSegment, PoeRecord, Severity, ValidationIssue};
 
 pub use crate::verifier::fetch::{
     FetchOutboundOptions, FetchOutboundResult, FetchTransport, HttpCallRecord, HttpMethod,
     HttpPurpose,
 };
 
-/// The wire-canonical network identifier surfaced on every report.
+/// The default reorg-safety confirmation-depth threshold, in blocks.
 ///
-/// Label 309 product policy is Cardano mainnet only; the value is fixed so a
-/// downstream consumer never has to infer which network a record was anchored
-/// on. The `cardano_network` input governs only path-2 stake-byte derivation and
-/// does not change this field.
-pub const NETWORK_CARDANO_MAINNET: &str = "cardano:mainnet";
-
-/// The default reorg-safety confirmation-depth floor.
-///
-/// A record with fewer confirmations is well-formed but not yet final, so the
-/// verifier returns the [`Verdict::Pending`] / [`ExitCode::InsufficientDepth`]
-/// pair rather than a failure.
+/// A transaction below the threshold is well-formed but not yet final, so the
+/// verifier reports [`Verdict::Pending`] rather than a failure. Deployment
+/// policy MAY raise it for high-value notarisation.
 pub const CONFIRMATION_DEPTH_THRESHOLD_DEFAULT: u32 = 15;
 
-/// The three-state verifier verdict.
+/// The four-state machine verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Every check passed.
+    /// Every check that ran passed and no error-severity issue is present.
     Valid,
-    /// The record is well-formed but below the confirmation-depth threshold.
+    /// On chain but below the confirmation-depth threshold
+    /// (`INSUFFICIENT_CONFIRMATIONS`); no result is final.
     Pending,
-    /// A structural, cryptographic, or network check failed.
+    /// No record-attributable error, but a required check could not run — or
+    /// could not be attributed — for network, policy, or provider-integrity
+    /// reasons. The same record may verify `valid` on retry or under a
+    /// different gateway configuration.
+    Unverifiable,
+    /// A record-attributable failure: integrity, structural, signature,
+    /// Merkle-mismatch, or service-independence-violation class.
     Failed,
 }
 
 impl Verdict {
-    /// The stable wire token for this verdict, identical across the SDKs.
+    /// The stable wire token for this verdict.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Verdict::Valid => "valid",
             Verdict::Pending => "pending",
+            Verdict::Unverifiable => "unverifiable",
             Verdict::Failed => "failed",
         }
     }
-}
 
-/// The verifier exit code, paired with [`Verdict`].
-///
-/// `0` is the only happy path; `3` fires exclusively on insufficient
-/// confirmations; `1` is the record-attributable failure class; `2` is the
-/// network failure class (a different gateway may succeed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitCode {
-    /// `0` — every check passed.
-    Ok,
-    /// `1` — integrity / structural / signature failure.
-    Integrity,
-    /// `2` — network failure (provider or content unavailable).
-    Network,
-    /// `3` — insufficient confirmations.
-    InsufficientDepth,
-}
-
-impl ExitCode {
-    /// The numeric wire value (`0..=3`).
+    /// The four-state process exit code paired with this verdict:
+    /// `valid` → 0, `failed` → 1, `unverifiable` → 2, `pending` → 3.
+    /// Exit codes 4 and higher are reserved for verifier-host runtime failures
+    /// that are not record-attributable and do not correspond to a verdict.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn exit_code(self) -> u8 {
         match self {
-            ExitCode::Ok => 0,
-            ExitCode::Integrity => 1,
-            ExitCode::Network => 2,
-            ExitCode::InsufficientDepth => 3,
+            Verdict::Valid => 0,
+            Verdict::Failed => 1,
+            Verdict::Unverifiable => 2,
+            Verdict::Pending => 3,
         }
     }
 }
@@ -88,17 +72,18 @@ impl ExitCode {
 /// The four conformance profiles, in strict-superset order.
 ///
 /// A verifier of a lower profile that meets a higher-profile field emits an
-/// [`ErrorCode::OutOfProfileSkipped`] info issue and continues; it never reports
-/// the record invalid. `recipient-sealed` is the union (the default).
+/// [`ErrorCode::OutOfProfileSkipped`] info issue and continues; it never
+/// reports the record invalid on that ground. `recipient-sealed` is the union
+/// (the default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Profile {
-    /// Hash-only: reads `items.hashes` / `uris` / `merkle` structurally.
+    /// Hash-only: structural validation plus content-hash checks.
     Core,
-    /// `core` plus record-level `sigs[]`.
+    /// `core` plus record-level signature verification.
     Signed,
-    /// `signed` plus the `enc` envelope structure.
+    /// `signed` plus the structural surface of the encryption envelope.
     Sealed,
-    /// `sealed` plus byte-level decryption with a recipient key.
+    /// `sealed` plus sealed-PoE decryption with held credentials.
     RecipientSealed,
 }
 
@@ -120,7 +105,7 @@ impl Profile {
         self.rank() >= required.rank()
     }
 
-    /// The stable wire token for this profile, identical across the SDKs.
+    /// The stable wire token for this profile.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -135,30 +120,22 @@ impl Profile {
 /// The verifier's default profile: the full pipeline.
 pub const DEFAULT_PROFILE: Profile = Profile::RecipientSealed;
 
-/// One verifier issue: a taxonomy code, its severity, a path, and a message.
+/// One report issue: a taxonomy code, its path, severity, and message.
 ///
-/// `path` and `message` carry human diagnostics; the cross-implementation parity
-/// surface is `code`. The `path` mirrors the Python `VerifierIssue.path` tuple so
-/// the serialised report matches byte-for-byte where a path is present.
+/// The shape is shared by the structural validator and the verifier layer;
+/// verifier-layer codes that concern the run rather than a record location
+/// carry an empty path. The cross-implementation parity surface is
+/// `(path, code, severity)`; `message` is human diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierIssue {
-    /// The taxonomy code (its wire string is the stable identifier).
-    pub code: ErrorCode,
-    /// The dotted path into the record this issue concerns (may be empty).
+    /// Segments from the record root: text map keys and integer array indices.
     pub path: Vec<PathSegment>,
-    /// A human-readable description (informational; not part of the contract).
-    pub message: String,
-    /// The issue severity.
+    /// The canonical taxonomy code.
+    pub code: ErrorCode,
+    /// The issue severity. Always emitted explicitly on the wire.
     pub severity: Severity,
-}
-
-/// A single segment of a [`VerifierIssue`] path: either a map key or an index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathSegment {
-    /// A textual key (e.g. `"sigs"`).
-    Key(String),
-    /// A numeric index (e.g. an `items[i]` position).
-    Index(usize),
+    /// A human-readable explanation including the offending value.
+    pub message: String,
 }
 
 impl VerifierIssue {
@@ -166,40 +143,130 @@ impl VerifierIssue {
     #[must_use]
     pub fn new(code: ErrorCode, path: Vec<PathSegment>, message: impl Into<String>) -> Self {
         Self {
-            code,
             path,
-            message: message.into(),
+            code,
             severity: code.severity(),
+            message: message.into(),
         }
     }
-}
 
-impl From<&crate::poe_standard::ValidationIssue> for VerifierIssue {
-    /// Lift a structural-validator issue into a verifier issue.
-    ///
-    /// The structural validator's issues carry no structured path (their parity
-    /// surface is the code), so the lifted issue has an empty path.
-    fn from(issue: &crate::poe_standard::ValidationIssue) -> Self {
+    /// Build an issue with an explicit severity (the dual-severity escalations).
+    #[must_use]
+    pub fn with_severity(
+        code: ErrorCode,
+        severity: Severity,
+        path: Vec<PathSegment>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            code: issue.code,
-            path: Vec::new(),
-            message: issue.message.clone(),
-            severity: issue.severity,
+            path,
+            code,
+            severity,
+            message: message.into(),
         }
     }
 }
 
-/// The validation summary: a pass flag plus three severity-keyed issue lists.
+impl From<&ValidationIssue> for VerifierIssue {
+    /// Lift a structural-validator issue into the report's issue list, path
+    /// and severity preserved.
+    fn from(issue: &ValidationIssue) -> Self {
+        Self {
+            path: issue.path.clone(),
+            code: issue.code,
+            severity: issue.severity,
+            message: issue.message.clone(),
+        }
+    }
+}
+
+/// Compare two issues by path (segment-wise) with the error-code-registry
+/// order as the tie-break — the normative report ordering.
+///
+/// Paths are compared element by element from the root: two integer segments
+/// compare numerically, two text segments by the bytewise order of their UTF-8
+/// encodings, an integer segment orders before a text segment where the kinds
+/// differ, and a path that is a strict prefix of another orders before it.
+#[must_use]
+pub fn compare_verifier_issues(a: &VerifierIssue, b: &VerifierIssue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let n = a.path.len().min(b.path.len());
+    for i in 0..n {
+        let ord = match (&a.path[i], &b.path[i]) {
+            (PathSegment::Index(x), PathSegment::Index(y)) => x.cmp(y),
+            (PathSegment::Index(_), PathSegment::Key(_)) => Ordering::Less,
+            (PathSegment::Key(_), PathSegment::Index(_)) => Ordering::Greater,
+            (PathSegment::Key(x), PathSegment::Key(y)) => x.as_bytes().cmp(y.as_bytes()),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.path
+        .len()
+        .cmp(&b.path.len())
+        .then_with(|| a.code.registry_index().cmp(&b.code.registry_index()))
+}
+
+/// The three-state per-claim content-check status, so an unchecked claim can
+/// never masquerade as a verified one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentCheck {
+    /// Bytes were obtained and every committed digest matched.
+    Checked,
+    /// Attributable fetched (or decrypted) bytes failed a commitment — a
+    /// record-attributable integrity outcome.
+    Mismatched,
+    /// The claim was not checked: `fetch_content` off, availability failure,
+    /// unattributable fetched bytes, or the per-URI fetch ceiling.
+    #[default]
+    NotChecked,
+}
+
+impl ContentCheck {
+    /// The stable wire token for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ContentCheck::Checked => "checked",
+            ContentCheck::Mismatched => "mismatched",
+            ContentCheck::NotChecked => "not_checked",
+        }
+    }
+}
+
+/// The recipient-verifier outcome for one `enc`-bearing item after every
+/// applicable keyring credential was attempted independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptionOutcome {
+    /// Whether an applicable credential recovered the content-encryption key
+    /// and the ciphertext opened end-to-end.
+    pub decrypted: bool,
+    /// The post-decryption recheck: every digest in the item's `hashes` map
+    /// recomputed over the recovered plaintext. Present whenever decryption ran
+    /// to completion; `false` forces the record's verdict to `failed`.
+    pub plaintext_hash_ok: Option<bool>,
+    /// The typed code describing why decryption did not succeed; the same code
+    /// also appears in the report's issue list.
+    pub code: Option<ErrorCode>,
+}
+
+/// One per-item report entry, positionally aligned with the record's `items[]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ValidationSummary {
-    /// `true` only when the verdict stayed [`Verdict::Valid`].
-    pub valid: bool,
-    /// Error-severity issues (drive a failed/pending verdict).
-    pub issues: Vec<VerifierIssue>,
-    /// Warning-severity issues (never fail the record).
-    pub warnings: Vec<VerifierIssue>,
-    /// Info-severity issues (out-of-profile skips, unsupported algorithms).
-    pub info: Vec<VerifierIssue>,
+pub struct ItemReportEntry {
+    /// The per-claim content-check status.
+    pub content_check: ContentCheck,
+    /// The decryption outcome, for an `enc`-bearing item when the run's
+    /// keyring is non-empty.
+    pub decryption: Option<DecryptionOutcome>,
+}
+
+/// One per-commitment report entry, positionally aligned with `merkle[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MerkleReportEntry {
+    /// The per-claim content-check status of the list commitment (leaves-list
+    /// acquisition, document validation, and root recompute).
+    pub content_check: ContentCheck,
 }
 
 /// The signer-key resolution path for a record signature.
@@ -227,27 +294,35 @@ impl SignerType {
 pub enum SigFailureReason {
     /// The COSE_Sign1 blob did not decode / had an attached payload.
     MalformedSigCoseSign1,
-    /// The protected `alg` was not EdDSA (`-8`); info-severity, never fails.
+    /// The protected `alg` was outside the known set; info-severity, never
+    /// fails the record.
     SignatureUnsupported,
     /// No 32-byte signer key could be resolved.
     SignerKeyUnresolved,
-    /// The Ed25519 signature did not verify.
+    /// Strict Ed25519 verification returned false.
     SignatureInvalid,
-    /// The path-2 wallet `address` did not bind to the resolved pubkey.
+    /// The wallet-path `address` did not bind to the resolved pubkey under the
+    /// containing transaction's network.
     WalletAddressMismatch,
 }
 
 impl SigFailureReason {
+    /// The taxonomy code this reason carries in the issue list.
+    #[must_use]
+    pub const fn error_code(self) -> ErrorCode {
+        match self {
+            SigFailureReason::MalformedSigCoseSign1 => ErrorCode::MalformedSigCoseSign1,
+            SigFailureReason::SignatureUnsupported => ErrorCode::SignatureUnsupported,
+            SigFailureReason::SignerKeyUnresolved => ErrorCode::SignerKeyUnresolved,
+            SigFailureReason::SignatureInvalid => ErrorCode::SignatureInvalid,
+            SigFailureReason::WalletAddressMismatch => ErrorCode::WalletAddressMismatch,
+        }
+    }
+
     /// The stable wire token for this reason.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            SigFailureReason::MalformedSigCoseSign1 => "MALFORMED_SIG_COSE_SIGN1",
-            SigFailureReason::SignatureUnsupported => "SIGNATURE_UNSUPPORTED",
-            SigFailureReason::SignerKeyUnresolved => "SIGNER_KEY_UNRESOLVED",
-            SigFailureReason::SignatureInvalid => "SIGNATURE_INVALID",
-            SigFailureReason::WalletAddressMismatch => "WALLET_ADDRESS_MISMATCH",
-        }
+        self.error_code().code()
     }
 }
 
@@ -256,7 +331,8 @@ impl SigFailureReason {
 pub struct SignatureCheck {
     /// The `sigs[]` index.
     pub index: usize,
-    /// Whether the signature verified (and, for path-2, bound its address).
+    /// Whether the signature verified (and, on the wallet path, bound its
+    /// address).
     pub valid: bool,
     /// The resolved signer pubkey as lowercase hex, when resolution succeeded.
     pub signer_pub: Option<String>,
@@ -271,7 +347,7 @@ impl SignatureCheck {
     ///
     /// A public hash-only PoE stays `"valid"` even when a signature is
     /// `"unsupported"`; `"unresolved"` is its own verdict; every other failure
-    /// collapses to `"invalid"`. Identical across the SDKs.
+    /// collapses to `"invalid"`.
     #[must_use]
     pub const fn verdict_str(&self) -> &'static str {
         match self.reason {
@@ -283,201 +359,13 @@ impl SignatureCheck {
     }
 }
 
-/// Per-decryption failure reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecryptionFailureReason {
-    /// The item has no `enc` envelope, an out-of-range index, or an unwrappable
-    /// shape.
-    NoEncEnvelope,
-    /// A gateway returned a non-200 status for the ciphertext URI.
-    UriFetchFailed,
-    /// No ciphertext could be obtained from the record alone.
-    CiphertextUnavailable,
-    /// The reconstructed URI named no in-set retrieval scheme.
-    UriTargetForbidden,
-    /// Every configured gateway was exhausted.
-    ContentUnavailable,
-    /// No supplied recipient key opened any slot.
-    WrongRecipientKey,
-    /// A CEK was recovered but the slots MAC did not match.
-    TamperedHeader,
-    /// The content AEAD failed after a CEK was recovered.
-    TamperedCiphertext,
-    /// The decryption entry shape did not match the envelope's key path.
-    WrongDecryptionInputShape,
-    /// The passphrase KDF step failed.
-    KdfDerivationFailed,
-    /// The recovered plaintext did not match a committed content hash.
-    UriIntegrityMismatch,
-}
-
-impl DecryptionFailureReason {
-    /// The stable wire token for this reason.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            DecryptionFailureReason::NoEncEnvelope => "no_enc_envelope",
-            DecryptionFailureReason::UriFetchFailed => "URI_FETCH_FAILED",
-            DecryptionFailureReason::CiphertextUnavailable => "CIPHERTEXT_UNAVAILABLE",
-            DecryptionFailureReason::UriTargetForbidden => "URI_TARGET_FORBIDDEN",
-            DecryptionFailureReason::ContentUnavailable => "CONTENT_UNAVAILABLE",
-            DecryptionFailureReason::WrongRecipientKey => "WRONG_RECIPIENT_KEY",
-            DecryptionFailureReason::TamperedHeader => "TAMPERED_HEADER",
-            DecryptionFailureReason::TamperedCiphertext => "TAMPERED_CIPHERTEXT",
-            DecryptionFailureReason::WrongDecryptionInputShape => "WRONG_DECRYPTION_INPUT_SHAPE",
-            DecryptionFailureReason::KdfDerivationFailed => "KDF_DERIVATION_FAILED",
-            DecryptionFailureReason::UriIntegrityMismatch => "URI_INTEGRITY_MISMATCH",
-        }
-    }
-}
-
-/// One item-decryption outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecryptResult {
-    /// The `items[]` index the entry targeted.
-    pub item_index: i64,
-    /// Whether decryption produced a plaintext (the integrity check may still
-    /// have failed — see `plaintext_hash_ok`).
-    pub ok: bool,
-    /// Whether every committed content hash recomputed to the plaintext. Present
-    /// only when `ok` is `true`.
-    pub plaintext_hash_ok: Option<bool>,
-    /// The failure reason, when one applies.
-    pub reason: Option<DecryptionFailureReason>,
-}
-
-impl DecryptResult {
-    /// The wire `verdict` token. `"decrypted"` on success; each failure reason
-    /// projects to its distinct verdict, identical across the SDKs.
-    #[must_use]
-    pub const fn verdict_str(&self) -> &'static str {
-        match self.reason {
-            None => "decrypted",
-            Some(DecryptionFailureReason::NoEncEnvelope) => "no-enc-envelope",
-            Some(DecryptionFailureReason::WrongDecryptionInputShape) => "wrong-input-shape",
-            Some(DecryptionFailureReason::CiphertextUnavailable)
-            | Some(DecryptionFailureReason::UriTargetForbidden) => "ciphertext-unavailable",
-            Some(DecryptionFailureReason::ContentUnavailable)
-            | Some(DecryptionFailureReason::UriFetchFailed) => "content-unavailable",
-            Some(DecryptionFailureReason::WrongRecipientKey) => "wrong-key",
-            Some(DecryptionFailureReason::TamperedHeader) => "tampered-header",
-            Some(DecryptionFailureReason::TamperedCiphertext)
-            | Some(DecryptionFailureReason::UriIntegrityMismatch) => "tampered-ciphertext",
-            Some(DecryptionFailureReason::KdfDerivationFailed) => "kdf-failed",
-        }
-    }
-
-    /// The wire `reason` string, when a failure reason applies. The
-    /// `NoEncEnvelope` (missing-envelope) case carries no reason, matching the
-    /// reference verifier's bare `no-enc-envelope` row.
-    #[must_use]
-    pub fn reason_str(&self) -> Option<&'static str> {
-        match self.reason {
-            None | Some(DecryptionFailureReason::NoEncEnvelope) => None,
-            Some(r) => Some(r.as_str()),
-        }
-    }
-}
-
-/// Per-commit Merkle outcome reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MerkleCheckReason {
-    /// The leaves payload could not be fetched; warning-severity.
-    MerkleLeavesUnavailable,
-    /// The recomputed root did not match the committed root.
-    MerkleRootMismatch,
-    /// The verifier does not implement this commitment algorithm.
-    MerkleUnsupported,
-    /// The leaves count did not match the committed count.
-    SchemaMerkleLeafCountMismatch,
-    /// The leaves payload used an unsupported format.
-    SchemaMerkleLeavesFormatUnsupported,
-}
-
-impl MerkleCheckReason {
-    /// The stable wire token for this reason.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            MerkleCheckReason::MerkleLeavesUnavailable => "MERKLE_LEAVES_UNAVAILABLE",
-            MerkleCheckReason::MerkleRootMismatch => "MERKLE_ROOT_MISMATCH",
-            MerkleCheckReason::MerkleUnsupported => "MERKLE_UNSUPPORTED",
-            MerkleCheckReason::SchemaMerkleLeafCountMismatch => "SCHEMA_MERKLE_LEAF_COUNT_MISMATCH",
-            MerkleCheckReason::SchemaMerkleLeavesFormatUnsupported => {
-                "SCHEMA_MERKLE_LEAVES_FORMAT_UNSUPPORTED"
-            }
-        }
-    }
-}
-
-/// One Merkle list-commitment outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MerkleCheck {
-    /// The `merkle[]` index.
-    pub merkle_index: usize,
-    /// The commitment algorithm identifier.
-    pub alg: String,
-    /// Whether the recomputed root matched, when a fold was performed.
-    pub root_ok: Option<bool>,
-    /// The reason, for any non-`valid` outcome.
-    pub reason: Option<MerkleCheckReason>,
-}
-
-impl MerkleCheck {
-    /// The 5-state wire `verdict` token. `"valid"`/`"mismatch"` are root-bind
-    /// outcomes; `"unavailable"`/`"format-unsupported"`/`"unsupported"` are
-    /// warning/info-severity (they never fail the record). Identical across SDKs.
-    #[must_use]
-    pub const fn verdict_str(&self) -> &'static str {
-        match self.reason {
-            None => {
-                if matches!(self.root_ok, Some(false)) {
-                    "mismatch"
-                } else {
-                    "valid"
-                }
-            }
-            Some(MerkleCheckReason::MerkleUnsupported) => "unsupported",
-            Some(MerkleCheckReason::MerkleLeavesUnavailable) => "unavailable",
-            Some(MerkleCheckReason::SchemaMerkleLeavesFormatUnsupported) => "format-unsupported",
-            Some(MerkleCheckReason::MerkleRootMismatch)
-            | Some(MerkleCheckReason::SchemaMerkleLeafCountMismatch) => "mismatch",
-        }
-    }
-}
-
-/// Per-attempt URI-fetch outcome reason (carried on `uri_checks`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UriFailureReason {
-    /// A gateway returned a non-200 status.
-    UriFetchFailed,
-    /// The fetched bytes did not match the committed hash.
-    UriIntegrityMismatch,
-    /// The URI named no in-set retrieval scheme.
-    UriTargetForbidden,
-    /// Every configured gateway was exhausted.
-    ContentUnavailable,
-}
-
-impl UriFailureReason {
-    /// The stable wire token for this reason.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            UriFailureReason::UriFetchFailed => "URI_FETCH_FAILED",
-            UriFailureReason::UriIntegrityMismatch => "URI_INTEGRITY_MISMATCH",
-            UriFailureReason::UriTargetForbidden => "URI_TARGET_FORBIDDEN",
-            UriFailureReason::ContentUnavailable => "CONTENT_UNAVAILABLE",
-        }
-    }
-}
-
 /// One vkey witness on the carrying transaction.
 ///
-/// Distinct from a record-level [`SignatureCheck`]: this describes who authorised
-/// and paid for the anchoring transaction, not the optional Label 309 authorship
-/// claim. A failed `signature_valid` is INFORMATIONAL — it never changes the
-/// verifier's verdict (the content claim does not depend on who paid the fee).
+/// Distinct from a record-level [`SignatureCheck`]: this describes who
+/// authorised and paid for the anchoring transaction, not the optional Label
+/// 309 authorship claim. A failed `signature_valid` is INFORMATIONAL — it never
+/// changes the verifier's verdict (the content claim does not depend on who
+/// paid the fee).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyTxWitness {
     /// The 32-byte Ed25519 verification key, lowercase hex.
@@ -532,100 +420,97 @@ pub struct TxDescription {
     /// The transaction body summary, when the body decoded.
     pub tx_summary: Option<VerifyTxSummary>,
     /// The ascending-sorted auxiliary metadata label keys, when aux decoded.
-    pub metadata_labels: Option<Vec<i64>>,
+    pub metadata_labels: Option<Vec<u64>>,
 }
 
-/// One per-attempt URI-fetch diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UriCheck {
-    /// The `items[]` index the URI belongs to.
-    pub item_index: i64,
-    /// The reconstructed absolute URI.
-    pub uri: String,
-    /// Whether the attempt returned the content.
-    pub ok: bool,
-    /// The failure reason, when the attempt failed.
-    pub reason: Option<UriFailureReason>,
-}
-
-/// One out-of-band decryption request.
+/// One decryption credential of the run's keyring.
 ///
-/// The verifier dispatches on the on-wire `enc` shape (`slots[]` for the
-/// recipient path, `passphrase` for the KDF path); a mismatched entry surfaces as
-/// [`DecryptionFailureReason::WrongDecryptionInputShape`].
+/// The keyring is **global to the run**, not positionally paired with
+/// encrypted items: for each `enc`-bearing item the verifier attempts every
+/// credential of the applicable shape independently — `Recipient` entries
+/// against `enc.slots`-path items, `Passphrase` entries against
+/// `enc.passphrase`-path items. One credential may open several items, and
+/// different credentials may succeed on different items.
 #[derive(Debug, Clone)]
 pub enum Decryption {
-    /// Sealed-recipient path: the 32-byte X25519 (or X-Wing) recipient secret.
+    /// A recipient KEM private key: a 32-byte X25519 scalar or a 32-byte
+    /// X-Wing decapsulation seed.
     Recipient {
-        /// The `items[]` index this entry targets.
-        item_index: i64,
         /// The recipient secret key bytes.
         recipient_secret_key: Vec<u8>,
     },
-    /// Passphrase path: the cleartext passphrase, normalised before KDF.
+    /// A passphrase, normalised by the pinned profile before any KDF work.
     Passphrase {
-        /// The `items[]` index this entry targets.
-        item_index: i64,
         /// The passphrase string.
         passphrase: String,
     },
 }
 
-impl Decryption {
-    /// The targeted item index, regardless of path.
+/// The Cardano network the verifier's explorer chain is configured against.
+///
+/// Names the report's `network` identifier and selects the expected CIP-19
+/// network header byte for wallet-path signature address binding — both
+/// derived from the containing transaction's network, never from any value in
+/// the record body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CardanoNetwork {
+    /// Cardano mainnet. The default; production deployments target mainnet.
+    #[default]
+    Mainnet,
+    /// Cardano preprod (a test network).
+    Preprod,
+}
+
+impl CardanoNetwork {
+    /// The report's network identifier for this network.
     #[must_use]
-    pub const fn item_index(&self) -> i64 {
+    pub const fn id(self) -> &'static str {
         match self {
-            Decryption::Recipient { item_index, .. }
-            | Decryption::Passphrase { item_index, .. } => *item_index,
+            CardanoNetwork::Mainnet => "cardano:mainnet",
+            CardanoNetwork::Preprod => "cardano:preprod",
         }
     }
 }
 
-/// The Cardano network governing path-2 stake-byte derivation.
-///
-/// This input never changes the report `network` field (always
-/// [`NETWORK_CARDANO_MAINNET`]); it only selects the CIP-19 stake-address network
-/// header used when binding a wallet signature's `address` claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CardanoNetwork {
-    /// Cardano mainnet (stake header `0xe1`). The default.
-    #[default]
-    Mainnet,
-    /// Cardano preprod (stake header `0xe0`).
-    Preprod,
-}
-
-/// The verifier input.
-///
-/// Mirrors the Python `VerifyTxInput`: a transaction hash, an optional profile
-/// and gateway chains, optional out-of-band decryption material, and an
-/// injectable [`FetchTransport`] for deterministic tests.
+/// The verifier input: a transaction reference plus deployment policy,
+/// gateway chains, the decryption keyring, and out-of-band bytes.
 pub struct VerifyTxInput<'a> {
-    /// Lowercase transaction hash (no `0x`).
+    /// Lowercase transaction hash (64 hex characters, no `0x`).
     pub tx_hash: String,
     /// The verifier profile. Defaults to [`DEFAULT_PROFILE`].
     pub profile: Profile,
-    /// Koios-compatible gateway URLs, tried in order.
+    /// Koios-compatible explorer URLs, tried in order.
     pub cardano_gateway_chain: Option<Vec<String>>,
-    /// Enables the Blockfrost fallback when set.
+    /// Enables the Blockfrost fallback explorer when set.
     pub blockfrost_project_id: Option<String>,
     /// Arweave gateway rotation (defaults baked in when absent).
     pub arweave_gateway_chain: Option<Vec<String>>,
-    /// IPFS gateway rotation (no baked-in default).
+    /// IPFS gateway rotation. No baked-in default: a deployment that supplies
+    /// none declines every `ipfs://` fetch (`URI_TARGET_FORBIDDEN`).
     pub ipfs_gateway_chain: Option<Vec<String>>,
-    /// Confirmation-depth floor. Defaults to
+    /// Confirmation-depth threshold. Defaults to
     /// [`CONFIRMATION_DEPTH_THRESHOLD_DEFAULT`].
     pub confirmation_depth_threshold: Option<u32>,
     /// Service-independence deny-host patterns.
     pub deny_hosts: Option<Vec<String>>,
-    /// Out-of-band decryption requests.
+    /// The master content-fetch switch (default `true`). When `false`, every
+    /// outbound content fetch — item URIs, Merkle leaves-lists, and ciphertext
+    /// alike — is suppressed, so the record renders offline with every content
+    /// claim reported as not checked. Out-of-band bytes are still consumed.
+    pub fetch_content: bool,
+    /// Per-URI fetch ceiling in bytes, enforced incrementally during
+    /// streaming. A fetch that reaches it is aborted and surfaced as
+    /// `CONTENT_FETCH_LIMIT_EXCEEDED` — a statement about the verifier's
+    /// policy, never about the record. `None` applies the transport default.
+    pub max_fetch_bytes: Option<u64>,
+    /// The decryption keyring (see [`Decryption`]).
     pub decryption: Option<Vec<Decryption>>,
-    /// Out-of-band ciphertext bytes, keyed by item index.
-    pub ciphertext_bytes: Option<BTreeMap<i64, Vec<u8>>>,
+    /// Out-of-band ciphertext bytes, keyed by item index. Supplied bytes are
+    /// attributable by definition.
+    pub ciphertext_bytes: Option<BTreeMap<usize, Vec<u8>>>,
     /// Out-of-band Merkle leaves-list bytes, keyed by `merkle[i]` index.
     pub merkle_leaves: Option<BTreeMap<usize, Vec<u8>>>,
-    /// Network used for path-2 stake-byte derivation only.
+    /// The network of the configured explorer chain (see [`CardanoNetwork`]).
     pub cardano_network: CardanoNetwork,
     /// Injectable transport (the single outbound egress point).
     pub fetch_outbound: Option<&'a dyn FetchTransport>,
@@ -644,6 +529,8 @@ impl<'a> VerifyTxInput<'a> {
             ipfs_gateway_chain: None,
             confirmation_depth_threshold: None,
             deny_hosts: None,
+            fetch_content: true,
+            max_fetch_bytes: None,
             decryption: None,
             ciphertext_bytes: None,
             merkle_leaves: None,
@@ -658,53 +545,81 @@ impl<'a> VerifyTxInput<'a> {
         self.confirmation_depth_threshold
             .unwrap_or(CONFIRMATION_DEPTH_THRESHOLD_DEFAULT)
     }
+
+    /// Whether the keyring holds at least one credential. Necessary but not
+    /// sufficient for the recipient-verifier reading: the run is a recipient
+    /// verifier only when credentials are held AND the profile admits sealed
+    /// decryption.
+    #[must_use]
+    pub fn has_keyring(&self) -> bool {
+        self.decryption.as_ref().is_some_and(|d| !d.is_empty())
+    }
+}
+
+/// Caller-supplied chain facts for the record-bytes entry point: the block-info
+/// tuple a server-rendered viewer holds from its index, in the pinned
+/// representations (integer POSIX seconds for `block_time`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockInfo {
+    /// Confirmation depth in blocks: explorer tip height − including-block
+    /// height + 1, so a transaction in the tip block has depth exactly 1.
+    pub confirmation_depth: u32,
+    /// The POSIX timestamp, in integer seconds UTC, of the slot of the block
+    /// that includes the transaction.
+    pub block_time: u64,
+    /// The slot number of the including block, when available.
+    pub block_slot: Option<u64>,
 }
 
 /// The full verifier report.
 ///
-/// Field names match the wire shape one-to-one. Serialisation rules (bytes →
-/// lowercase hex, omission of `None` and empty lists) live in
-/// [`super::serialize`].
+/// The schema-pinned surface is: `verdict`, `exitCode` (derived from the
+/// verdict), `network`, `confirmationDepth` / `confirmationThreshold`,
+/// `block_time` / `block_slot`, the flat `issues` list, the positional `items`
+/// and `merkle` per-claim entries, and the `auditTrail`. The remaining fields
+/// are implementation extras (the schema is an open map).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
-    /// The transaction hash.
+    /// The requested transaction hash.
     pub tx_hash: String,
-    /// The three-state verdict.
+    /// The four-state machine verdict ([`Verdict::exit_code`] pairs it with
+    /// the process exit code).
     pub verdict: Verdict,
-    /// The exit code paired with the verdict.
-    pub exit_code: ExitCode,
     /// The active verifier profile.
     pub profile: Profile,
-    /// The wire-canonical network identifier.
+    /// The network identifier of the resolved transaction, as established by
+    /// the configured explorer chain.
     pub network: &'static str,
-    /// The confirmation-depth threshold applied.
-    pub confirmation_depth_threshold: u32,
-    /// The validation summary.
-    pub validation: ValidationSummary,
-    /// The per-call outbound audit trail.
-    pub http_calls: Vec<HttpCallRecord>,
-    /// Whether label-309 metadata was present.
-    pub metadata_present: bool,
-    /// The transaction's confirmation depth.
-    pub num_confirmations: u32,
-    /// The block time (Unix seconds), when resolved.
+    /// The confirmation-depth threshold the resolved depth was compared
+    /// against.
+    pub confirmation_threshold: u32,
+    /// The explorer-asserted confirmation depth, when the transaction
+    /// resolved.
+    pub confirmation_depth: Option<u32>,
+    /// The block time in integer POSIX seconds UTC, when resolved.
     pub block_time: Option<u64>,
     /// The block slot, when resolved.
     pub block_slot: Option<u64>,
-    /// The decoded record, projected to JSON, when validation passed.
+    /// Every issue of the run — structural-validation issues plus
+    /// verifier-layer codes — sorted by path with the registry-order
+    /// tie-break, each carrying an explicit severity.
+    pub issues: Vec<VerifierIssue>,
+    /// One entry per record `items[]` element, positionally aligned. Empty
+    /// exactly when no validated record with an `items` array is in hand.
+    pub items: Vec<ItemReportEntry>,
+    /// One entry per record `merkle[]` element, positionally aligned.
+    pub merkle: Vec<MerkleReportEntry>,
+    /// Every outbound network call of the run — success, failure, retry —
+    /// recorded by the single egress wrapper.
+    pub audit_trail: Vec<HttpCallRecord>,
+    /// The decoded record, when structural validation passed.
     pub record: Option<PoeRecord>,
-    /// Record-level signature checks, when run.
+    /// Record-level signature checks, when the signature step ran.
     pub record_signatures: Option<Vec<SignatureCheck>>,
-    /// Item-decryption results, when run.
-    pub item_decryptions: Option<Vec<DecryptResult>>,
-    /// The carrying transaction's vkey witnesses, when raw tx CBOR was available.
+    /// The carrying transaction's vkey witnesses, when raw tx CBOR decoded.
     pub tx_witnesses: Option<Vec<VerifyTxWitness>>,
     /// The carrying transaction's body summary, when the body decoded.
     pub tx_summary: Option<VerifyTxSummary>,
     /// The co-published auxiliary metadata label keys, when aux decoded.
-    pub metadata_labels: Option<Vec<i64>>,
-    /// Per-attempt URI-fetch diagnostics, when any were emitted.
-    pub uri_checks: Option<Vec<UriCheck>>,
-    /// Merkle list-commitment checks, when run.
-    pub merkle_checks: Option<Vec<MerkleCheck>>,
+    pub metadata_labels: Option<Vec<u64>>,
 }

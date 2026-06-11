@@ -4,19 +4,21 @@
 //   BUILD_FIXTURES=1 pnpm exec vitest run packages/crypto-core/tests/fixtures/sealed-poe/_build-hybrid-fixtures.test.ts
 //
 // Pinned inputs: deterministic recipient keypair seeds, per-slot 64-byte X-Wing
-// encapsulation randomness (eseed), CEK, and content nonce. Wraps via
-// eciesSealedPoeWrap with kem='mlkem768x25519' + skipShuffle=true so slot
-// positions are deterministic across regenerations. The Python parity twin
-// mirrors these JSON files byte-for-byte.
+// encapsulation randomness (eseed), CEK, content nonce, and the item's hashes
+// map (the honest sha2-256 of the plaintext). Wraps via eciesSealedPoeWrap with
+// kem='mlkem768x25519' + skipShuffle=true so slot positions are deterministic
+// across regenerations. The Python parity twin mirrors these JSON files
+// byte-for-byte.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { sha256 } from '@noble/hashes/sha2.js';
 import { describe, it } from 'vitest';
 
 import { mlkem768x25519Keygen } from '../../../src/kem/mlkem768x25519';
-import { joinKemCt } from '../../../src/sealed-poe/slots-codec';
+import type { ItemHashes } from '../../../src/sealed-poe/transcript';
 import { eciesSealedPoeWrap, type Mlkem768X25519Slot } from '../../../src/sealed-poe/wrap';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -53,8 +55,17 @@ function mirror(filename: string, value: unknown): void {
   fs.copyFileSync(tsPath, pyPath);
 }
 
+// The honest hash claim: the real sha2-256 of the plaintext.
+function honestHashes(plaintext: Uint8Array): ItemHashes {
+  return { 'sha2-256': sha256(plaintext) };
+}
+
+function hashesToHex(hashes: ItemHashes): Record<string, string> {
+  return Object.fromEntries(Object.entries(hashes).map(([alg, d]) => [alg, bytesToHex(d)]));
+}
+
 interface HybridSlotHex {
-  // Flat 1120-byte X-Wing enc (the reassembled kem_ct), hex.
+  // Single 1120-byte X-Wing ciphertext, hex.
   kem_ct_hex: string;
   wrap_hex: string;
 }
@@ -74,6 +85,7 @@ interface HybridFixture {
     cek_hex: string;
     nonce_hex: string;
     plaintext_hex: string;
+    hashes: Record<string, string>;
     expected_slots: HybridSlotHex[];
     expected_slots_mac_hex: string;
     expected_ciphertext_hex: string;
@@ -91,9 +103,11 @@ function buildHybridFixture(args: {
 }): HybridFixture {
   const keys = args.recipientSeeds.map((s) => mlkem768x25519Keygen(s));
   const recipientPublicKeys = keys.map((k) => k.publicKey);
+  const hashes = honestHashes(args.plaintext);
 
   const out = eciesSealedPoeWrap({
     plaintext: args.plaintext,
+    hashes,
     recipientPublicKeys,
     kem: 'mlkem768x25519',
     cek: args.cek,
@@ -118,8 +132,9 @@ function buildHybridFixture(args: {
       cek_hex: bytesToHex(args.cek),
       nonce_hex: bytesToHex(args.nonce),
       plaintext_hex: bytesToHex(args.plaintext),
+      hashes: hashesToHex(hashes),
       expected_slots: slots.map((s) => ({
-        kem_ct_hex: bytesToHex(joinKemCt(s.kem_ct)),
+        kem_ct_hex: bytesToHex(s.kem_ct),
         wrap_hex: bytesToHex(s.wrap),
       })),
       expected_slots_mac_hex: bytesToHex(out.envelope.slots_mac),

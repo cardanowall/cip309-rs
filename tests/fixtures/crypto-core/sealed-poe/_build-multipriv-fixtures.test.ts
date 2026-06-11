@@ -12,10 +12,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { sha256 } from '@noble/hashes/sha2.js';
 import { describe, it } from 'vitest';
 
 import { x25519PublicKey } from '../../../src/kem/x25519';
-import { eciesSealedPoeWrap } from '../../../src/sealed-poe/wrap';
+import type { ItemHashes } from '../../../src/sealed-poe/transcript';
+import { eciesSealedPoeWrap, SEALED_POE_AEAD } from '../../../src/sealed-poe/wrap';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PY_MIRROR = path.resolve(HERE, '../../../../sdk-py/tests/fixtures/sealed-poe');
@@ -48,6 +50,15 @@ function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+// The honest hash claim: the real sha2-256 of the plaintext.
+function honestHashes(plaintext: Uint8Array): ItemHashes {
+  return { 'sha2-256': sha256(plaintext) };
+}
+
+function hashesToHex(hashes: ItemHashes): Record<string, string> {
+  return Object.fromEntries(Object.entries(hashes).map(([alg, d]) => [alg, bytesToHex(d)]));
+}
+
 interface MultiPrivFixture {
   version: 1;
   primitive: string;
@@ -55,9 +66,10 @@ interface MultiPrivFixture {
   vector: {
     name: string;
     recipient_privs_hex: string[];
+    hashes: Record<string, string>;
     envelope: {
       scheme: 1;
-      aead: 'xchacha20-poly1305';
+      aead: typeof SEALED_POE_AEAD;
       kem: 'x25519';
       nonce_hex: string;
       slots: Array<{ epk_hex: string; wrap_hex: string }>;
@@ -119,8 +131,10 @@ function buildFixture(args: {
     for (const p of fillerPubs) recipientPubs.push(p);
   }
 
+  const hashes = honestHashes(args.plaintext);
   const out = eciesSealedPoeWrap({
     plaintext: args.plaintext,
+    hashes,
     recipientPublicKeys: recipientPubs,
     cek: args.cek,
     nonce: args.nonce,
@@ -135,9 +149,10 @@ function buildFixture(args: {
     vector: {
       name: args.name,
       recipient_privs_hex: args.recipientPrivs.map(bytesToHex),
+      hashes: hashesToHex(hashes),
       envelope: {
         scheme: 1,
-        aead: 'xchacha20-poly1305',
+        aead: SEALED_POE_AEAD,
         kem: 'x25519',
         nonce_hex: bytesToHex(out.envelope.nonce),
         slots: out.envelope.slots.map((s) => ({
@@ -270,8 +285,11 @@ function buildNegativeAdditions(): void {
   // (priv[1] matches slot[0]) but slots_mac comparison fails → TAMPERED_HEADER.
   const privs = [fillPriv(0x55), fillPriv(0x66), fillPriv(0x77)];
   const matchPub = x25519PublicKey({ secretKey: privs[1]! });
+  const macFailPlaintext = sequentialBytes(16);
+  const macFailHashes = honestHashes(macFailPlaintext);
   const out = eciesSealedPoeWrap({
-    plaintext: sequentialBytes(16),
+    plaintext: macFailPlaintext,
+    hashes: macFailHashes,
     recipientPublicKeys: [matchPub],
     cek: fillBytes(0xa4, 32),
     nonce: fillBytes(0xb4, 24),
@@ -284,7 +302,7 @@ function buildNegativeAdditions(): void {
     name: 'multipriv-mac-fail',
     envelope: {
       scheme: 1,
-      aead: 'xchacha20-poly1305',
+      aead: SEALED_POE_AEAD,
       kem: 'x25519',
       nonce_hex: bytesToHex(out.envelope.nonce),
       slots: out.envelope.slots.map((s) => ({
@@ -293,6 +311,7 @@ function buildNegativeAdditions(): void {
       })),
       slots_mac_hex: bytesToHex(tamperedMac),
     },
+    hashes: hashesToHex(macFailHashes),
     ciphertext_hex: bytesToHex(out.ciphertext),
     recipient_secret_keys_hex: privs.map(bytesToHex),
     expected_reason: 'TAMPERED_HEADER',
@@ -311,7 +330,7 @@ function buildNegativeAdditions(): void {
   // the existing shape; the raise fires before any envelope-shape work.
   const sentinel = {
     scheme: 1,
-    aead: 'xchacha20-poly1305',
+    aead: SEALED_POE_AEAD,
     kem: 'x25519',
     nonce_hex: bytesToHex(fillBytes(0x00, 24)),
     slots: [
@@ -323,6 +342,7 @@ function buildNegativeAdditions(): void {
     slots_mac_hex: bytesToHex(fillBytes(0x00, 32)),
   };
   const sentinelCiphertext = bytesToHex(fillBytes(0x00, 16));
+  const sentinelHashes = hashesToHex(honestHashes(new Uint8Array(0)));
   const validPrivHex = bytesToHex(fillPriv(0x11));
   const shortPrivHex = bytesToHex(fillBytes(0x11, 31));
 
@@ -330,6 +350,7 @@ function buildNegativeAdditions(): void {
     {
       name: 'empty-recipient-secret-keys',
       envelope: sentinel,
+      hashes: sentinelHashes,
       ciphertext_hex: sentinelCiphertext,
       recipient_secret_keys_hex: [],
       expected_error_code: 'INVALID_RECIPIENT_KEY',
@@ -337,6 +358,7 @@ function buildNegativeAdditions(): void {
     {
       name: 'both-forms-supplied',
       envelope: sentinel,
+      hashes: sentinelHashes,
       ciphertext_hex: sentinelCiphertext,
       recipient_secret_hex: validPrivHex,
       recipient_secret_keys_hex: [validPrivHex],
@@ -345,12 +367,14 @@ function buildNegativeAdditions(): void {
     {
       name: 'neither-form-supplied',
       envelope: sentinel,
+      hashes: sentinelHashes,
       ciphertext_hex: sentinelCiphertext,
       expected_error_code: 'INVALID_RECIPIENT_KEY',
     },
     {
       name: 'multipriv-element-wrong-length',
       envelope: sentinel,
+      hashes: sentinelHashes,
       ciphertext_hex: sentinelCiphertext,
       recipient_secret_keys_hex: [validPrivHex, shortPrivHex, validPrivHex],
       expected_error_code: 'INVALID_RECIPIENT_KEY',

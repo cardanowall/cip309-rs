@@ -29,6 +29,7 @@ pub mod off_host_sign;
 pub mod poe;
 pub mod publish;
 pub mod records;
+pub mod resumable;
 pub mod transport;
 pub mod types;
 
@@ -50,6 +51,10 @@ pub use publish::{
     PublishError, PublishHelperError, Signer, SignerError,
 };
 pub use records::RecordsNamespace;
+pub use resumable::{
+    upload_resumable, ResumableUploadError, DEFAULT_RESUMABLE_CHUNK_BYTES,
+    DEFAULT_RESUMABLE_THRESHOLD_BYTES,
+};
 pub use transport::{
     ClientResponse, ClientTransport, MultipartField, RequestBody, ReqwestClientTransport,
     ResponseHeaders,
@@ -61,5 +66,8 @@ pub use types::{
     PublishBatchSuccessEntry, PublishContentInput, PublishInput, PublishMerkleInput,
     PublishMerkleResponse, PublishPrehashedInput, PublishResponse, PublishSealedInput, QuoteInput,
     QuoteResponse, RecordResource, RecordSignature, RecordsListInput, RecordsListResponse,
-    SealedKemChoice, SupportedHashAlg, UploadEntry, UploadError, UploadsInput, UploadsResponse,
+    ResumableSource, ResumableUploadInput, ResumableUploadResult, SealedKemChoice,
+    SupportedHashAlg, UploadAttemptStatus, UploadEntry, UploadError, UploadSessionChunkAck,
+    UploadSessionCreated, UploadSessionDeduplicated, UploadSessionStatus, UploadsInput,
+    UploadsResponse,
 };

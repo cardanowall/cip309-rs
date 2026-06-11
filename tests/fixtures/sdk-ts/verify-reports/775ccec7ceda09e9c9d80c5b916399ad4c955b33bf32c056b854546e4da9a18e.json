@@ -1,0 +1,71 @@
+{
+  "auditTrail": [
+    {
+      "bytes": 395,
+      "durationMs": 1,
+      "method": "GET",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://cardano-mainnet.blockfrost.io/api/v0/txs/775ccec7ceda09e9c9d80c5b916399ad4c955b33bf32c056b854546e4da9a18e/cbor"
+    },
+    {
+      "bytes": 66,
+      "durationMs": 1,
+      "method": "GET",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://cardano-mainnet.blockfrost.io/api/v0/txs/775ccec7ceda09e9c9d80c5b916399ad4c955b33bf32c056b854546e4da9a18e"
+    },
+    {
+      "bytes": 36,
+      "durationMs": 1,
+      "method": "GET",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://cardano-mainnet.blockfrost.io/api/v0/blocks/latest"
+    }
+  ],
+  "block_slot": 100006420,
+  "block_time": 1700006420,
+  "confirmationDepth": 23,
+  "confirmationThreshold": 15,
+  "exitCode": 0,
+  "issues": [],
+  "items": [
+    {
+      "contentCheck": "not_checked"
+    }
+  ],
+  "merkle": [],
+  "metadataLabels": [
+    309
+  ],
+  "network": "cardano:mainnet",
+  "profile": "recipient-sealed",
+  "record": {
+    "items": [
+      {
+        "hashes": {
+          "sha2-256": "f8f497cee9c6f564cda126cbad4f93d22424b5a34f7039816c5e31e949e8d8a7"
+        }
+      }
+    ],
+    "v": 1
+  },
+  "txHash": "775ccec7ceda09e9c9d80c5b916399ad4c955b33bf32c056b854546e4da9a18e",
+  "txSummary": {
+    "fee_lovelace": "170106",
+    "input_count": 1,
+    "output_count": 1,
+    "outputs": [
+      {
+        "address": "addr1v9cw97yfnfv76qmtzf7vvnu3g58ls8p6wxqfyp3x6wnjs2qkn63rt",
+        "lovelace": "2000000"
+      }
+    ],
+    "script_witness_count": 0,
+    "total_output_lovelace": "2000000"
+  },
+  "txWitnesses": [],
+  "verdict": "valid"
+}

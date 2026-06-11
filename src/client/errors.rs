@@ -423,11 +423,21 @@ pub fn parse_http_error(args: ParseHttpErrorArgs) -> Label309HttpError {
             required_scopes: problem.extension_string_array("required"),
             granted_scopes: problem.extension_string_array("granted"),
         },
-        "insufficient-funds" => HttpErrorKind::InsufficientFunds {
-            balance_usd_micros: problem.extension_decimal_u64("balance_usd_micros"),
-            required_usd_micros: problem.extension_decimal_u64("required_usd_micros"),
-            top_up_url: problem.extension_str("top_up_url"),
-        },
+        // The three 402 funding/affordability failures are one condition to a
+        // caller: the account cannot fund the operation. `insufficient-funds` is
+        // the balance shortfall; `insufficient-storage-credit` is the storage
+        // funding source being out of credit; `no-funding-grant` is the absence
+        // of any funding source entitling the account beyond the free window.
+        // All three collapse to the same funding kind so a caller routes the
+        // user to top up without branching on the code, matching the resumable
+        // create path (which treats any 402 as a funding error).
+        "insufficient-funds" | "insufficient-storage-credit" | "no-funding-grant" => {
+            HttpErrorKind::InsufficientFunds {
+                balance_usd_micros: problem.extension_decimal_u64("balance_usd_micros"),
+                required_usd_micros: problem.extension_decimal_u64("required_usd_micros"),
+                top_up_url: problem.extension_str("top_up_url"),
+            }
+        }
         "quote-expired" => HttpErrorKind::QuoteExpired {
             quote_id: problem.extension_str("quote_id"),
         },

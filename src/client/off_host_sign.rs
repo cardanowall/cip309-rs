@@ -31,7 +31,7 @@ use crate::cose::{
     build_label309_sig_structure, build_sig_structure, encode_cose_sign1, CoseHeader,
     CARDANO_POE_SIG_DOMAIN_PREFIX,
 };
-use crate::poe_standard::{chunk_bytes, encode_record_body_for_signing, PoeRecord, SigEntry};
+use crate::poe_standard::{encode_record_body_for_signing, PoeRecord, SigEntry};
 
 const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
 const ED25519_SIGNATURE_LENGTH: usize = 64;
@@ -163,7 +163,7 @@ pub fn prepare_sig_structure(
     })
 }
 
-/// Assemble the detached path-1 COSE_Sign1 and its chunked `sigs[]` entry.
+/// Assemble the detached path-1 COSE_Sign1 and its `sigs[]` entry.
 ///
 /// # Errors
 ///
@@ -187,13 +187,12 @@ pub fn assemble_cose_sign1(
     let cose_sign1_bytes =
         encode_cose_sign1(&protected_header, &CoseHeader::new(), None, signature)
             .expect("COSE_Sign1 encodes");
-    let chunks = chunk_bytes(&cose_sign1_bytes);
     Ok(AssembledCoseSign1 {
-        cose_sign1_bytes,
         sig_entry: SigEntry {
-            cose_sign1: chunks,
+            cose_sign1: cose_sign1_bytes.clone(),
             cose_key: None,
         },
+        cose_sign1_bytes,
     })
 }
 
@@ -251,12 +250,11 @@ pub fn assemble_cose_sign1_hashed(
     let cose_sign1_bytes =
         encode_cose_sign1(&protected_header, &unprotected_header, None, signature)
             .expect("COSE_Sign1 encodes");
-    let chunks = chunk_bytes(&cose_sign1_bytes);
     Ok(AssembledCoseSign1 {
-        cose_sign1_bytes,
         sig_entry: SigEntry {
-            cose_sign1: chunks,
+            cose_sign1: cose_sign1_bytes.clone(),
             cose_key: None,
         },
+        cose_sign1_bytes,
     })
 }

@@ -1,176 +1,138 @@
 //! Canonical wire-form serialiser for [`VerifyReport`].
 //!
-//! [`verify_report_to_dict`] lowers a report to a [`serde_json::Value`] under the
-//! exact rules the TypeScript and Python twins use, so the same transaction
-//! produces byte-identical JSON across all three SDKs:
+//! [`verify_report_to_dict`] lowers a report to a [`serde_json::Value`] whose
+//! key names, enums, and entry shapes follow the published verify-report JSON
+//! Schema — the cross-implementation contract — plus this implementation's
+//! informational extras (`record`, `signatures`, the transaction description):
 //!
-//! - byte strings → lowercase hex (no `0x`),
-//! - `None` values are omitted,
-//! - empty lists are omitted at the report-field level (mirroring the twins'
-//!   `compose_validation` / dataclass-field elision),
-//! - the `record` is the CBOR→JSON projection of its canonical encoding (map keys
-//!   as strings, byte values as hex).
+//! - schema-required keys: `verdict`, `exitCode`, `issues`, `items`, `merkle`,
+//!   `auditTrail`;
+//! - chain facts: `network`, `confirmationDepth`, `confirmationThreshold`,
+//!   and the spec-pinned snake_case `block_time` / `block_slot`;
+//! - byte strings → lowercase hex (no `0x`);
+//! - absent optional values are omitted;
+//! - the `record` is the CBOR→JSON projection of its canonical encoding
+//!   (map keys as strings, byte values as hex).
 
 use serde_json::{Map, Value};
 
 use crate::cbor::{decode_canonical_cbor, CborValue};
-use crate::poe_standard::{encode_poe_record, PoeRecord};
+use crate::poe_standard::{encode_poe_record, PathSegment, PoeRecord, Severity};
 
+use crate::verifier::fetch::HttpCallRecord;
 use crate::verifier::types::{
-    DecryptResult, MerkleCheck, PathSegment, SignatureCheck, UriCheck, ValidationSummary, Verdict,
-    VerifierIssue, VerifyReport, VerifyTxSummary, VerifyTxWitness,
+    DecryptionOutcome, ItemReportEntry, MerkleReportEntry, SignatureCheck, VerifierIssue,
+    VerifyReport, VerifyTxSummary, VerifyTxWitness,
 };
 
 /// Lower a [`VerifyReport`] to its canonical JSON object.
-///
-/// The result round-trips the `verify-reports/<tx_hash>.json` golden corpus: a
-/// `serde_json::to_string` with sorted keys reproduces those fixtures byte-for-byte.
 #[must_use]
 pub fn verify_report_to_dict(report: &VerifyReport) -> Value {
     let mut out = Map::new();
 
-    // Required scalar fields (always present).
-    out.insert("tx_hash".into(), Value::String(report.tx_hash.clone()));
+    // Schema-required fields.
     out.insert(
         "verdict".into(),
         Value::String(report.verdict.as_str().into()),
     );
-    out.insert("exit_code".into(), Value::from(report.exit_code.as_u8()));
+    out.insert("exitCode".into(), Value::from(report.verdict.exit_code()));
+    out.insert(
+        "issues".into(),
+        Value::Array(report.issues.iter().map(issue_to_value).collect()),
+    );
+    out.insert(
+        "items".into(),
+        Value::Array(report.items.iter().map(item_entry_to_value).collect()),
+    );
+    out.insert(
+        "merkle".into(),
+        Value::Array(report.merkle.iter().map(merkle_entry_to_value).collect()),
+    );
+    out.insert(
+        "auditTrail".into(),
+        Value::Array(
+            report
+                .audit_trail
+                .iter()
+                .map(audit_entry_to_value)
+                .collect(),
+        ),
+    );
+
+    // Chain facts and run identity.
+    out.insert("network".into(), Value::String(report.network.into()));
+    out.insert("txHash".into(), Value::String(report.tx_hash.clone()));
     out.insert(
         "profile".into(),
         Value::String(report.profile.as_str().into()),
     );
-    out.insert("network".into(), Value::String(report.network.into()));
     out.insert(
-        "confirmation_depth_threshold".into(),
-        Value::from(report.confirmation_depth_threshold),
+        "confirmationThreshold".into(),
+        Value::from(report.confirmation_threshold),
     );
-    out.insert("validation".into(), validation_to_value(&report.validation));
-    insert_list_or_omit(&mut out, "http_calls", http_calls_to_values(report));
-    out.insert(
-        "metadata_present".into(),
-        Value::Bool(report.metadata_present),
-    );
-    out.insert(
-        "num_confirmations".into(),
-        Value::from(report.num_confirmations),
-    );
-
-    // Optional fields, omitted when absent.
+    // The schema admits `confirmationDepth` only at >= 1 (a transaction in
+    // the tip block has depth exactly 1). The pipeline never resolves a lower
+    // value, and a hand-constructed report carrying one omits the key rather
+    // than serialising an out-of-domain claim.
+    if let Some(depth) = report.confirmation_depth.filter(|d| *d >= 1) {
+        out.insert("confirmationDepth".into(), Value::from(depth));
+    }
     if let Some(t) = report.block_time {
         out.insert("block_time".into(), Value::from(t));
     }
     if let Some(s) = report.block_slot {
         out.insert("block_slot".into(), Value::from(s));
     }
+
+    // Implementation extras (the schema is an open map).
     if let Some(record) = &report.record {
         out.insert("record".into(), record_to_value(record));
     }
     if let Some(checks) = &report.record_signatures {
-        out.insert(
-            "record_signatures".into(),
-            Value::Array(checks.iter().map(signature_check_to_value).collect()),
-        );
+        if !checks.is_empty() {
+            out.insert(
+                "signatures".into(),
+                Value::Array(checks.iter().map(signature_check_to_value).collect()),
+            );
+        }
     }
-    if let Some(results) = &report.item_decryptions {
-        out.insert(
-            "item_decryptions".into(),
-            Value::Array(results.iter().map(decrypt_result_to_value).collect()),
-        );
-    }
-    // Transaction-level description. `tx_witnesses` and `metadata_labels` are
-    // emitted even when empty (the carrying tx is described as having no vkey
-    // witnesses / no co-published labels); they are omitted only when raw tx CBOR
-    // was unavailable (the field stays `None`). `tx_summary` is omitted unless the
-    // body decoded.
     if let Some(witnesses) = &report.tx_witnesses {
         out.insert(
-            "tx_witnesses".into(),
+            "txWitnesses".into(),
             Value::Array(witnesses.iter().map(tx_witness_to_value).collect()),
         );
     }
     if let Some(summary) = &report.tx_summary {
-        out.insert("tx_summary".into(), tx_summary_to_value(summary));
+        out.insert("txSummary".into(), tx_summary_to_value(summary));
     }
     if let Some(labels) = &report.metadata_labels {
         out.insert(
-            "metadata_labels".into(),
+            "metadataLabels".into(),
             Value::Array(labels.iter().copied().map(Value::from).collect()),
-        );
-    }
-    if let Some(checks) = &report.uri_checks {
-        insert_list_or_omit(
-            &mut out,
-            "uri_checks",
-            checks.iter().map(uri_check_to_value).collect(),
-        );
-    }
-    if let Some(checks) = &report.merkle_checks {
-        insert_list_or_omit(
-            &mut out,
-            "merkle_checks",
-            checks.iter().map(merkle_check_to_value).collect(),
         );
     }
 
     Value::Object(out)
 }
 
-/// `http_calls` is a required field but, like the dataclass-field elision in the
-/// twins, an empty list is omitted; the verifier always issues at least the
-/// resolve calls when it reaches the metadata stage, so the present case is the
-/// norm.
-fn insert_list_or_omit(out: &mut Map<String, Value>, key: &str, list: Vec<Value>) {
-    if !list.is_empty() {
-        out.insert(key.into(), Value::Array(list));
+fn severity_str(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
     }
 }
 
-fn http_calls_to_values(report: &VerifyReport) -> Vec<Value> {
-    report
-        .http_calls
-        .iter()
-        .map(|c| {
-            let mut m = Map::new();
-            m.insert("url".into(), Value::String(c.url.clone()));
-            m.insert("method".into(), Value::String(c.method.as_str().into()));
-            m.insert("status".into(), Value::from(c.status));
-            m.insert("bytes".into(), Value::from(c.bytes));
-            m.insert("duration_ms".into(), Value::from(c.duration_ms));
-            m.insert("purpose".into(), Value::String(c.purpose.as_str().into()));
-            Value::Object(m)
-        })
-        .collect()
-}
-
-fn validation_to_value(v: &ValidationSummary) -> Value {
+fn issue_to_value(issue: &VerifierIssue) -> Value {
     let mut m = Map::new();
-    m.insert("valid".into(), Value::Bool(v.valid));
-    if !v.issues.is_empty() {
-        m.insert("issues".into(), issues_to_values(&v.issues));
-    }
-    if !v.warnings.is_empty() {
-        m.insert("warnings".into(), issues_to_values(&v.warnings));
-    }
-    if !v.info.is_empty() {
-        m.insert("info".into(), issues_to_values(&v.info));
-    }
+    m.insert("code".into(), Value::String(issue.code.code().into()));
+    m.insert("path".into(), Value::Array(path_to_values(&issue.path)));
+    m.insert(
+        "severity".into(),
+        Value::String(severity_str(issue.severity).into()),
+    );
+    m.insert("message".into(), Value::String(issue.message.clone()));
     Value::Object(m)
-}
-
-fn issues_to_values(issues: &[VerifierIssue]) -> Value {
-    Value::Array(
-        issues
-            .iter()
-            .map(|i| {
-                let mut m = Map::new();
-                m.insert("code".into(), Value::String(i.code.code().into()));
-                m.insert("path".into(), Value::Array(path_to_values(&i.path)));
-                m.insert("message".into(), Value::String(i.message.clone()));
-                Value::Object(m)
-            })
-            .collect(),
-    )
 }
 
 fn path_to_values(path: &[PathSegment]) -> Vec<Value> {
@@ -182,41 +144,79 @@ fn path_to_values(path: &[PathSegment]) -> Vec<Value> {
         .collect()
 }
 
-fn signature_check_to_value(c: &SignatureCheck) -> Value {
+fn item_entry_to_value(entry: &ItemReportEntry) -> Value {
     let mut m = Map::new();
-    m.insert("index".into(), Value::from(c.index));
-    // The wire shape carries a 4-state `verdict` string, not a boolean.
-    m.insert("verdict".into(), Value::String(c.verdict_str().into()));
-    if let Some(pub_hex) = &c.signer_pub {
-        m.insert("signer_pub".into(), Value::String(pub_hex.clone()));
-    }
-    if let Some(t) = c.signer_type {
-        m.insert("signer_type".into(), Value::String(t.as_str().into()));
-    }
-    if let Some(r) = c.reason {
-        m.insert("reason".into(), Value::String(r.as_str().into()));
+    m.insert(
+        "contentCheck".into(),
+        Value::String(entry.content_check.as_str().into()),
+    );
+    if let Some(decryption) = &entry.decryption {
+        m.insert("decryption".into(), decryption_to_value(decryption));
     }
     Value::Object(m)
 }
 
-fn decrypt_result_to_value(d: &DecryptResult) -> Value {
+fn decryption_to_value(outcome: &DecryptionOutcome) -> Value {
     let mut m = Map::new();
-    m.insert("item_index".into(), Value::from(d.item_index));
-    // The wire shape carries a discriminated `verdict` string, not a boolean.
-    m.insert("verdict".into(), Value::String(d.verdict_str().into()));
-    if let Some(hash_ok) = d.plaintext_hash_ok {
-        m.insert("plaintext_hash_ok".into(), Value::Bool(hash_ok));
+    m.insert("decrypted".into(), Value::Bool(outcome.decrypted));
+    if let Some(ok) = outcome.plaintext_hash_ok {
+        m.insert("plaintextHashOk".into(), Value::Bool(ok));
     }
-    if let Some(reason) = d.reason_str() {
-        m.insert("reason".into(), Value::String(reason.into()));
+    if let Some(code) = outcome.code {
+        m.insert("code".into(), Value::String(code.code().into()));
+    }
+    Value::Object(m)
+}
+
+fn merkle_entry_to_value(entry: &MerkleReportEntry) -> Value {
+    let mut m = Map::new();
+    m.insert(
+        "contentCheck".into(),
+        Value::String(entry.content_check.as_str().into()),
+    );
+    Value::Object(m)
+}
+
+fn audit_entry_to_value(call: &HttpCallRecord) -> Value {
+    let mut m = Map::new();
+    m.insert("url".into(), Value::String(call.url.clone()));
+    m.insert("method".into(), Value::String(call.method.as_str().into()));
+    // The status is schema-required on every entry, with null as the
+    // no-response reading: a refused call or transport failure serialises as
+    // JSON null, never omits the key.
+    m.insert(
+        "status".into(),
+        call.status.map_or(Value::Null, Value::from),
+    );
+    m.insert("bytes".into(), Value::from(call.bytes));
+    m.insert("durationMs".into(), Value::from(call.duration_ms));
+    m.insert(
+        "purpose".into(),
+        Value::String(call.purpose.as_str().into()),
+    );
+    Value::Object(m)
+}
+
+fn signature_check_to_value(check: &SignatureCheck) -> Value {
+    let mut m = Map::new();
+    m.insert("index".into(), Value::from(check.index));
+    m.insert("verdict".into(), Value::String(check.verdict_str().into()));
+    if let Some(pub_hex) = &check.signer_pub {
+        m.insert("signerPub".into(), Value::String(pub_hex.clone()));
+    }
+    if let Some(t) = check.signer_type {
+        m.insert("signerType".into(), Value::String(t.as_str().into()));
+    }
+    if let Some(r) = check.reason {
+        m.insert("reason".into(), Value::String(r.as_str().into()));
     }
     Value::Object(m)
 }
 
 fn tx_witness_to_value(w: &VerifyTxWitness) -> Value {
     let mut m = Map::new();
-    // The witness kind is fixed to "vkey"; bootstrap/script witnesses are summed
-    // separately in `tx_summary.script_witness_count`.
+    // The witness kind is fixed to "vkey"; bootstrap/script witnesses are
+    // summed separately in `txSummary.script_witness_count`.
     m.insert("type".into(), Value::String("vkey".into()));
     m.insert("vkey".into(), Value::String(w.vkey.clone()));
     m.insert("key_hash".into(), Value::String(w.key_hash.clone()));
@@ -269,33 +269,10 @@ fn tx_summary_to_value(s: &VerifyTxSummary) -> Value {
     Value::Object(m)
 }
 
-fn uri_check_to_value(u: &UriCheck) -> Value {
-    let mut m = Map::new();
-    m.insert("item_index".into(), Value::from(u.item_index));
-    m.insert("uri".into(), Value::String(u.uri.clone()));
-    m.insert("ok".into(), Value::Bool(u.ok));
-    if let Some(r) = u.reason {
-        m.insert("reason".into(), Value::String(r.as_str().into()));
-    }
-    Value::Object(m)
-}
-
-fn merkle_check_to_value(c: &MerkleCheck) -> Value {
-    let mut m = Map::new();
-    m.insert("merkle_index".into(), Value::from(c.merkle_index));
-    m.insert("alg".into(), Value::String(c.alg.clone()));
-    // The wire shape carries a 5-state `verdict` string, not a boolean.
-    m.insert("verdict".into(), Value::String(c.verdict_str().into()));
-    if let Some(r) = c.reason {
-        m.insert("reason".into(), Value::String(r.as_str().into()));
-    }
-    Value::Object(m)
-}
-
 /// Project a validated record to JSON via its canonical CBOR encoding.
 ///
-/// The record re-encodes to the same canonical bytes the metadata carried, so the
-/// projection (byte strings → hex, map keys → strings) matches the twins' record
+/// The record re-encodes to the same canonical bytes the metadata carried, so
+/// the projection (byte strings → hex, map keys → strings) matches the wire
 /// shape exactly. On the impossible duplicate-extension-key encode failure the
 /// record is rendered as an empty object rather than panicking.
 fn record_to_value(record: &PoeRecord) -> Value {
@@ -317,8 +294,8 @@ fn cbor_to_value(value: &CborValue) -> Value {
     match value {
         CborValue::Unsigned(n) => Value::from(*n),
         CborValue::Negative(m) => {
-            // CBOR negative integer is -1 - m; m fits in u64, so the signed value
-            // fits in i128 and (for record fields) in i64.
+            // CBOR negative integer is -1 - m; m fits in u64, so the signed
+            // value fits in i128 and (for record fields) in i64.
             let signed = -1_i128 - i128::from(*m);
             i64::try_from(signed).map_or_else(|_| Value::String(signed.to_string()), Value::from)
         }
@@ -346,10 +323,4 @@ fn cbor_key_to_string(key: &CborValue) -> String {
         CborValue::Bytes(b) => crate::hex::encode(b),
         other => format!("{other:?}"),
     }
-}
-
-/// Convenience: whether a report serialised to its valid-pass shape.
-#[must_use]
-pub fn is_clean_pass(report: &VerifyReport) -> bool {
-    report.verdict == Verdict::Valid
 }

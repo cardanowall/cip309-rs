@@ -9,6 +9,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > release. Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-06-11
+
+### Changed
+
+- **BREAKING (wire format):** The sealed-PoE construction is finalized: nonce-salted key derivation, a content-hash-bound slot transcript, segmented STREAM content encryption (`chacha20-poly1305-stream64k`), an in-ciphertext passphrase commitment, and passphrase normalization pinned to Unicode 16.0 NFKC. Records sealed by earlier releases do not decrypt or verify under 0.4.0, and vice versa.
+- **BREAKING (wire format):** Record fields are de-chunked: `kem_ct` is a single byte string, URIs are plain text strings, and COSE fields are single byte strings. The only remaining chunking is the ledger-imposed ≤64-byte segmentation of the whole record body for transport.
+- **BREAKING (verifier):** The verifier returns a four-state verdict (`valid` | `pending` | `unverifiable` | `failed`) and a reworked report schema (camelCase fields, positional `items`/`merkle` results, severity-tagged issues). It enforces transaction-hash and auxiliary-data binding, never fabricates confirmation depth, never follows redirects, and treats a deny-host violation as terminal on the resolve path and per-attempt on the content path. Bytes that fail a URI's own content address are attributed to the provider as `URI_PROVIDER_INTEGRITY_MISMATCH`, distinct from a content-hash failure.
+- The structural validator accepts options — supported critical extensions, verifier role, resource bounds, and a passphrase-parameter ceiling — and the error-code registry now holds 76 codes.
+- Conformance vectors regenerated under the finalized wire format; transaction vectors are fully bound (transaction hash and auxiliary-data hash).
+
+### Added
+
+- Identity-seed string encoding: `encode_identity_seed` / `parse_identity_seed` for the checksummed `L309-SEED-1…` form (HRP `l309-seed-`, rendered uppercase), with raw-hex input accepted; pinned by a cross-SDK conformance vector.
+- New conformance families: carriage, Cardano, KDF, Unicode normalization, seed encoding, and recipient-scan negatives.
+
 ## [0.3.0] - 2026-06-06
 
 ### Changed

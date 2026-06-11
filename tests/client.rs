@@ -22,8 +22,8 @@ use cardanowall::client::{
     ParseHttpErrorArgs, PoeVerifyInput, PublishBatchEntry, PublishBatchInput,
     PublishBatchResultEntry, PublishContentInput, PublishInput, PublishMerkleInput,
     PublishPrehashedInput, PublishSealedInput, QuoteInput, RecordSignature, RecordsListInput,
-    RequestBody, ResponseHeaders, SealedKemChoice, Signer, SignerError, SupportedHashAlg,
-    UploadsInput,
+    RequestBody, ResponseHeaders, ResumableSource, ResumableUploadError, ResumableUploadInput,
+    SealedKemChoice, Signer, SignerError, SupportedHashAlg, UploadsInput,
 };
 use cardanowall::verifier::fetch::{HttpMethod, OutboundError};
 
@@ -55,6 +55,7 @@ enum RequestBodySnapshot {
     None,
     Json(String),
     Multipart(Vec<MultipartFieldSnapshot>),
+    Bytes(Vec<u8>),
 }
 
 impl RequestBodySnapshot {
@@ -73,6 +74,7 @@ impl RequestBodySnapshot {
                     })
                     .collect(),
             ),
+            RequestBody::Bytes(bytes) => RequestBodySnapshot::Bytes(bytes.clone()),
         }
     }
 
@@ -80,6 +82,13 @@ impl RequestBodySnapshot {
         match self {
             RequestBodySnapshot::Json(s) => s,
             _ => panic!("expected a JSON body, got {self:?}"),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            RequestBodySnapshot::Bytes(b) => b,
+            _ => panic!("expected a binary body, got {self:?}"),
         }
     }
 }
@@ -267,3 +276,4 @@ include!("client_parts/request_parity.rs");
 include!("client_parts/error_mapping.rs");
 include!("client_parts/namespaces.rs");
 include!("client_parts/off_host_sign.rs");
+include!("client_parts/resumable.rs");

@@ -1,0 +1,82 @@
+{
+  "auditTrail": [
+    {
+      "bytes": 590,
+      "durationMs": 1,
+      "method": "POST",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://api.koios.rest/api/v1/tx_cbor"
+    },
+    {
+      "bytes": 156,
+      "durationMs": 1,
+      "method": "POST",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://api.koios.rest/api/v1/tx_info"
+    },
+    {
+      "bytes": 27,
+      "durationMs": 1,
+      "method": "GET",
+      "purpose": "cardano",
+      "status": 200,
+      "url": "https://api.koios.rest/api/v1/tip"
+    },
+    {
+      "bytes": 64,
+      "durationMs": 1,
+      "method": "GET",
+      "purpose": "arweave",
+      "status": 200,
+      "url": "https://arweave.net/6428f177800f5f657fe613ccebd1438e01444cad73a"
+    }
+  ],
+  "block_slot": 100005700,
+  "block_time": 1700005700,
+  "confirmationDepth": 61,
+  "confirmationThreshold": 15,
+  "exitCode": 0,
+  "issues": [],
+  "items": [
+    {
+      "contentCheck": "checked"
+    }
+  ],
+  "merkle": [],
+  "metadataLabels": [
+    309
+  ],
+  "network": "cardano:mainnet",
+  "profile": "recipient-sealed",
+  "record": {
+    "items": [
+      {
+        "hashes": {
+          "sha2-256": "50f859292937bfa48c2f2bf85a86806d7b22e7b25d2595cd3f9e3b545f002e59"
+        },
+        "uris": [
+          "ar://6428f177800f5f657fe613ccebd1438e01444cad73a"
+        ]
+      }
+    ],
+    "v": 1
+  },
+  "txHash": "f97d0b7393e0362a0580834bc859a46038b083521d63c81cc1c9f0c55170ce4d",
+  "txSummary": {
+    "fee_lovelace": "170094",
+    "input_count": 1,
+    "output_count": 1,
+    "outputs": [
+      {
+        "address": "addr1v9mjteqnm7k32m6k55esh27k8uae4d0m6xkm3jg7axzygws4sqxqv",
+        "lovelace": "2000000"
+      }
+    ],
+    "script_witness_count": 0,
+    "total_output_lovelace": "2000000"
+  },
+  "txWitnesses": [],
+  "verdict": "valid"
+}

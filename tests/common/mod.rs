@@ -28,6 +28,12 @@ pub fn sdk_ts_fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sdk-ts")
 }
 
+/// Absolute path to the standard's conformance tree, for fixture areas that
+/// have no package-local mirror.
+pub fn label309_conformance() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../label-309/conformance")
+}
+
 /// Read and parse a JSON fixture file.
 ///
 /// Panics with a path-tagged message if the file cannot be read or parsed,

@@ -4,11 +4,8 @@
 //! CBOR encoder, the structural validator, and the error-code catalogue. It is a
 //! byte-parity twin of the TypeScript (`@cardanowall/poe-standard`) and Python
 //! (`cardanowall.poe_standard`) implementations: it reproduces their exact
-//! canonical-CBOR bytes against the same shared cross-implementation test
-//! vectors. On the handful of validator edge cases where the published
-//! TypeScript and Python references currently disagree — the extension-key and
-//! unauthenticated-cipher regex boundaries, the CIDv0 decode, and the URI-scheme
-//! dispatch — this hand-rolled validator tracks the Python reference.
+//! canonical-CBOR bytes and their exact validation verdicts against the same
+//! shared cross-implementation conformance vectors.
 //!
 //! The two public encoders both emit RFC 8949 §4.2.1 canonical CBOR (the
 //! [`crate::cbor`] layer does the deterministic ordering and shortest-form work):
@@ -17,46 +14,61 @@
 //! - [`encode_record_body_for_signing`] — the same map with the `sigs` key
 //!   dropped. These bytes are what record-level COSE_Sign1 signatures cover.
 //!
+//! Every logical byte string in the record body is a SINGLE CBOR byte string
+//! and every URI is a SINGLE text string: `kem_ct` is one 1120-byte string,
+//! `cose_sign1` / `cose_key` are single strings, and `uris[]` entries are plain
+//! absolute URIs. The Cardano ledger's 64-byte metadata-string cap is satisfied
+//! by the whole-body transport chunk array alone, which is reassembled before
+//! the record body ever reaches this layer — record fields carry no chunk
+//! wrappers of their own.
+//!
 //! [`validate_poe_record`] is a pure function over CBOR bytes that performs no
 //! I/O, runs no cryptographic signature verification, and decrypts nothing. It
-//! returns the same [`ErrorCode`] set, the same per-issue severity, and the same
-//! ok/fail verdict as the other two SDKs.
+//! returns the same verdict, the same [`ErrorCode`] set, the same per-issue
+//! severity, and the same sorted issue order as the other two SDKs for any
+//! given `(bytes, options)` pair.
 
 use std::collections::BTreeSet;
 
 use crate::cbor::{decode_canonical_cbor, encode_canonical_cbor, CborValue};
 // The verifier resource bounds the sealed-PoE unwrap layer enforces. Importing
 // the same constants here, rather than re-declaring them, makes the structural
-// validator and the unwrap layer trip the identical thresholds: a divergence is
-// impossible because there is one definition. Both are deployment-pinned
-// reference values, not wire fields.
+// validator and the unwrap layer default to identical thresholds. Both are
+// deployment-pinned reference values, not wire fields — `ValidatorOptions`
+// overrides them per deployment.
 use crate::sealed_poe::{MAX_DECODED_ENVELOPE_BYTES, MAX_SLOTS};
 
 // ===========================================================================
 // Error-code catalogue
 // ===========================================================================
 
-/// One code from the Label 309 validation error-code taxonomy.
+/// One code from the Label 309 error-code registry.
 ///
-/// The variants split into two parts:
+/// The variants are declared in the registry's entry order, and that order is
+/// load-bearing: issues sharing an identical path tie-break by registry
+/// position ([`ErrorCode::registry_index`]), so every implementation sorts an
+/// issue list identically.
 ///
-/// - **Structural** codes (`Part A`) are the only codes
-///   [`validate_poe_record`] ever emits — every canonical-decode, schema, and
-///   domain failure surfaces as one of these.
-/// - **Verifier** codes (`Part B`) are re-exported so a downstream verifier can
-///   dispatch on a single union; the structural validator never emits them.
+/// Three layers emit these codes:
+///
+/// - **Part A** — the structural validator ([`validate_poe_record`]); these are
+///   the only codes it ever emits.
+/// - **carriage** — the pre-validator transport step that reassembles the
+///   label-309 chunk array (`CHUNK_TOO_LARGE`).
+/// - **Part B** — the public / recipient verifier (chain resolution, signature
+///   verification, content fetch, decryption), included so downstream verifiers
+///   dispatch on a single union.
 ///
 /// Each variant's [`code`](ErrorCode::code) string matches the canonical
-/// `SCREAMING_SNAKE_CASE` spelling byte-for-byte, so cross-implementation tests
-/// can assert the exact same strings the TypeScript and Python SDKs use.
+/// `SCREAMING_SNAKE_CASE` spelling byte-for-byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ErrorCode {
-    // --- Part A: structural validator codes ---
     /// Every canonical-CBOR decode failure: malformed/truncated bytes,
     /// indefinite-length encodings, non-canonical (unsorted) map keys, duplicate
     /// map keys, non-minimal integers, invalid UTF-8. One code, no finer grain.
     MalformedCbor,
-    /// A field has the wrong CBOR type for its position.
+    /// A field has the wrong CBOR type for its position (including a map
+    /// carrying a non-text key where a text-keyed map is required).
     SchemaTypeMismatch,
     /// A required field is absent.
     SchemaMissingRequired,
@@ -74,38 +86,36 @@ pub enum ErrorCode {
     UnsupportedHashAlg,
     /// A Merkle list-commitment algorithm identifier is not in the v1 registry.
     UnsupportedMerkleCommitAlg,
-    /// A reconstructed URI is not a well-formed absolute `ar://` / `ipfs://` URI.
+    /// `merkle[i].leaf_count` is outside the pinned range `1 .. 2^32 - 1`.
+    SchemaMerkleLeafCountInvalid,
+    /// A URI is not a well-formed absolute `ar://` / `ipfs://` URI.
     InvalidUri,
-    /// A chunk's byte length is outside the `[1, 64]` range.
+    /// A transport chunk's byte length exceeds the ledger's 64-byte cap
+    /// (carriage layer; never emitted by the structural validator).
     ChunkTooLarge,
-    /// `enc.aead` names an unauthenticated cipher family member.
+    /// `enc.aead` names a forbidden unauthenticated cipher family member.
     UnauthenticatedCipherForbidden,
-    /// `enc.aead` is not in the v1 AEAD registry.
+    /// `enc.aead` is not in the v1 content-format registry.
     UnsupportedAeadAlg,
-    /// `enc.nonce` length does not match the AEAD's nonce length.
+    /// `enc.nonce` length does not match the content format's registered length.
     NonceLengthMismatch,
-    /// `enc.scheme` is not the unsigned integer 1.
+    /// `enc.scheme` is not a supported envelope scheme.
     UnsupportedEnvelopeScheme,
+    /// The envelope uses identifiers this implementation does not support and
+    /// degrades to the opaque reading. Dual severity: `info` in the public
+    /// reading, `error` in the recipient role / strict sealed-crypto mode.
+    EncUnsupported,
     /// `enc.slots` is an empty array.
     EncSlotsEmpty,
     /// A recipient slot is not the closed 2-key map its KEM requires.
     EncSlotInvalidShape,
-    /// Two slots in one `enc.slots` carry identical encapsulation material (the
-    /// same `epk`, or the same reassembled `kem_ct`), breaking per-slot KEK
-    /// uniqueness.
-    EncSlotsDuplicateKemMaterial,
-    /// `enc.slots` exceeds the slot-count resource bound (`MAX_SLOTS`).
-    EncSlotsTooMany,
-    /// The decoded `enc` envelope exceeds the size resource bound
-    /// (`MAX_DECODED_ENVELOPE_BYTES`).
-    EncEnvelopeTooLarge,
     /// `enc.kem` is not in the v1 KEM registry.
     UnsupportedKemAlg,
     /// `enc.slots` is present but `enc.kem` is absent.
     EncKemRequired,
     /// A classical slot's `epk` is not 32 bytes.
     KemEpkLengthMismatch,
-    /// A hybrid slot's `kem_ct` does not reassemble to the X-Wing `enc` length.
+    /// A hybrid slot's `kem_ct` is not the X-Wing 1120-byte encapsulation.
     KemCtLengthMismatch,
     /// A slot's `wrap` is not 48 bytes.
     WrapLengthMismatch,
@@ -115,11 +125,18 @@ pub enum ErrorCode {
     EncSlotsMacRequired,
     /// `enc.slots_mac` is present but `enc.slots` is absent.
     EncSlotsRequired,
-    /// `enc` combines `slots` with `passphrase`; the two key paths are exclusive.
+    /// Two slots in one `enc.slots` carry identical encapsulation material,
+    /// breaking per-slot KEK uniqueness.
+    EncSlotsDuplicateKemMaterial,
+    /// `enc.slots` exceeds the slot-count resource bound.
+    EncSlotsTooMany,
+    /// The decoded `enc` envelope exceeds the byte-size resource bound.
+    EncEnvelopeTooLarge,
+    /// `enc` combines `passphrase` with the slots key path; the two are exclusive.
     EncExclusivityViolation,
     /// `enc` carries neither a `slots` nor a `passphrase` key path.
     EncNoKeyPath,
-    /// An `enc`-bearing item's `hashes` carries no content-hash entry.
+    /// An `enc`-bearing item's `hashes` carries no registered content-hash entry.
     EncRequiresContentHash,
     /// `enc.passphrase.alg` is not in the v1 passphrase-KDF registry.
     EncPassphraseAlgUnsupported,
@@ -129,11 +146,10 @@ pub enum ErrorCode {
     EncPassphraseSaltTooLong,
     /// An Argon2id parameter is below the v1 floor.
     EncPassphraseArgon2ParamsTooLow,
-    /// Declared but not emitted by the structural validator; reserved for a
-    /// policy layer above it.
+    /// An Argon2id parameter exceeds the deployment policy ceiling.
     EncPassphraseParamsExceedPolicy,
     /// A `sigs[i].cose_sign1` (or `cose_key`) blob is not a well-formed COSE
-    /// structure.
+    /// structure, or the COSE_Sign1 carries an attached (non-null) payload.
     MalformedSigCoseSign1,
     /// A signature's protected `alg` is not in the known set; info-severity.
     SignatureUnsupported,
@@ -149,9 +165,13 @@ pub enum ErrorCode {
     ExtensionUnsupportedCritical,
     /// A `crit` entry violates the `crit[]` shape rules.
     CritShapeInvalid,
-
-    // --- Part B: verifier-layer codes ---
-    /// Label-309 metadata could not be found for the transaction.
+    /// The referenced transaction could not be found on chain.
+    TxNotFound,
+    /// No chain/storage provider was reachable.
+    ProviderUnavailable,
+    /// The transaction bytes failed the tx-hash / auxiliary-data-hash binding.
+    TxIntegrityMismatch,
+    /// The transaction exists but carries no label-309 metadata.
     MetadataNotFound,
     /// The transaction has fewer confirmations than required; info-severity.
     InsufficientConfirmations,
@@ -161,48 +181,50 @@ pub enum ErrorCode {
     SignerKeyUnresolved,
     /// The signer wallet address did not match.
     WalletAddressMismatch,
-    /// A URI target is on the deny list.
+    /// A URI target is outside the permitted fetch set.
     UriTargetForbidden,
-    /// A fetched URI's bytes did not match the committed hash.
+    /// Fetched (attributable) bytes did not match the committed hash.
     UriIntegrityMismatch,
+    /// Unattributable fetched bytes mismatched; warning-severity.
+    UriProviderIntegrityMismatch,
     /// A URI fetch failed at runtime; warning-severity.
     UriFetchFailed,
     /// The committed content is unavailable.
     ContentUnavailable,
+    /// The verifier's content-fetch budget was exhausted.
+    ContentFetchLimitExceeded,
     /// The committed ciphertext is unavailable.
     CiphertextUnavailable,
-    /// A required provider is unavailable.
-    ProviderUnavailable,
     /// A service-independence invariant was violated.
     ServiceIndependenceViolation,
-    /// Decryption input had the wrong shape.
+    /// Decryption input had the wrong shape for the envelope's key path.
     WrongDecryptionInputShape,
     /// The recipient key did not match any slot.
     WrongRecipientKey,
-    /// The sealed header failed its authentication tag.
+    /// The sealed header failed its authentication.
     TamperedHeader,
-    /// The ciphertext failed its authentication tag.
+    /// The ciphertext failed its authentication.
     TamperedCiphertext,
     /// A key-derivation step failed.
     KdfDerivationFailed,
-    /// A Merkle commitment's leaf count did not match.
+    /// A passphrase contained codepoints outside the pinned normalization profile.
+    EncPassphraseUnnormalizable,
+    /// A passphrase normalized to the empty string.
+    EncPassphraseEmpty,
+    /// A fetched leaves-list's leaf count did not match the commitment.
     SchemaMerkleLeafCountMismatch,
     /// A Merkle leaves payload used an unsupported format.
     SchemaMerkleLeavesFormatUnsupported,
-    /// A Merkle leaves payload was structurally malformed (undecodable CBOR,
-    /// non-map top level, wrong-typed/wrong-length field, empty leaves, or a
-    /// `tree_alg` outside the v1 registry).
+    /// A Merkle leaves payload was structurally malformed.
     SchemaMerkleLeavesMalformed,
     /// A recomputed Merkle root did not match the committed root.
     MerkleRootMismatch,
-    /// The Merkle leaves payload was unavailable; warning-severity.
+    /// The Merkle leaves payload was unavailable; warning-severity (dual).
     MerkleLeavesUnavailable,
-    /// The Merkle leaves were in informative-only form; info-severity.
-    MerkleLeavesInformativeForm,
-    /// A Merkle commitment used an unsupported feature; info-severity by default.
+    /// A Merkle commitment used an unsupported feature; info-severity (dual).
     MerkleUnsupported,
-    /// A check was skipped because it was out of the active profile;
-    /// info-severity by default.
+    /// A check was skipped because it was outside the active verifier profile;
+    /// info-severity (dual).
     OutOfProfileSkipped,
 }
 
@@ -213,14 +235,23 @@ pub enum Severity {
     Error,
     /// A non-fatal runtime anomaly that did not invalidate the record.
     Warning,
-    /// A deliberate non-check (out-of-profile, unrecognised optional feature).
+    /// A deliberate non-failing disposition.
     Info,
 }
 
-/// The structural validator codes, in catalogue order.
-///
-/// These are the only codes [`validate_poe_record`] emits.
-pub const STRUCTURAL_ERROR_CODES: &[ErrorCode] = &[
+/// The layer that emits a code (the registry's `part` column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorCodePart {
+    /// The structural validator.
+    A,
+    /// The verifier layer.
+    B,
+    /// The transport (chunk-array) reassembly step.
+    Carriage,
+}
+
+/// The complete error-code registry, in canonical entry order.
+pub const ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::MalformedCbor,
     ErrorCode::SchemaTypeMismatch,
     ErrorCode::SchemaMissingRequired,
@@ -230,17 +261,16 @@ pub const STRUCTURAL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::HashDigestLengthMismatch,
     ErrorCode::UnsupportedHashAlg,
     ErrorCode::UnsupportedMerkleCommitAlg,
+    ErrorCode::SchemaMerkleLeafCountInvalid,
     ErrorCode::InvalidUri,
     ErrorCode::ChunkTooLarge,
     ErrorCode::UnauthenticatedCipherForbidden,
     ErrorCode::UnsupportedAeadAlg,
     ErrorCode::NonceLengthMismatch,
     ErrorCode::UnsupportedEnvelopeScheme,
+    ErrorCode::EncUnsupported,
     ErrorCode::EncSlotsEmpty,
     ErrorCode::EncSlotInvalidShape,
-    ErrorCode::EncSlotsDuplicateKemMaterial,
-    ErrorCode::EncSlotsTooMany,
-    ErrorCode::EncEnvelopeTooLarge,
     ErrorCode::UnsupportedKemAlg,
     ErrorCode::EncKemRequired,
     ErrorCode::KemEpkLengthMismatch,
@@ -249,6 +279,9 @@ pub const STRUCTURAL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::EncSlotsMacInvalidLength,
     ErrorCode::EncSlotsMacRequired,
     ErrorCode::EncSlotsRequired,
+    ErrorCode::EncSlotsDuplicateKemMaterial,
+    ErrorCode::EncSlotsTooMany,
+    ErrorCode::EncEnvelopeTooLarge,
     ErrorCode::EncExclusivityViolation,
     ErrorCode::EncNoKeyPath,
     ErrorCode::EncRequiresContentHash,
@@ -265,13 +298,9 @@ pub const STRUCTURAL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::SupersedesTxInvalidLength,
     ErrorCode::ExtensionUnsupportedCritical,
     ErrorCode::CritShapeInvalid,
-];
-
-/// The verifier-layer codes, in catalogue order.
-///
-/// Re-exported so a downstream verifier can dispatch on the single [`ErrorCode`]
-/// union; the structural validator never emits these.
-pub const VERIFIER_ERROR_CODES: &[ErrorCode] = &[
+    ErrorCode::TxNotFound,
+    ErrorCode::ProviderUnavailable,
+    ErrorCode::TxIntegrityMismatch,
     ErrorCode::MetadataNotFound,
     ErrorCode::InsufficientConfirmations,
     ErrorCode::SignatureInvalid,
@@ -279,22 +308,24 @@ pub const VERIFIER_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::WalletAddressMismatch,
     ErrorCode::UriTargetForbidden,
     ErrorCode::UriIntegrityMismatch,
+    ErrorCode::UriProviderIntegrityMismatch,
     ErrorCode::UriFetchFailed,
     ErrorCode::ContentUnavailable,
+    ErrorCode::ContentFetchLimitExceeded,
     ErrorCode::CiphertextUnavailable,
-    ErrorCode::ProviderUnavailable,
     ErrorCode::ServiceIndependenceViolation,
     ErrorCode::WrongDecryptionInputShape,
     ErrorCode::WrongRecipientKey,
     ErrorCode::TamperedHeader,
     ErrorCode::TamperedCiphertext,
     ErrorCode::KdfDerivationFailed,
+    ErrorCode::EncPassphraseUnnormalizable,
+    ErrorCode::EncPassphraseEmpty,
     ErrorCode::SchemaMerkleLeafCountMismatch,
     ErrorCode::SchemaMerkleLeavesFormatUnsupported,
     ErrorCode::SchemaMerkleLeavesMalformed,
     ErrorCode::MerkleRootMismatch,
     ErrorCode::MerkleLeavesUnavailable,
-    ErrorCode::MerkleLeavesInformativeForm,
     ErrorCode::MerkleUnsupported,
     ErrorCode::OutOfProfileSkipped,
 ];
@@ -316,17 +347,16 @@ impl ErrorCode {
             ErrorCode::HashDigestLengthMismatch => "HASH_DIGEST_LENGTH_MISMATCH",
             ErrorCode::UnsupportedHashAlg => "UNSUPPORTED_HASH_ALG",
             ErrorCode::UnsupportedMerkleCommitAlg => "UNSUPPORTED_MERKLE_COMMIT_ALG",
+            ErrorCode::SchemaMerkleLeafCountInvalid => "SCHEMA_MERKLE_LEAF_COUNT_INVALID",
             ErrorCode::InvalidUri => "INVALID_URI",
             ErrorCode::ChunkTooLarge => "CHUNK_TOO_LARGE",
             ErrorCode::UnauthenticatedCipherForbidden => "UNAUTHENTICATED_CIPHER_FORBIDDEN",
             ErrorCode::UnsupportedAeadAlg => "UNSUPPORTED_AEAD_ALG",
             ErrorCode::NonceLengthMismatch => "NONCE_LENGTH_MISMATCH",
             ErrorCode::UnsupportedEnvelopeScheme => "UNSUPPORTED_ENVELOPE_SCHEME",
+            ErrorCode::EncUnsupported => "ENC_UNSUPPORTED",
             ErrorCode::EncSlotsEmpty => "ENC_SLOTS_EMPTY",
             ErrorCode::EncSlotInvalidShape => "ENC_SLOT_INVALID_SHAPE",
-            ErrorCode::EncSlotsDuplicateKemMaterial => "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
-            ErrorCode::EncSlotsTooMany => "ENC_SLOTS_TOO_MANY",
-            ErrorCode::EncEnvelopeTooLarge => "ENC_ENVELOPE_TOO_LARGE",
             ErrorCode::UnsupportedKemAlg => "UNSUPPORTED_KEM_ALG",
             ErrorCode::EncKemRequired => "ENC_KEM_REQUIRED",
             ErrorCode::KemEpkLengthMismatch => "KEM_EPK_LENGTH_MISMATCH",
@@ -335,6 +365,9 @@ impl ErrorCode {
             ErrorCode::EncSlotsMacInvalidLength => "ENC_SLOTS_MAC_INVALID_LENGTH",
             ErrorCode::EncSlotsMacRequired => "ENC_SLOTS_MAC_REQUIRED",
             ErrorCode::EncSlotsRequired => "ENC_SLOTS_REQUIRED",
+            ErrorCode::EncSlotsDuplicateKemMaterial => "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
+            ErrorCode::EncSlotsTooMany => "ENC_SLOTS_TOO_MANY",
+            ErrorCode::EncEnvelopeTooLarge => "ENC_ENVELOPE_TOO_LARGE",
             ErrorCode::EncExclusivityViolation => "ENC_EXCLUSIVITY_VIOLATION",
             ErrorCode::EncNoKeyPath => "ENC_NO_KEY_PATH",
             ErrorCode::EncRequiresContentHash => "ENC_REQUIRES_CONTENT_HASH",
@@ -351,6 +384,9 @@ impl ErrorCode {
             ErrorCode::SupersedesTxInvalidLength => "SUPERSEDES_TX_INVALID_LENGTH",
             ErrorCode::ExtensionUnsupportedCritical => "EXTENSION_UNSUPPORTED_CRITICAL",
             ErrorCode::CritShapeInvalid => "CRIT_SHAPE_INVALID",
+            ErrorCode::TxNotFound => "TX_NOT_FOUND",
+            ErrorCode::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
+            ErrorCode::TxIntegrityMismatch => "TX_INTEGRITY_MISMATCH",
             ErrorCode::MetadataNotFound => "METADATA_NOT_FOUND",
             ErrorCode::InsufficientConfirmations => "INSUFFICIENT_CONFIRMATIONS",
             ErrorCode::SignatureInvalid => "SIGNATURE_INVALID",
@@ -358,16 +394,19 @@ impl ErrorCode {
             ErrorCode::WalletAddressMismatch => "WALLET_ADDRESS_MISMATCH",
             ErrorCode::UriTargetForbidden => "URI_TARGET_FORBIDDEN",
             ErrorCode::UriIntegrityMismatch => "URI_INTEGRITY_MISMATCH",
+            ErrorCode::UriProviderIntegrityMismatch => "URI_PROVIDER_INTEGRITY_MISMATCH",
             ErrorCode::UriFetchFailed => "URI_FETCH_FAILED",
             ErrorCode::ContentUnavailable => "CONTENT_UNAVAILABLE",
+            ErrorCode::ContentFetchLimitExceeded => "CONTENT_FETCH_LIMIT_EXCEEDED",
             ErrorCode::CiphertextUnavailable => "CIPHERTEXT_UNAVAILABLE",
-            ErrorCode::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             ErrorCode::ServiceIndependenceViolation => "SERVICE_INDEPENDENCE_VIOLATION",
             ErrorCode::WrongDecryptionInputShape => "WRONG_DECRYPTION_INPUT_SHAPE",
             ErrorCode::WrongRecipientKey => "WRONG_RECIPIENT_KEY",
             ErrorCode::TamperedHeader => "TAMPERED_HEADER",
             ErrorCode::TamperedCiphertext => "TAMPERED_CIPHERTEXT",
             ErrorCode::KdfDerivationFailed => "KDF_DERIVATION_FAILED",
+            ErrorCode::EncPassphraseUnnormalizable => "ENC_PASSPHRASE_UNNORMALIZABLE",
+            ErrorCode::EncPassphraseEmpty => "ENC_PASSPHRASE_EMPTY",
             ErrorCode::SchemaMerkleLeafCountMismatch => "SCHEMA_MERKLE_LEAF_COUNT_MISMATCH",
             ErrorCode::SchemaMerkleLeavesFormatUnsupported => {
                 "SCHEMA_MERKLE_LEAVES_FORMAT_UNSUPPORTED"
@@ -375,32 +414,196 @@ impl ErrorCode {
             ErrorCode::SchemaMerkleLeavesMalformed => "SCHEMA_MERKLE_LEAVES_MALFORMED",
             ErrorCode::MerkleRootMismatch => "MERKLE_ROOT_MISMATCH",
             ErrorCode::MerkleLeavesUnavailable => "MERKLE_LEAVES_UNAVAILABLE",
-            ErrorCode::MerkleLeavesInformativeForm => "MERKLE_LEAVES_INFORMATIVE_FORM",
             ErrorCode::MerkleUnsupported => "MERKLE_UNSUPPORTED",
             ErrorCode::OutOfProfileSkipped => "OUT_OF_PROFILE_SKIPPED",
         }
     }
 
-    /// The severity for this code.
+    /// The default severity for this code.
     ///
-    /// Every code is `Error` except `SIGNATURE_UNSUPPORTED`,
-    /// `INSUFFICIENT_CONFIRMATIONS`, `MERKLE_LEAVES_INFORMATIVE_FORM`,
-    /// `MERKLE_UNSUPPORTED`, and `OUT_OF_PROFILE_SKIPPED` (info), and
-    /// `URI_FETCH_FAILED` / `MERKLE_LEAVES_UNAVAILABLE` (warning). The two
-    /// dual-severity verifier codes record their default `info` reading here.
+    /// The four dual-severity codes ([`is_dual_severity`](Self::is_dual_severity))
+    /// record their default reading here; a promoting context escalates them to
+    /// [`Severity::Error`] (the validator does this for `ENC_UNSUPPORTED` under
+    /// the recipient role).
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {
-            ErrorCode::SignatureUnsupported
+            ErrorCode::EncUnsupported
+            | ErrorCode::SignatureUnsupported
             | ErrorCode::InsufficientConfirmations
-            | ErrorCode::MerkleLeavesInformativeForm
             | ErrorCode::MerkleUnsupported
             | ErrorCode::OutOfProfileSkipped => Severity::Info,
-            ErrorCode::UriFetchFailed | ErrorCode::MerkleLeavesUnavailable => Severity::Warning,
+            ErrorCode::UriProviderIntegrityMismatch
+            | ErrorCode::UriFetchFailed
+            | ErrorCode::MerkleLeavesUnavailable => Severity::Warning,
             _ => Severity::Error,
         }
     }
+
+    /// The emitting layer (the registry's `part` column).
+    #[must_use]
+    pub const fn part(self) -> ErrorCodePart {
+        match self {
+            ErrorCode::ChunkTooLarge => ErrorCodePart::Carriage,
+            ErrorCode::MalformedCbor
+            | ErrorCode::SchemaTypeMismatch
+            | ErrorCode::SchemaMissingRequired
+            | ErrorCode::SchemaUnknownField
+            | ErrorCode::SchemaInvalidLiteral
+            | ErrorCode::SchemaEmptyRecord
+            | ErrorCode::HashDigestLengthMismatch
+            | ErrorCode::UnsupportedHashAlg
+            | ErrorCode::UnsupportedMerkleCommitAlg
+            | ErrorCode::SchemaMerkleLeafCountInvalid
+            | ErrorCode::InvalidUri
+            | ErrorCode::UnauthenticatedCipherForbidden
+            | ErrorCode::UnsupportedAeadAlg
+            | ErrorCode::NonceLengthMismatch
+            | ErrorCode::UnsupportedEnvelopeScheme
+            | ErrorCode::EncUnsupported
+            | ErrorCode::EncSlotsEmpty
+            | ErrorCode::EncSlotInvalidShape
+            | ErrorCode::UnsupportedKemAlg
+            | ErrorCode::EncKemRequired
+            | ErrorCode::KemEpkLengthMismatch
+            | ErrorCode::KemCtLengthMismatch
+            | ErrorCode::WrapLengthMismatch
+            | ErrorCode::EncSlotsMacInvalidLength
+            | ErrorCode::EncSlotsMacRequired
+            | ErrorCode::EncSlotsRequired
+            | ErrorCode::EncSlotsDuplicateKemMaterial
+            | ErrorCode::EncSlotsTooMany
+            | ErrorCode::EncEnvelopeTooLarge
+            | ErrorCode::EncExclusivityViolation
+            | ErrorCode::EncNoKeyPath
+            | ErrorCode::EncRequiresContentHash
+            | ErrorCode::EncPassphraseAlgUnsupported
+            | ErrorCode::EncPassphraseSaltTooShort
+            | ErrorCode::EncPassphraseSaltTooLong
+            | ErrorCode::EncPassphraseArgon2ParamsTooLow
+            | ErrorCode::EncPassphraseParamsExceedPolicy
+            | ErrorCode::MalformedSigCoseSign1
+            | ErrorCode::SignatureUnsupported
+            | ErrorCode::SigEntryInvalidShape
+            | ErrorCode::SigEntryKidCoseKeyConflict
+            | ErrorCode::SigPrivateKeyLeaked
+            | ErrorCode::SupersedesTxInvalidLength
+            | ErrorCode::ExtensionUnsupportedCritical
+            | ErrorCode::CritShapeInvalid => ErrorCodePart::A,
+            _ => ErrorCodePart::B,
+        }
+    }
+
+    /// Whether this code carries context-dependent (dual) severity.
+    #[must_use]
+    pub const fn is_dual_severity(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::EncUnsupported
+                | ErrorCode::MerkleLeavesUnavailable
+                | ErrorCode::MerkleUnsupported
+                | ErrorCode::OutOfProfileSkipped
+        )
+    }
+
+    /// The position of this code in the canonical registry.
+    ///
+    /// Issues carrying an identical path are ordered by this index, so every
+    /// implementation sorts an issue list identically.
+    #[must_use]
+    pub const fn registry_index(self) -> usize {
+        self as usize
+    }
 }
+
+/// The Part A (structural-validator) codes, in registry order.
+pub const STRUCTURAL_ERROR_CODES: &[ErrorCode] = &[
+    ErrorCode::MalformedCbor,
+    ErrorCode::SchemaTypeMismatch,
+    ErrorCode::SchemaMissingRequired,
+    ErrorCode::SchemaUnknownField,
+    ErrorCode::SchemaInvalidLiteral,
+    ErrorCode::SchemaEmptyRecord,
+    ErrorCode::HashDigestLengthMismatch,
+    ErrorCode::UnsupportedHashAlg,
+    ErrorCode::UnsupportedMerkleCommitAlg,
+    ErrorCode::SchemaMerkleLeafCountInvalid,
+    ErrorCode::InvalidUri,
+    ErrorCode::UnauthenticatedCipherForbidden,
+    ErrorCode::UnsupportedAeadAlg,
+    ErrorCode::NonceLengthMismatch,
+    ErrorCode::UnsupportedEnvelopeScheme,
+    ErrorCode::EncUnsupported,
+    ErrorCode::EncSlotsEmpty,
+    ErrorCode::EncSlotInvalidShape,
+    ErrorCode::UnsupportedKemAlg,
+    ErrorCode::EncKemRequired,
+    ErrorCode::KemEpkLengthMismatch,
+    ErrorCode::KemCtLengthMismatch,
+    ErrorCode::WrapLengthMismatch,
+    ErrorCode::EncSlotsMacInvalidLength,
+    ErrorCode::EncSlotsMacRequired,
+    ErrorCode::EncSlotsRequired,
+    ErrorCode::EncSlotsDuplicateKemMaterial,
+    ErrorCode::EncSlotsTooMany,
+    ErrorCode::EncEnvelopeTooLarge,
+    ErrorCode::EncExclusivityViolation,
+    ErrorCode::EncNoKeyPath,
+    ErrorCode::EncRequiresContentHash,
+    ErrorCode::EncPassphraseAlgUnsupported,
+    ErrorCode::EncPassphraseSaltTooShort,
+    ErrorCode::EncPassphraseSaltTooLong,
+    ErrorCode::EncPassphraseArgon2ParamsTooLow,
+    ErrorCode::EncPassphraseParamsExceedPolicy,
+    ErrorCode::MalformedSigCoseSign1,
+    ErrorCode::SignatureUnsupported,
+    ErrorCode::SigEntryInvalidShape,
+    ErrorCode::SigEntryKidCoseKeyConflict,
+    ErrorCode::SigPrivateKeyLeaked,
+    ErrorCode::SupersedesTxInvalidLength,
+    ErrorCode::ExtensionUnsupportedCritical,
+    ErrorCode::CritShapeInvalid,
+];
+
+/// The carriage (transport) codes, in registry order.
+pub const CARRIAGE_ERROR_CODES: &[ErrorCode] = &[ErrorCode::ChunkTooLarge];
+
+/// The Part B (verifier-layer) codes, in registry order.
+///
+/// Included so a downstream verifier can dispatch on the single [`ErrorCode`]
+/// union; the structural validator never emits these.
+pub const VERIFIER_ERROR_CODES: &[ErrorCode] = &[
+    ErrorCode::TxNotFound,
+    ErrorCode::ProviderUnavailable,
+    ErrorCode::TxIntegrityMismatch,
+    ErrorCode::MetadataNotFound,
+    ErrorCode::InsufficientConfirmations,
+    ErrorCode::SignatureInvalid,
+    ErrorCode::SignerKeyUnresolved,
+    ErrorCode::WalletAddressMismatch,
+    ErrorCode::UriTargetForbidden,
+    ErrorCode::UriIntegrityMismatch,
+    ErrorCode::UriProviderIntegrityMismatch,
+    ErrorCode::UriFetchFailed,
+    ErrorCode::ContentUnavailable,
+    ErrorCode::ContentFetchLimitExceeded,
+    ErrorCode::CiphertextUnavailable,
+    ErrorCode::ServiceIndependenceViolation,
+    ErrorCode::WrongDecryptionInputShape,
+    ErrorCode::WrongRecipientKey,
+    ErrorCode::TamperedHeader,
+    ErrorCode::TamperedCiphertext,
+    ErrorCode::KdfDerivationFailed,
+    ErrorCode::EncPassphraseUnnormalizable,
+    ErrorCode::EncPassphraseEmpty,
+    ErrorCode::SchemaMerkleLeafCountMismatch,
+    ErrorCode::SchemaMerkleLeavesFormatUnsupported,
+    ErrorCode::SchemaMerkleLeavesMalformed,
+    ErrorCode::MerkleRootMismatch,
+    ErrorCode::MerkleLeavesUnavailable,
+    ErrorCode::MerkleUnsupported,
+    ErrorCode::OutOfProfileSkipped,
+];
 
 // ===========================================================================
 // Record model
@@ -408,12 +611,11 @@ impl ErrorCode {
 
 /// A Label 309 v1 Proof-of-Existence record (the encoder's input).
 ///
-/// The base keys mirror the wire format: `v`, `crit`, `sigs`, `items`,
-/// `merkle`, `supersedes`. Every key not in that base set is an extension key,
-/// retained verbatim in [`extensions`](PoeRecord::extensions) as a
-/// `(name, CborValue)` pair. Extension keys are part of the canonical map AND of
-/// the signed body, so they must round-trip byte-identically through both
-/// encoders — the encoder copies each into the canonical map and the canonical
+/// The base keys mirror the wire format: `v`, `items`, `merkle`, `supersedes`,
+/// `sigs`, `crit`. Every key not in that base set is an extension key, retained
+/// verbatim in [`extensions`](PoeRecord::extensions) as a `(name, CborValue)`
+/// pair. Extension keys are part of the canonical map AND of the signed body,
+/// so they round-trip byte-identically through both encoders — the canonical
 /// layer sorts them into key order.
 ///
 /// Absent optional fields are encoded by omission (never as `null`).
@@ -442,9 +644,9 @@ pub struct PoeRecord {
 pub struct ItemEntry {
     /// Content-hash map: algorithm identifier → digest bytes. Non-empty.
     pub hashes: Vec<(String, Vec<u8>)>,
-    /// Storage URIs, each a chunked `[ tstr .size (1..64) ]` array.
-    pub uris: Option<Vec<Vec<String>>>,
-    /// Optional sealed-PoE envelope.
+    /// Storage URIs, each one absolute URI in a single text string.
+    pub uris: Option<Vec<String>>,
+    /// Optional encryption envelope.
     pub enc: Option<EncryptionEnvelope>,
 }
 
@@ -455,26 +657,42 @@ pub struct MerkleCommit {
     pub alg: String,
     /// The Merkle root digest bytes.
     pub root: Vec<u8>,
-    /// The number of committed leaves (≥ 1).
+    /// The number of committed leaves (`1 .. 2^32 - 1`).
     pub leaf_count: u64,
     /// Optional storage URIs for the leaves payload.
-    pub uris: Option<Vec<Vec<String>>>,
+    pub uris: Option<Vec<String>>,
 }
 
-/// A sealed-PoE encryption envelope (`items[i].enc`).
+/// The `items[i].enc` value: a choice between the typed scheme-1 envelope and
+/// the opaque reading.
+///
+/// Mirrors the grammar's `enc = enc-scheme-1 / enc-opaque`. The opaque arm
+/// preserves an envelope under identifiers this implementation does not support
+/// verbatim, so an accepted record re-encodes byte-identically regardless of
+/// which reading applied. Producers construct [`Scheme1`](Self::Scheme1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptionEnvelope {
-    /// Envelope version. MUST equal `1`.
+pub enum EncryptionEnvelope {
+    /// The typed scheme-1 envelope this revision defines.
+    Scheme1(EncScheme1),
+    /// An envelope under unsupported identifiers, preserved as bounded CBOR
+    /// metadata. A verifier escape hatch, never a producer surface.
+    Opaque(CborValue),
+}
+
+/// The typed scheme-1 encryption envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncScheme1 {
+    /// Envelope scheme. MUST equal `1`.
     pub scheme: u64,
-    /// Content AEAD identifier.
+    /// Content-format (AEAD) identifier.
     pub aead: String,
-    /// Content AEAD nonce.
+    /// The record-unique content nonce.
     pub nonce: Vec<u8>,
     /// KEM identifier (required when `slots` is present).
     pub kem: Option<String>,
     /// Recipient slots (exclusive with `passphrase`).
     pub slots: Option<Vec<Slot>>,
-    /// MAC over the recipient slots (required iff `slots` is present).
+    /// MAC over the recipient slot set (required iff `slots` is present).
     pub slots_mac: Option<Vec<u8>>,
     /// Passphrase key-derivation block (exclusive with `slots`).
     pub passphrase: Option<PassphraseBlock>,
@@ -487,10 +705,11 @@ pub struct EncryptionEnvelope {
 /// MUST be absent; the encoder emits only the fields that are set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Slot {
-    /// Classical ephemeral X25519 public key (x25519 KEM).
+    /// Classical ephemeral X25519 public key (x25519 KEM; 32 bytes).
     pub epk: Option<Vec<u8>>,
-    /// Hybrid X-Wing `enc`, pre-chunked into `[ bstr .size (1..64) ]`.
-    pub kem_ct: Option<Vec<Vec<u8>>>,
+    /// Hybrid X-Wing encapsulation (mlkem768x25519 KEM; a single 1120-byte
+    /// byte string).
+    pub kem_ct: Option<Vec<u8>>,
     /// Wrapped CEK + AEAD tag (48 bytes).
     pub wrap: Option<Vec<u8>>,
 }
@@ -500,7 +719,7 @@ pub struct Slot {
 pub struct PassphraseBlock {
     /// Passphrase-KDF identifier.
     pub alg: String,
-    /// KDF salt.
+    /// KDF salt (16..64 bytes).
     pub salt: Vec<u8>,
     /// KDF parameters (`m`, `t`, `p` for Argon2id), as ordered `(name, value)`.
     pub params: Vec<(String, u64)>,
@@ -509,10 +728,10 @@ pub struct PassphraseBlock {
 /// A record-level signature entry (`sigs[i]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigEntry {
-    /// The detached COSE_Sign1 structure, chunked into `[ bstr .size (1..64) ]`.
-    pub cose_sign1: Vec<Vec<u8>>,
-    /// The optional path-2 `cbor<COSE_Key>` sidecar, chunked likewise.
-    pub cose_key: Option<Vec<Vec<u8>>>,
+    /// The detached COSE_Sign1 structure, a single byte string.
+    pub cose_sign1: Vec<u8>,
+    /// The optional path-2 `cbor<COSE_Key>` sidecar, a single byte string.
+    pub cose_key: Option<Vec<u8>>,
 }
 
 // ===========================================================================
@@ -635,15 +854,21 @@ fn merkle_to_cbor(commit: &MerkleCommit) -> CborValue {
     CborValue::Map(pairs)
 }
 
-fn uris_to_cbor(uris: &[Vec<String>]) -> CborValue {
-    CborValue::Array(
-        uris.iter()
-            .map(|chunks| CborValue::Array(chunks.iter().map(CborValue::text).collect()))
-            .collect(),
-    )
+fn uris_to_cbor(uris: &[String]) -> CborValue {
+    CborValue::Array(uris.iter().map(CborValue::text).collect())
 }
 
 fn envelope_to_cbor(enc: &EncryptionEnvelope) -> CborValue {
+    match enc {
+        EncryptionEnvelope::Scheme1(typed) => scheme1_to_cbor(typed),
+        // The opaque reading is preserved verbatim, so an accepted record
+        // re-encodes to its original bytes (and a signed body re-signs over
+        // the exact bytes the producer covered).
+        EncryptionEnvelope::Opaque(value) => value.clone(),
+    }
+}
+
+fn scheme1_to_cbor(enc: &EncScheme1) -> CborValue {
     let mut pairs: Vec<(CborValue, CborValue)> = vec![
         (CborValue::text("scheme"), CborValue::Unsigned(enc.scheme)),
         (CborValue::text("aead"), CborValue::text(enc.aead.clone())),
@@ -684,17 +909,11 @@ fn slot_to_cbor(slot: &Slot) -> CborValue {
     // drops any `epk`; otherwise the classical shape is emitted and any stray
     // `kem_ct` is dropped. Emitting both fields would produce a 3-key map the
     // validator rejects, so the selection here keeps the encoder and validator
-    // in agreement. `kem_ct` is the ALREADY-chunked array, carried through
-    // unchanged so the slot bytes match what `slots_mac` committed to
-    // byte-for-byte. The canonical CBOR layer orders the keys (length-then-
-    // bytewise), so insertion order here is irrelevant to the wire bytes.
+    // in agreement.
     let wrap = CborValue::Bytes(slot.wrap.clone().unwrap_or_default());
     if let Some(kem_ct) = &slot.kem_ct {
         return CborValue::Map(vec![
-            (
-                CborValue::text("kem_ct"),
-                CborValue::Array(kem_ct.iter().map(|c| CborValue::Bytes(c.clone())).collect()),
-            ),
+            (CborValue::text("kem_ct"), CborValue::Bytes(kem_ct.clone())),
             (CborValue::text("wrap"), wrap),
         ]);
     }
@@ -723,131 +942,121 @@ fn passphrase_to_cbor(pp: &PassphraseBlock) -> CborValue {
 fn sig_entry_to_cbor(entry: &SigEntry) -> CborValue {
     let mut pairs: Vec<(CborValue, CborValue)> = vec![(
         CborValue::text("cose_sign1"),
-        CborValue::Array(
-            entry
-                .cose_sign1
-                .iter()
-                .map(|c| CborValue::Bytes(c.clone()))
-                .collect(),
-        ),
+        CborValue::Bytes(entry.cose_sign1.clone()),
     )];
     if let Some(cose_key) = &entry.cose_key {
         pairs.push((
             CborValue::text("cose_key"),
-            CborValue::Array(
-                cose_key
-                    .iter()
-                    .map(|c| CborValue::Bytes(c.clone()))
-                    .collect(),
-            ),
+            CborValue::Bytes(cose_key.clone()),
         ));
     }
     CborValue::Map(pairs)
 }
 
 // ===========================================================================
-// Chunking helpers: split oversized byte/text values into the bounded
-// chunks the canonical record encoding requires.
+// Validator — options and result types
 // ===========================================================================
 
-const CHUNK_MAX_BYTES: usize = 64;
-
-/// Split a logical byte string into `[ bstr .size (1..64) ]` chunks.
-///
-/// Always returns a non-empty vector. An empty input yields a single empty
-/// chunk, which the validator's schema gate later rejects with
-/// [`ErrorCode::ChunkTooLarge`]; real callers (COSE_Sign1, `cbor<COSE_Key>`,
-/// X-Wing `enc`) never pass empty input.
-#[must_use]
-pub fn chunk_bytes(value: &[u8]) -> Vec<Vec<u8>> {
-    if value.is_empty() {
-        return vec![Vec::new()];
-    }
-    value.chunks(CHUNK_MAX_BYTES).map(<[u8]>::to_vec).collect()
+/// The validation reading for dual-severity envelope dispositions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidatorRole {
+    /// The default public reading: an envelope under an unsupported `scheme` /
+    /// `kem` / `aead` degrades to opaque and `ENC_UNSUPPORTED` is informational.
+    #[default]
+    Public,
+    /// The recipient verifier and strict sealed-crypto mode: the same condition
+    /// is a hard reject — `ENC_UNSUPPORTED` escalates to `error` and co-fires
+    /// with the identifier-specific `UNSUPPORTED_*` code.
+    RecipientOrStrict,
 }
 
-/// Concatenate chunked bytes back into a single buffer.
-///
-/// The inverse of [`chunk_bytes`] for `bytes-chunk-array` shapes.
-#[must_use]
-pub fn bytes_chunk_array_concat(chunks: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
-    for chunk in chunks {
-        out.extend_from_slice(chunk);
-    }
-    out
+/// An upper policy ceiling on Argon2id work factors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2ParamsCeiling {
+    /// Memory cost ceiling (KiB).
+    pub m: u64,
+    /// Iteration-count ceiling.
+    pub t: u64,
+    /// Parallelism ceiling.
+    pub p: u64,
 }
 
-/// Chunk a URI into `[ tstr .size (1..64) ]`, splitting on UTF-8 codepoint
-/// boundaries so no multi-byte codepoint straddles a chunk.
-///
-/// Pure-ASCII URIs collapse to plain 64-byte slices. An empty URI yields a
-/// single empty chunk. A URI ≤ 64 bytes yields a single chunk.
-#[must_use]
-pub fn chunk_uri(uri: &str) -> Vec<String> {
-    let bytes = uri.as_bytes();
-    if bytes.is_empty() {
-        return vec![String::new()];
-    }
-    if bytes.len() <= CHUNK_MAX_BYTES {
-        return vec![uri.to_string()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        let mut end = (cursor + CHUNK_MAX_BYTES).min(bytes.len());
-        // Rewind to the start of a codepoint if we landed inside one. UTF-8
-        // continuation bytes match 0b10xx_xxxx.
-        while end < bytes.len() && (bytes[end] & 0xc0) == 0x80 {
-            end -= 1;
-        }
-        // The slice is guaranteed to be on char boundaries here, so this is
-        // valid UTF-8.
-        chunks.push(String::from_utf8_lossy(&bytes[cursor..end]).into_owned());
-        cursor = end;
-    }
-    chunks
-}
+/// The reference deployment ceiling on Argon2id work factors — a verifier-side
+/// denial-of-service backstop (a 64 GiB `m` must not be able to stall a
+/// decrypt-on-paste consumer), enforced by default and distinct from the
+/// normative floors. Ceilings are deployment policy, not a wire rule: override
+/// per deployment, or set `passphrase_params_ceiling: None` to disable.
+pub const DEFAULT_PASSPHRASE_PARAMS_CEILING: Argon2ParamsCeiling = Argon2ParamsCeiling {
+    m: 2_097_152, // KiB = 2 GiB
+    t: 16,
+    p: 8,
+};
 
-/// Result of reconstructing a chunked URI.
+/// Options for [`validate_poe_record`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReconstructUriResult {
-    /// The chunks reconstructed to a valid UTF-8 URI string.
-    Ok(String),
-    /// The chunk bytes did not reconstruct to valid UTF-8.
-    Invalid,
+pub struct ValidatorOptions {
+    /// Names of the critical extensions this validator implements. Default: the
+    /// empty set — a default-configured validator therefore fails every
+    /// `crit`-bearing record with `EXTENSION_UNSUPPORTED_CRITICAL`, by design.
+    pub supported_critical_extensions: BTreeSet<String>,
+    /// The validation reading for dual-severity envelope dispositions.
+    pub role: ValidatorRole,
+    /// Slot-count resource bound (reference bound 1024; deployments MAY tighten).
+    pub max_slots: usize,
+    /// Decoded-envelope byte resource bound (reference bound 65536), measured by
+    /// re-encoding the decoded `enc` subtree canonically.
+    pub max_enc_envelope_bytes: usize,
+    /// Upper policy ceiling on Argon2id parameters
+    /// (`ENC_PASSPHRASE_PARAMS_EXCEED_POLICY`). Defaults to
+    /// [`DEFAULT_PASSPHRASE_PARAMS_CEILING`]; `None` disables the ceiling.
+    pub passphrase_params_ceiling: Option<Argon2ParamsCeiling>,
 }
 
-/// Reconstruct a chunked URI (`uri-chunk-array`) into its logical string.
+impl Default for ValidatorOptions {
+    fn default() -> Self {
+        Self {
+            supported_critical_extensions: BTreeSet::new(),
+            role: ValidatorRole::Public,
+            max_slots: MAX_SLOTS,
+            max_enc_envelope_bytes: MAX_DECODED_ENVELOPE_BYTES,
+            passphrase_params_ceiling: Some(DEFAULT_PASSPHRASE_PARAMS_CEILING),
+        }
+    }
+}
+
+/// One segment of an issue path: a text map key or an integer array index.
 ///
-/// Byte-concatenates the chunks and decodes the whole as strict UTF-8. The
-/// canonical-CBOR decoder already rejects any non-UTF-8 `tstr` upstream, so the
-/// [`ReconstructUriResult::Invalid`] branch is the residual structural guard.
-#[must_use]
-pub fn reconstruct_chunked_uri(chunks: &[String]) -> ReconstructUriResult {
-    let mut merged: Vec<u8> = Vec::new();
-    for chunk in chunks {
-        merged.extend_from_slice(chunk.as_bytes());
-    }
-    match String::from_utf8(merged) {
-        Ok(uri) => ReconstructUriResult::Ok(uri),
-        Err(_) => ReconstructUriResult::Invalid,
+/// The segment list is the API form; a dotted string (e.g.
+/// `items.0.hashes.sha2-256`) is a display rendering only, so map keys
+/// containing `.` need no escaping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PathSegment {
+    /// A text map key.
+    Key(String),
+    /// An integer array index.
+    Index(usize),
+}
+
+impl PathSegment {
+    fn key(s: impl Into<String>) -> Self {
+        PathSegment::Key(s.into())
     }
 }
 
-// ===========================================================================
-// Validator
-// ===========================================================================
+impl std::fmt::Display for PathSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathSegment::Key(k) => f.write_str(k),
+            PathSegment::Index(i) => write!(f, "{i}"),
+        }
+    }
+}
 
 /// One entry in the validator's result.
-///
-/// The cross-implementation parity contract is on [`code`](ValidationIssue::code)
-/// and [`severity`](ValidationIssue::severity); the human-readable
-/// [`message`](ValidationIssue::message) is informational and differs between
-/// SDKs. (Unlike the TypeScript/Python issues, this Rust port does not carry a
-/// structured `path`; the validator's parity surface is the emitted code set.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
+    /// Segments from the record root: text map keys and integer array indices.
+    pub path: Vec<PathSegment>,
     /// The canonical taxonomy code.
     pub code: ErrorCode,
     /// The issue's severity.
@@ -859,19 +1068,20 @@ pub struct ValidationIssue {
 /// The result of structural validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidateResult {
-    /// The record passed: zero error-severity issues. `info` and `warning`
+    /// The record passed: zero error-severity issues. `warning` and `info`
     /// issues (which never fail a record) are carried for inspection.
     Ok {
         /// The decoded record.
         record: Box<PoeRecord>,
-        /// Info-severity issues (e.g. `SIGNATURE_UNSUPPORTED`).
-        info: Vec<ValidationIssue>,
-        /// Warning-severity issues.
+        /// Warning-severity issues, sorted.
         warnings: Vec<ValidationIssue>,
+        /// Info-severity issues, sorted.
+        info: Vec<ValidationIssue>,
     },
-    /// The record failed: at least one error-severity issue.
+    /// The record failed: at least one error-severity issue. The list carries
+    /// every collected issue of every severity, sorted.
     Fail {
-        /// The error-severity issues that failed the record.
+        /// The full sorted issue list (all severities).
         issues: Vec<ValidationIssue>,
     },
 }
@@ -883,62 +1093,83 @@ impl ValidateResult {
         matches!(self, ValidateResult::Ok { .. })
     }
 
-    /// The set of emitted codes (error, warning, and info), for assertions.
+    /// The distinct error-severity codes, sorted by registry order.
     #[must_use]
-    pub fn codes(&self) -> BTreeSet<ErrorCode> {
+    pub fn error_codes(&self) -> BTreeSet<ErrorCode> {
         match self {
-            ValidateResult::Ok { info, warnings, .. } => {
-                info.iter().chain(warnings.iter()).map(|i| i.code).collect()
-            }
-            ValidateResult::Fail { issues } => issues.iter().map(|i| i.code).collect(),
+            ValidateResult::Ok { .. } => BTreeSet::new(),
+            ValidateResult::Fail { issues } => issues
+                .iter()
+                .filter(|i| i.severity == Severity::Error)
+                .map(|i| i.code)
+                .collect(),
+        }
+    }
+
+    /// The distinct info-severity codes, sorted by registry order.
+    #[must_use]
+    pub fn info_codes(&self) -> BTreeSet<ErrorCode> {
+        match self {
+            ValidateResult::Ok { info, .. } => info.iter().map(|i| i.code).collect(),
+            ValidateResult::Fail { issues } => issues
+                .iter()
+                .filter(|i| i.severity == Severity::Info)
+                .map(|i| i.code)
+                .collect(),
         }
     }
 }
 
-// --- Algorithm-identifier registries ---
+// ===========================================================================
+// Registries (closed catalogue of this implementation)
+// ===========================================================================
 
-const HASH_ALGS: &[(&str, usize)] = &[("sha2-256", 32), ("blake2b-256", 32)];
-const MERKLE_COMMIT_ALGS: &[(&str, usize)] = &[("rfc9162-sha256", 32)];
-const AEAD_NONCE_LENGTHS: &[(&str, usize)] = &[("xchacha20-poly1305", 24)];
-const PASSPHRASE_ALGS: &[&str] = &["argon2id"];
+// Content-hash algorithm registry. Value = digest length.
+const HASH_ALG_LENGTHS: &[(&str, usize)] = &[("sha2-256", 32), ("blake2b-256", 32)];
+
+// Merkle list-commitment algorithm registry. Value = root length.
+const MERKLE_COMMIT_ALG_LENGTHS: &[(&str, usize)] = &[("rfc9162-sha256", 32)];
+
+// Content-format (AEAD) registry. Value = the registered `enc.nonce` length.
+const AEAD_NONCE_LENGTHS: &[(&str, usize)] = &[("chacha20-poly1305-stream64k", 24)];
+
+// Passphrase KDF registry.
+const PASSPHRASE_KDF_ALGS: &[&str] = &["argon2id"];
+
+// Signature-algorithm registry: COSE `alg` labels. `-8` (EdDSA, pinned to
+// Ed25519) is the mandatory baseline; `-19` (Ed25519 fully-specified) is
+// verified identically when accepted. Anything else is tagged
+// `SIGNATURE_UNSUPPORTED` (info-severity) — signatures are optional, so an
+// unrecognised algorithm never fails the record by itself.
 const KNOWN_SIG_ALG_IDS: &[i64] = &[-8, -19];
-const COSE_KEY_PRIVATE_MATERIAL_LABELS: &[i64] = &[-4];
 
-const REGISTERED_RECORD_KEYS: &[&str] = &["v", "items", "merkle", "supersedes", "sigs", "crit"];
-const REGISTERED_ITEM_KEYS: &[&str] = &["hashes", "uris", "enc"];
-const REGISTERED_ENC_KEYS: &[&str] = &[
-    "scheme",
-    "aead",
-    "kem",
-    "nonce",
-    "slots",
-    "slots_mac",
-    "passphrase",
-];
-const REGISTERED_PASSPHRASE_KEYS: &[&str] = &["alg", "salt", "params"];
-const REGISTERED_SLOT_KEYS: &[&str] = &["epk", "kem_ct", "wrap"];
-const REGISTERED_SIG_ENTRY_KEYS: &[&str] = &["cose_sign1", "cose_key"];
-const REGISTERED_MERKLE_COMMIT_KEYS: &[&str] = &["alg", "root", "leaf_count", "uris"];
+// Closed top-level base-key set; everything else is extension namespace.
+const TOP_LEVEL_BASE_KEYS: &[&str] = &["v", "items", "merkle", "supersedes", "sigs", "crit"];
 
-/// The X-Wing `enc` length carried by the `mlkem768x25519` hybrid KEM.
-const MLKEM768X25519_ENC_LENGTH: usize = 1120;
+// Every numeric wire field is a CBOR unsigned integer pinned to this range and
+// handled as an exact integer (the `u64` CBOR argument carries the full wire
+// range, so no precision is ever lost before the range check rejects).
+const UINT32_MAX: u64 = 0xffff_ffff;
 
-/// Fixed envelope-field lengths used by the decoded-envelope byte backstop. The
-/// nonce is the XChaCha20-Poly1305 nonce (also the AEAD registry value) and
-/// `slots_mac` is a SHA-256 MAC; both are pinned by the construction, so the
-/// backstop measures the same aggregate the unwrap layer does.
-const NONCE_LENGTH: usize = 24;
-const SLOTS_MAC_LENGTH: usize = 32;
+// Argon2id parameter floors.
+const ARGON2_FLOORS: [(&str, u64); 3] = [("m", 65_536), ("t", 3), ("p", 1)];
 
-/// Which ciphertext-bearing field a KEM uses, plus its expected length.
+/// Which ciphertext-bearing field a KEM uses, plus its exact lengths.
+///
+/// A descriptor declares the slot's ciphertext-bearing field and its exact byte
+/// length; `wrap` is 48 bytes for every KEM (32-byte CEK + 16-byte AEAD tag).
+/// The validator branches on the descriptor so adding a future KEM is a
+/// registry edit, not a new code path.
 #[derive(Debug, Clone, Copy)]
 struct KemSlotDescriptor {
-    /// `"epk"` for a classical KEM, `"kem_ct"` for a hybrid KEM.
+    /// `"epk"` for the classical KEM, `"kem_ct"` for the hybrid KEM.
     field: &'static str,
-    /// Expected (reassembled) length of the ciphertext-bearing field.
+    /// Exact length of the ciphertext-bearing field.
     field_length: usize,
     /// `wrap` length — 32-byte CEK + 16-byte AEAD tag.
     wrap_length: usize,
+    /// The length-mismatch code for the ciphertext-bearing field.
+    field_length_code: ErrorCode,
 }
 
 fn kem_slot_descriptor(kem: &str) -> Option<KemSlotDescriptor> {
@@ -947,15 +1178,19 @@ fn kem_slot_descriptor(kem: &str) -> Option<KemSlotDescriptor> {
             field: "epk",
             field_length: 32,
             wrap_length: 48,
+            field_length_code: ErrorCode::KemEpkLengthMismatch,
         }),
         "mlkem768x25519" => Some(KemSlotDescriptor {
             field: "kem_ct",
-            field_length: MLKEM768X25519_ENC_LENGTH,
+            field_length: 1120,
             wrap_length: 48,
+            field_length_code: ErrorCode::KemCtLengthMismatch,
         }),
         _ => None,
     }
 }
+
+const SLOT_KEY_UNIVERSE: &[&str] = &["epk", "kem_ct", "wrap"];
 
 fn registry_lookup(registry: &[(&str, usize)], key: &str) -> Option<usize> {
     registry
@@ -964,37 +1199,24 @@ fn registry_lookup(registry: &[(&str, usize)], key: &str) -> Option<usize> {
         .map(|(_, len)| *len)
 }
 
-/// Whether a key is a vendor (`x-…`) or companion-CIP (`<cip>-…`) extension key.
+/// Whether a key is a vendor (`x-…`) or companion (`<ns>-…`) extension key.
 ///
-/// Faithfully reproduces the reference regex `^(x-.+|[a-z]+-.+)$` with the exact
-/// semantics the Python `re` module applies in its default mode: `.` matches any
-/// single character EXCEPT the newline `U+000A`; the unanchored `$` matches at
-/// the true end of the string OR immediately before a single trailing newline;
-/// and the pattern is applied as a full anchored match (`^…$`). There is no
-/// DOTALL and no MULTILINE.
-///
-/// Consequences that distinguish this from a naive byte-length check:
-/// `"x-\n"`, `"a-\n"` and `"x-a\nb"` are NOT extension keys (the `.+` part can
-/// only match the non-newline characters and the lone newline cannot satisfy it
-/// or be spanned), while a single trailing newline IS tolerated (`"x-note\n"` is
-/// an extension key). A second trailing newline (`"x-note\n\n"`) is not.
+/// Vendor form: literal `x-` followed by at least one character. Companion
+/// form: one or more ASCII-lowercase letters, a hyphen, then at least one
+/// character. In both forms a control character (U+0000–U+001F,
+/// U+007F–U+009F) anywhere in the key — including a trailing newline — puts
+/// the key outside the namespace.
 fn is_extension_key(key: &str) -> bool {
-    // `$` lets exactly ONE trailing newline sit past the matched region; strip it
-    // so the rest is a plain anchored match. Any further newline anywhere in the
-    // remaining text is unmatchable (`.` never spans `\n`, and `$` only anchors at
-    // the very end of this region), so the whole key is rejected.
-    let core = key.strip_suffix('\n').unwrap_or(key);
-    if core.contains('\n') {
+    if key
+        .chars()
+        .any(|c| matches!(c, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}'))
+    {
         return false;
     }
-    // `x-.+` : literal "x-" followed by at least one (now newline-free) char.
-    if let Some(rest) = core.strip_prefix("x-") {
-        if !rest.is_empty() {
-            return true;
-        }
+    if let Some(rest) = key.strip_prefix("x-") {
+        return !rest.is_empty();
     }
-    // `[a-z]+-.+` : one-or-more ASCII-lowercase letters, a hyphen, then ≥1 char.
-    let bytes = core.as_bytes();
+    let bytes = key.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i].is_ascii_lowercase() {
         i += 1;
@@ -1002,28 +1224,18 @@ fn is_extension_key(key: &str) -> bool {
     i >= 1 && i < bytes.len() && bytes[i] == b'-' && i + 1 < bytes.len()
 }
 
-/// Whether an AEAD identifier names an unauthenticated cipher.
+/// Whether an AEAD identifier names a forbidden unauthenticated cipher.
 ///
-/// Reproduces the regex
-/// `(^|[-_])(cbc|ctr|ecb|cfb|ofb)([-_]|$)|^(rc4|des|3des)([-_]|$)` (ASCII,
-/// case-insensitive): a delimited block-cipher mode token in any key-size
-/// spelling, or a leading legacy stream/block cipher. The delimiters keep
-/// authenticated AEADs (`aes-256-gcm`, `xchacha20-poly1305`) from matching.
-///
-/// The `$` in `([-_]|$)` follows the Python `re` semantics: it anchors at the
-/// true end of the string OR immediately before a single trailing newline
-/// (`U+000A`). So `aes-256-cbc\n` IS an unauthenticated cipher (the `$` matches
-/// before the trailing newline), while `aes-256-cbc\nx` is not (the newline is
-/// interior, not a token boundary) and `aes-256-cbc\r` is not (`\r` is not the
-/// newline the `$` shorthand tolerates).
+/// Reproduces the reference pattern
+/// `(?:^|[-_])(?:cbc|ctr|ecb|cfb|ofb)(?:[-_]|$)|^(?:rc4|des|3des)(?:[-_]|$)`
+/// (ASCII case-insensitive): a delimited block-cipher mode token in any
+/// key-size spelling (`aes-cbc`, `aes-256-cbc`, `des-ede3-cbc`, …), or a
+/// leading legacy stream/block cipher. The token delimiters keep authenticated
+/// AEADs (`aes-256-gcm`, `chacha20-poly1305-stream64k`) from matching.
 fn is_unauthenticated_cipher(aead: &str) -> bool {
     let lower = aead.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let is_delim = |b: u8| b == b'-' || b == b'_';
-    // End-of-token boundary matching the regex `$`: the true end, or the index
-    // just before a single trailing newline.
-    let is_end_boundary =
-        |after: usize| after == bytes.len() || (after + 1 == bytes.len() && bytes[after] == b'\n');
 
     // Arm 1: a delimited mode token anywhere.
     for mode in ["cbc", "ctr", "ecb", "cfb", "ofb"] {
@@ -1033,7 +1245,7 @@ fn is_unauthenticated_cipher(aead: &str) -> bool {
             let idx = start + rel;
             let before_ok = idx == 0 || is_delim(bytes[idx - 1]);
             let after = idx + m.len();
-            let after_ok = is_end_boundary(after) || is_delim(bytes[after]);
+            let after_ok = after == bytes.len() || is_delim(bytes[after]);
             if before_ok && after_ok {
                 return true;
             }
@@ -1046,7 +1258,7 @@ fn is_unauthenticated_cipher(aead: &str) -> bool {
         let l = legacy.as_bytes();
         if bytes.starts_with(l) {
             let after = l.len();
-            if is_end_boundary(after) || is_delim(bytes[after]) {
+            if after == bytes.len() || is_delim(bytes[after]) {
                 return true;
             }
         }
@@ -1061,160 +1273,173 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Structural validator over canonical-CBOR record bytes.
+// ===========================================================================
+// Validator — public entry point
+// ===========================================================================
+
+/// Structural validator over canonical-CBOR record-body bytes.
 ///
 /// A pure function: no I/O, no cryptographic signature verification, no
-/// decryption. Returns the same accept/reject verdict and the same
-/// [`ErrorCode`] set as the TypeScript and Python SDKs. The record passes iff it
-/// emits zero error-severity issues; info and warning issues never fail it.
+/// decryption, deterministic output for any given `(bytes, options)` pair.
+/// Returns the same verdict, the same code set, and the same sorted issue list
+/// as the TypeScript and Python SDKs. The record passes iff it emits zero
+/// error-severity issues; warning and info issues never fail it.
+///
+/// Pipeline:
+///
+/// 1. **Canonical CBOR decode** — every decode failure (malformed bytes,
+///    indefinite-length, unsorted/duplicate map keys, non-minimal integers,
+///    invalid UTF-8) surfaces as the single `MALFORMED_CBOR` code.
+/// 2. **Non-text-key pre-guard** — a map carrying a non-text key at a typed
+///    grammar position is `SCHEMA_TYPE_MISMATCH` at the containing map,
+///    foreclosing the parse of that subtree.
+/// 3. **Schema parse** — closed shapes and per-field CBOR types; a failed
+///    parse forecloses the domain pass.
+/// 4. **Domain checks** — cross-field rules, registry membership, URI shape,
+///    the encryption-envelope union (typed scheme-1 vs the degrade-to-opaque
+///    reading), `sigs[i]` COSE structural decode, `crit[]` shape, exact-integer
+///    ranges.
+/// 5. **Result emission** — issues sorted path segment-wise (integer segments
+///    before text, text by UTF-8 bytes, prefix first, same-path tie-break by
+///    registry order); valid iff no error-severity issue.
 ///
 /// This implementation never panics: every failure mode maps to an issue.
 #[must_use]
-pub fn validate_poe_record(bytes: &[u8]) -> ValidateResult {
-    // Step 2 — canonical CBOR decode. Every decode failure (malformed bytes,
-    // indefinite-length, unsorted/duplicate map keys, non-minimal ints, invalid
-    // UTF-8) folds into the single MALFORMED_CBOR code; the cbor layer keeps an
-    // IndefiniteLength variant only for a descriptive message, and it reports the
-    // same MALFORMED_CBOR stable code.
+pub fn validate_poe_record(bytes: &[u8], options: &ValidatorOptions) -> ValidateResult {
+    // Step 1 — canonical CBOR decode.
     let decoded = match decode_canonical_cbor(bytes) {
         Ok(value) => value,
         Err(cause) => {
             return ValidateResult::Fail {
                 issues: vec![issue(
                     ErrorCode::MalformedCbor,
+                    Vec::new(),
                     format!("cbor decode failed: {cause}"),
                 )],
             };
         }
     };
 
-    let mut issues: Vec<ValidationIssue> = Vec::new();
-    let mut info: Vec<ValidationIssue> = Vec::new();
+    // Step 2 pre-guard — non-text map keys at the typed grammar positions.
+    let pre_guard = collect_non_text_key_map_issues(&decoded);
+    if !pre_guard.is_empty() {
+        return ValidateResult::Fail {
+            issues: sort_issues(pre_guard),
+        };
+    }
 
-    let record_map = match as_map(&decoded) {
-        Some(map) => map,
-        None => {
+    // Step 2 — schema parse. A failed parse forecloses the domain pass (there
+    // is no well-shaped record to walk); its issues are emitted sorted.
+    let record_map = match &decoded {
+        CborValue::Map(pairs) => pairs,
+        _ => {
             return ValidateResult::Fail {
                 issues: vec![issue(
                     ErrorCode::SchemaTypeMismatch,
+                    Vec::new(),
                     "top-level value must be a CBOR map".to_string(),
                 )],
             };
         }
     };
-
-    // Step 3 — top-level key gate (closed base + extension tolerance).
-    check_record_top_level_keys(record_map, &mut issues, &mut info);
-
-    // Step 3 / 4 — required `v` literal.
-    match map_get(record_map, "v") {
-        None => issues.push(issue(
-            ErrorCode::SchemaMissingRequired,
-            "missing required field 'v'".to_string(),
-        )),
-        Some(v_val) => {
-            // `v` MUST be the unsigned integer 1. Floats are already rejected at
-            // decode; a negative or larger uint is the only failure path here.
-            if !matches!(v_val, CborValue::Unsigned(1)) {
-                issues.push(issue(
-                    ErrorCode::SchemaInvalidLiteral,
-                    "v must be the unsigned integer 1".to_string(),
-                ));
-            }
-        }
+    let schema = schema_issues(record_map);
+    if !schema.is_empty() {
+        return ValidateResult::Fail {
+            issues: sort_issues(schema),
+        };
     }
 
-    // Step 4a — content commitment + per-item / per-merkle walks.
-    let mut items_non_empty = false;
-    let mut merkle_non_empty = false;
+    // Step 3 — domain checks. Issues of every severity are collected together;
+    // no error-severity issue stops the walk.
+    let mut issues: Vec<ValidationIssue> = Vec::new();
 
-    if let Some(items_raw) = map_get(record_map, "items") {
-        match items_raw {
-            CborValue::Array(items) => {
-                if !items.is_empty() {
-                    items_non_empty = true;
-                    for item in items {
-                        validate_item_entry(item, &mut issues);
-                    }
-                }
-            }
-            _ => issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "items must be an array".to_string(),
-            )),
+    check_content_commitment_presence(record_map, &mut issues);
+    check_crit(record_map, options, &mut issues);
+
+    // Unknown top-level fields: keys outside the base set that match neither
+    // extension-key namespace (typos, control-character keys).
+    for key in text_keys(record_map) {
+        if TOP_LEVEL_BASE_KEYS.contains(&key) || is_extension_key(key) {
+            continue;
         }
-    }
-
-    if let Some(merkle_raw) = map_get(record_map, "merkle") {
-        match merkle_raw {
-            CborValue::Array(commits) => {
-                if !commits.is_empty() {
-                    merkle_non_empty = true;
-                    for commit in commits {
-                        validate_merkle_commit(commit, &mut issues);
-                    }
-                }
-            }
-            _ => issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "merkle must be an array".to_string(),
-            )),
-        }
-    }
-
-    if !items_non_empty && !merkle_non_empty {
         issues.push(issue(
-            ErrorCode::SchemaEmptyRecord,
-            "record carries neither items (>=1) nor merkle (>=1)".to_string(),
+            ErrorCode::SchemaUnknownField,
+            vec![PathSegment::key(key)],
+            format!("unknown top-level field: {key}"),
         ));
     }
 
-    // Step 4h — supersedes length.
-    if let Some(supersedes) = map_get(record_map, "supersedes") {
-        validate_supersedes(supersedes, &mut issues);
+    if let Some(CborValue::Array(items)) = map_get(record_map, "items") {
+        for (i, item) in items.iter().enumerate() {
+            check_item(item, i, options, &mut issues);
+        }
     }
 
-    // Step 4j — crit[] shape rules.
-    if map_get(record_map, "crit").is_some() {
-        validate_crit(record_map, &mut issues);
+    if let Some(CborValue::Array(merkle)) = map_get(record_map, "merkle") {
+        for (i, commit) in merkle.iter().enumerate() {
+            check_merkle_commit(commit, i, &mut issues);
+        }
     }
 
-    // Step 4f / 4g — sig entries.
-    if let Some(sigs) = map_get(record_map, "sigs") {
-        validate_sigs(sigs, &mut issues, &mut info);
+    if let Some(CborValue::Array(sigs)) = map_get(record_map, "sigs") {
+        if sigs.is_empty() {
+            issues.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("sigs")],
+                "sigs[] must be non-empty when present".to_string(),
+            ));
+        }
+        for (i, entry) in sigs.iter().enumerate() {
+            check_sig_entry(entry, i, &mut issues);
+        }
     }
 
-    // Step 5 — emit.
-    if !issues.is_empty() {
-        return ValidateResult::Fail { issues };
+    // Step 4 — result emission.
+    let sorted = sort_issues(issues);
+    if sorted.iter().any(|i| i.severity == Severity::Error) {
+        return ValidateResult::Fail { issues: sorted };
     }
+    let warnings = sorted
+        .iter()
+        .filter(|i| i.severity == Severity::Warning)
+        .cloned()
+        .collect();
+    let info = sorted
+        .iter()
+        .filter(|i| i.severity == Severity::Info)
+        .cloned()
+        .collect();
     match record_from_cbor(&decoded) {
         Some(record) => ValidateResult::Ok {
             record: Box::new(record),
+            warnings,
             info,
-            warnings: Vec::new(),
         },
-        // record_from_cbor only fails on a shape the domain pass already rejects,
-        // so this branch is unreachable for an issue-free record; surface it as a
-        // type mismatch rather than panicking.
+        // record_from_cbor only fails on a shape the schema pass already
+        // rejects, so this branch is unreachable for an issue-free record;
+        // surface it as a type mismatch rather than panicking.
         None => ValidateResult::Fail {
             issues: vec![issue(
                 ErrorCode::SchemaTypeMismatch,
+                Vec::new(),
                 "record decode produced an unexpected shape".to_string(),
             )],
         },
     }
 }
 
-fn issue(code: ErrorCode, message: String) -> ValidationIssue {
+fn issue(code: ErrorCode, path: Vec<PathSegment>, message: String) -> ValidationIssue {
     ValidationIssue {
+        path,
         code,
         severity: code.severity(),
         message,
     }
 }
 
-// --- CBOR map accessors (text-keyed) ---
+// ===========================================================================
+// CBOR map accessors
+// ===========================================================================
 
 fn as_map(value: &CborValue) -> Option<&[(CborValue, CborValue)]> {
     match value {
@@ -1248,557 +1473,1286 @@ fn as_text(value: &CborValue) -> Option<&str> {
     }
 }
 
-// --- Top-level key gate ---
-
-fn check_record_top_level_keys(
-    record_map: &[(CborValue, CborValue)],
-    issues: &mut Vec<ValidationIssue>,
-    info: &mut Vec<ValidationIssue>,
-) {
-    for (key, _) in record_map {
-        match key {
-            CborValue::Text(k) => {
-                if REGISTERED_RECORD_KEYS.contains(&k.as_str()) {
-                    continue;
-                }
-                if is_extension_key(k) {
-                    info.push(issue(
-                        ErrorCode::OutOfProfileSkipped,
-                        format!("top-level extension key '{k}' preserved but not interpreted"),
-                    ));
-                } else {
-                    issues.push(issue(
-                        ErrorCode::SchemaUnknownField,
-                        format!("unknown record field: '{k}'"),
-                    ));
-                }
-            }
-            _ => issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "top-level key must be a text string".to_string(),
-            )),
-        }
-    }
+/// The map's text keys, in decoded (canonical) order.
+fn text_keys(pairs: &[(CborValue, CborValue)]) -> impl Iterator<Item = &str> {
+    pairs.iter().filter_map(|(k, _)| match k {
+        CborValue::Text(t) => Some(t.as_str()),
+        _ => None,
+    })
 }
 
-fn check_unknown_keys(
-    map: &[(CborValue, CborValue)],
-    allowed: &[&str],
-    label: &str,
-    issues: &mut Vec<ValidationIssue>,
-) {
-    for (key, _) in map {
-        let ok = matches!(key, CborValue::Text(k) if allowed.contains(&k.as_str()));
-        if !ok {
-            issues.push(issue(
-                ErrorCode::SchemaUnknownField,
-                format!("unknown {label} field"),
-            ));
-        }
-    }
+/// Whether a decoded value is a CBOR map carrying at least one non-text key.
+///
+/// Every map at a typed grammar position is text-keyed, so such a map is the
+/// non-text-key violation the pre-guard reports at the containing map.
+fn is_non_text_key_map(value: &CborValue) -> bool {
+    matches!(value, CborValue::Map(pairs)
+        if pairs.iter().any(|(k, _)| !matches!(k, CborValue::Text(_))))
 }
 
-// --- Item entry ---
+// ===========================================================================
+// Step 2 pre-guard — non-text-key maps
+// ===========================================================================
 
-fn validate_item_entry(item: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let item_map = match as_map(item) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "item entry must be a map".to_string(),
-            ));
-            return;
-        }
-    };
-    check_unknown_keys(item_map, REGISTERED_ITEM_KEYS, "item", issues);
-
-    let hashes_raw = map_get(item_map, "hashes");
-    match hashes_raw {
-        Some(CborValue::Map(m)) if !m.is_empty() => {
-            for (alg_key, digest) in m {
-                validate_hash_map_entry(alg_key, digest, issues);
-            }
-        }
-        _ => issues.push(issue(
+// Non-text-key detection over the typed grammar positions reachable from the
+// record root: the root map, each `items[i]` / `merkle[i]` / `sigs[i]` entry,
+// and the `hashes` / `enc` maps inside an item. Positions inside extension
+// values are deliberately NOT walked — extension values admit any CBOR value
+// the canonical profile allows, integer-keyed maps included. The interior of a
+// supported `enc` envelope is scanned by the envelope dispatch itself (the
+// opaque reading likewise admits arbitrary values).
+fn collect_non_text_key_map_issues(decoded: &CborValue) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let flag = |issues: &mut Vec<ValidationIssue>, path: Vec<PathSegment>| {
+        issues.push(issue(
             ErrorCode::SchemaTypeMismatch,
-            "hashes must be a non-empty CBOR map of <alg-id> -> <digest>".to_string(),
+            path,
+            "CBOR map carries a non-text key where a text-keyed map is required".to_string(),
+        ));
+    };
+    if is_non_text_key_map(decoded) {
+        flag(&mut issues, Vec::new());
+        return issues;
+    }
+    let Some(record_map) = as_map(decoded) else {
+        return issues;
+    };
+    for field in ["items", "merkle", "sigs"] {
+        let Some(CborValue::Array(entries)) = map_get(record_map, field) else {
+            continue;
+        };
+        for (i, entry) in entries.iter().enumerate() {
+            if is_non_text_key_map(entry) {
+                flag(
+                    &mut issues,
+                    vec![PathSegment::key(field), PathSegment::Index(i)],
+                );
+                continue;
+            }
+            if field != "items" {
+                continue;
+            }
+            let Some(item_map) = as_map(entry) else {
+                continue;
+            };
+            for sub in ["hashes", "enc"] {
+                if map_get(item_map, sub).is_some_and(is_non_text_key_map) {
+                    flag(
+                        &mut issues,
+                        vec![
+                            PathSegment::key(field),
+                            PathSegment::Index(i),
+                            PathSegment::key(sub),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+    issues
+}
+
+// ===========================================================================
+// Step 2 — schema parse
+// ===========================================================================
+
+// The closed-shape gate over the decoded record map. Mirrors the reference
+// schema layer exactly: per-field CBOR types, the fixed byte lengths a field
+// can assert in isolation (32-byte `supersedes`), the `v == 1` literal, and
+// closed-map strictness for `items[i]` / `merkle[i]` / `sigs[i]`. Every issue
+// is collected (the walk never stops at the first), and ANY issue forecloses
+// the domain pass. Cross-field rules, registry membership, URI shape,
+// non-empty-array rules, and integer ranges are domain checks so each emits
+// its precise canonical code.
+fn schema_issues(record_map: &[(CborValue, CborValue)]) -> Vec<ValidationIssue> {
+    let mut out: Vec<ValidationIssue> = Vec::new();
+
+    // `v == 1` literal.
+    match map_get(record_map, "v") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            vec![PathSegment::key("v")],
+            "missing required field 'v'".to_string(),
+        )),
+        Some(CborValue::Unsigned(1)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaInvalidLiteral,
+            vec![PathSegment::key("v")],
+            "v must be the literal 1".to_string(),
         )),
     }
 
-    if let Some(uris) = map_get(item_map, "uris") {
-        validate_item_uris(uris, issues);
+    if let Some(items_raw) = map_get(record_map, "items") {
+        match items_raw {
+            CborValue::Array(items) => {
+                for (i, entry) in items.iter().enumerate() {
+                    schema_item_issues(entry, i, &mut out);
+                }
+            }
+            _ => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("items")],
+                "items must be a CBOR array".to_string(),
+            )),
+        }
     }
 
-    if let Some(enc) = map_get(item_map, "enc") {
-        // Content-hash pre-check: an `enc`-bearing item's hashes MUST carry a
-        // content-hash entry. Fires before inner enc-shape validation so the
-        // more fundamental defect is reported first.
-        let has_content_hash = matches!(hashes_raw, Some(CborValue::Map(m))
-            if m.iter().any(|(k, _)| matches!(k, CborValue::Text(t)
-                if HASH_ALGS.iter().any(|(alg, _)| alg == t))));
-        // An enc-bearing item MUST commit to a content hash. `has_content_hash`
-        // is already false for the empty/absent map, so the predicate is simply
-        // its absence — the empty-map case emits ENC_REQUIRES_CONTENT_HASH too
-        // (alongside the SCHEMA_TYPE_MISMATCH the hashes-shape check already
-        // raised). When the precondition fails we skip the inner enc-shape walk:
-        // the missing content commitment is the more fundamental defect.
-        if !has_content_hash {
-            issues.push(issue(
-                ErrorCode::EncRequiresContentHash,
-                "item carries `enc` but `hashes` has no content-hash entry (sha2-256 or blake2b-256)"
-                    .to_string(),
+    if let Some(merkle_raw) = map_get(record_map, "merkle") {
+        match merkle_raw {
+            CborValue::Array(commits) => {
+                for (i, entry) in commits.iter().enumerate() {
+                    schema_merkle_issues(entry, i, &mut out);
+                }
+            }
+            _ => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("merkle")],
+                "merkle must be a CBOR array".to_string(),
+            )),
+        }
+    }
+
+    if let Some(supersedes) = map_get(record_map, "supersedes") {
+        match supersedes {
+            CborValue::Bytes(b) if b.len() == 32 => {}
+            CborValue::Bytes(b) => out.push(issue(
+                ErrorCode::SupersedesTxInvalidLength,
+                vec![PathSegment::key("supersedes")],
+                format!("supersedes length {} != 32", b.len()),
+            )),
+            _ => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("supersedes")],
+                "supersedes must be a CBOR byte string".to_string(),
+            )),
+        }
+    }
+
+    if let Some(sigs_raw) = map_get(record_map, "sigs") {
+        match sigs_raw {
+            CborValue::Array(entries) => {
+                for (i, entry) in entries.iter().enumerate() {
+                    schema_sig_issues(entry, i, &mut out);
+                }
+            }
+            _ => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("sigs")],
+                "sigs must be a CBOR array".to_string(),
+            )),
+        }
+    }
+
+    if let Some(crit_raw) = map_get(record_map, "crit") {
+        match crit_raw {
+            CborValue::Array(entries) => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if !matches!(entry, CborValue::Text(_)) {
+                        out.push(issue(
+                            ErrorCode::SchemaTypeMismatch,
+                            vec![PathSegment::key("crit"), PathSegment::Index(i)],
+                            "crit entry must be a text string".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                vec![PathSegment::key("crit")],
+                "crit must be a CBOR array of text strings".to_string(),
+            )),
+        }
+    }
+
+    out
+}
+
+const ITEM_KEYS: &[&str] = &["hashes", "uris", "enc"];
+
+fn schema_item_issues(entry: &CborValue, i: usize, out: &mut Vec<ValidationIssue>) {
+    let base = vec![PathSegment::key("items"), PathSegment::Index(i)];
+    // Non-text-key maps were foreclosed by the pre-guard, so a Map here is
+    // text-keyed.
+    let Some(item_map) = as_map(entry) else {
+        out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            base,
+            "items[] entry must be a CBOR map".to_string(),
+        ));
+        return;
+    };
+
+    match map_get(item_map, "hashes") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            with(&base, PathSegment::key("hashes")),
+            "item is missing required 'hashes'".to_string(),
+        )),
+        Some(CborValue::Map(pairs)) => {
+            for (alg, digest) in pairs {
+                let CborValue::Text(alg) = alg else {
+                    continue; // unreachable: hashes maps are text-keyed past the pre-guard
+                };
+                if !matches!(digest, CborValue::Bytes(_)) {
+                    out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(
+                            &with(&base, PathSegment::key("hashes")),
+                            PathSegment::key(alg.clone()),
+                        ),
+                        format!("hashes['{alg}'] digest must be a CBOR byte string"),
+                    ));
+                }
+            }
+        }
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(&base, PathSegment::key("hashes")),
+            "hashes must be a CBOR map".to_string(),
+        )),
+    }
+
+    if let Some(uris_raw) = map_get(item_map, "uris") {
+        schema_uris_issues(uris_raw, &with(&base, PathSegment::key("uris")), out);
+    }
+
+    // `enc` is held opaque at the item layer: the typed-vs-opaque dispatch in
+    // the domain pass narrows it.
+
+    for key in text_keys(item_map) {
+        if !ITEM_KEYS.contains(&key) {
+            out.push(issue(
+                ErrorCode::SchemaUnknownField,
+                with(&base, PathSegment::key(key)),
+                format!("unrecognized key '{key}' in items[] entry"),
             ));
-        } else {
-            validate_encryption(enc, issues);
         }
     }
 }
 
-fn validate_hash_map_entry(alg: &CborValue, digest: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let alg_str = match alg {
-        CborValue::Text(t) => t.as_str(),
-        _ => {
-            issues.push(issue(
-                ErrorCode::UnsupportedHashAlg,
-                "hash alg must be a text string".to_string(),
+fn schema_uris_issues(raw: &CborValue, base: &[PathSegment], out: &mut Vec<ValidationIssue>) {
+    match raw {
+        CborValue::Array(uris) => {
+            for (j, uri) in uris.iter().enumerate() {
+                if !matches!(uri, CborValue::Text(_)) {
+                    out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(base, PathSegment::Index(j)),
+                        "uris[] entry must be a single text string".to_string(),
+                    ));
+                }
+            }
+        }
+        _ => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            base.to_vec(),
+            "uris must be a CBOR array of text strings".to_string(),
+        )),
+    }
+}
+
+const MERKLE_KEYS: &[&str] = &["alg", "root", "leaf_count", "uris"];
+
+fn schema_merkle_issues(entry: &CborValue, i: usize, out: &mut Vec<ValidationIssue>) {
+    let base = vec![PathSegment::key("merkle"), PathSegment::Index(i)];
+    let Some(commit_map) = as_map(entry) else {
+        out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            base,
+            "merkle[] entry must be a CBOR map".to_string(),
+        ));
+        return;
+    };
+
+    match map_get(commit_map, "alg") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            with(&base, PathSegment::key("alg")),
+            "merkle entry is missing required 'alg'".to_string(),
+        )),
+        Some(CborValue::Text(_)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(&base, PathSegment::key("alg")),
+            "merkle entry 'alg' must be a text string".to_string(),
+        )),
+    }
+
+    match map_get(commit_map, "root") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            with(&base, PathSegment::key("root")),
+            "merkle entry is missing required 'root'".to_string(),
+        )),
+        Some(CborValue::Bytes(_)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(&base, PathSegment::key("root")),
+            "merkle entry 'root' must be a CBOR byte string".to_string(),
+        )),
+    }
+
+    // `leaf_count` admits any CBOR integer at the schema layer; the domain pass
+    // enforces the unsigned type and the `1 .. 2^32 - 1` range with their
+    // precise codes. A missing or non-integer value is the schema-layer type
+    // violation.
+    match map_get(commit_map, "leaf_count") {
+        Some(CborValue::Unsigned(_) | CborValue::Negative(_)) => {}
+        _ => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(&base, PathSegment::key("leaf_count")),
+            "merkle entry 'leaf_count' must be a CBOR integer".to_string(),
+        )),
+    }
+
+    if let Some(uris_raw) = map_get(commit_map, "uris") {
+        schema_uris_issues(uris_raw, &with(&base, PathSegment::key("uris")), out);
+    }
+
+    for key in text_keys(commit_map) {
+        if !MERKLE_KEYS.contains(&key) {
+            out.push(issue(
+                ErrorCode::SchemaUnknownField,
+                with(&base, PathSegment::key(key)),
+                format!("unrecognized key '{key}' in merkle[] entry"),
             ));
-            return;
+        }
+    }
+}
+
+const SIG_ENTRY_KEYS: &[&str] = &["cose_sign1", "cose_key"];
+
+fn schema_sig_issues(entry: &CborValue, i: usize, out: &mut Vec<ValidationIssue>) {
+    let base = vec![PathSegment::key("sigs"), PathSegment::Index(i)];
+    let Some(entry_map) = as_map(entry) else {
+        out.push(issue(
+            ErrorCode::SigEntryInvalidShape,
+            base,
+            "sigs[] entry must be the closed map {cose_sign1, ? cose_key}".to_string(),
+        ));
+        return;
+    };
+
+    match map_get(entry_map, "cose_sign1") {
+        None => out.push(issue(
+            ErrorCode::SigEntryInvalidShape,
+            with(&base, PathSegment::key("cose_sign1")),
+            "sigs[] entry is missing required 'cose_sign1'".to_string(),
+        )),
+        Some(CborValue::Bytes(_)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SigEntryInvalidShape,
+            with(&base, PathSegment::key("cose_sign1")),
+            "sigs[i].cose_sign1 must be a single CBOR byte string".to_string(),
+        )),
+    }
+
+    if let Some(cose_key) = map_get(entry_map, "cose_key") {
+        if !matches!(cose_key, CborValue::Bytes(_)) {
+            out.push(issue(
+                ErrorCode::SigEntryInvalidShape,
+                with(&base, PathSegment::key("cose_key")),
+                "sigs[i].cose_key must be a single CBOR byte string".to_string(),
+            ));
+        }
+    }
+
+    for key in text_keys(entry_map) {
+        if !SIG_ENTRY_KEYS.contains(&key) {
+            out.push(issue(
+                ErrorCode::SigEntryInvalidShape,
+                with(&base, PathSegment::key(key)),
+                format!("sigs[] entry carries unrecognized key '{key}'"),
+            ));
+        }
+    }
+}
+
+fn with(base: &[PathSegment], seg: PathSegment) -> Vec<PathSegment> {
+    let mut path = base.to_vec();
+    path.push(seg);
+    path
+}
+
+// ===========================================================================
+// Step 3 — domain checks
+// ===========================================================================
+
+// Content-commitment rule: a record MUST carry at least one of `items[]` or
+// `merkle[]` non-empty (SCHEMA_EMPTY_RECORD when both are empty or absent).
+// When exactly one of them is present-but-empty beside a non-empty sibling,
+// the empty array itself violates its `1*` cardinality.
+fn check_content_commitment_presence(
+    record_map: &[(CborValue, CborValue)],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let arr_len = |key: &str| -> Option<usize> {
+        match map_get(record_map, key) {
+            Some(CborValue::Array(a)) => Some(a.len()),
+            _ => None,
         }
     };
-    let expected = match registry_lookup(HASH_ALGS, alg_str) {
-        Some(len) => len,
-        None => {
-            issues.push(issue(
-                ErrorCode::UnsupportedHashAlg,
-                format!("unknown hash alg: {alg_str}"),
-            ));
-            return;
-        }
-    };
-    let digest_bytes = match as_bytes(digest) {
-        Some(b) => b,
-        None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                format!("hashes[{alg_str}] value must be CBOR bytes"),
-            ));
-            return;
-        }
-    };
-    if digest_bytes.len() != expected {
+    let items_len = arr_len("items");
+    let merkle_len = arr_len("merkle");
+    if items_len.unwrap_or(0) == 0 && merkle_len.unwrap_or(0) == 0 {
         issues.push(issue(
-            ErrorCode::HashDigestLengthMismatch,
-            format!(
-                "hashes[{alg_str}] digest length {} != {expected}",
-                digest_bytes.len()
-            ),
+            ErrorCode::SchemaEmptyRecord,
+            Vec::new(),
+            "record must carry at least one of items[] or merkle[] non-empty".to_string(),
+        ));
+        return;
+    }
+    if items_len == Some(0) {
+        issues.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            vec![PathSegment::key("items")],
+            "items[] must be non-empty when present".to_string(),
+        ));
+    }
+    if merkle_len == Some(0) {
+        issues.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            vec![PathSegment::key("merkle")],
+            "merkle[] must be non-empty when present".to_string(),
         ));
     }
 }
 
-// --- URIs ---
-
-fn validate_item_uris(raw: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    match raw {
-        CborValue::Array(uris) if !uris.is_empty() => {
-            for chunks in uris {
-                validate_one_uri(chunks, issues);
-            }
-        }
-        _ => issues.push(issue(
+// `crit[]` shape rules plus the per-entry critical-extension support check.
+fn check_crit(
+    record_map: &[(CborValue, CborValue)],
+    options: &ValidatorOptions,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(CborValue::Array(crit)) = map_get(record_map, "crit") else {
+        return;
+    };
+    // `crit` has `1*` cardinality: an empty array is a malformed shape.
+    if crit.is_empty() {
+        issues.push(issue(
             ErrorCode::SchemaTypeMismatch,
-            "uris must be a non-empty array of chunked-tstr-arrays".to_string(),
-        )),
+            vec![PathSegment::key("crit")],
+            "crit[] must carry at least one entry when present".to_string(),
+        ));
+        return;
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (i, entry) in crit.iter().enumerate() {
+        let Some(name) = as_text(entry) else {
+            continue; // unreachable: the schema pass pinned crit entries to text
+        };
+        let path = vec![PathSegment::key("crit"), PathSegment::Index(i)];
+        let reason = if TOP_LEVEL_BASE_KEYS.contains(&name) {
+            Some(format!(
+                "'{name}' is a base key and MUST NOT appear in crit[]"
+            ))
+        } else if !is_extension_key(name) {
+            Some(format!(
+                "'{name}' does not match the extension-key form (^x-… or ^[a-z]+-…, no control characters)"
+            ))
+        } else if !map_has(record_map, name) {
+            Some(format!(
+                "'{name}' is named in crit but absent from the record map"
+            ))
+        } else if seen.contains(name) {
+            Some(format!("'{name}' appears more than once in crit[]"))
+        } else {
+            None
+        };
+        seen.insert(name);
+        if let Some(reason) = reason {
+            issues.push(issue(ErrorCode::CritShapeInvalid, path, reason));
+            continue;
+        }
+        // Shape-valid entry: accepted iff this validator implements the named
+        // extension. The default supported set is empty, so a default-configured
+        // validator fails every `crit`-bearing record — by design.
+        if !options.supported_critical_extensions.contains(name) {
+            issues.push(issue(
+                ErrorCode::ExtensionUnsupportedCritical,
+                path,
+                format!("crit lists extension '{name}' that this validator does not implement"),
+            ));
+        }
     }
 }
 
-fn validate_one_uri(chunks: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let chunk_arr = match chunks {
-        CborValue::Array(c) if !c.is_empty() => c,
-        _ => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "each URI must be a non-empty array of tstr chunks (<=64B each)".to_string(),
-            ));
-            return;
-        }
+fn check_item(
+    item: &CborValue,
+    idx: usize,
+    options: &ValidatorOptions,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(item_map) = as_map(item) else {
+        return; // unreachable: the schema pass rejected non-map entries
     };
-    let mut typed: Vec<String> = Vec::with_capacity(chunk_arr.len());
-    let mut type_ok = true;
-    for chunk in chunk_arr {
-        match chunk {
-            CborValue::Text(s) => {
-                let byte_len = s.len();
-                if !(1..=64).contains(&byte_len) {
-                    issues.push(issue(
-                        ErrorCode::ChunkTooLarge,
-                        format!("chunk length {byte_len} not in [1, 64]"),
-                    ));
-                    type_ok = false;
-                } else {
-                    typed.push(s.clone());
-                }
-            }
-            _ => {
-                issues.push(issue(
-                    ErrorCode::SchemaTypeMismatch,
-                    "chunked-tstr element must be a text string".to_string(),
-                ));
-                type_ok = false;
-            }
-        }
+    check_item_hashes(item_map, idx, issues);
+    if let Some(uris_raw) = map_get(item_map, "uris") {
+        check_uris(
+            uris_raw,
+            &[
+                PathSegment::key("items"),
+                PathSegment::Index(idx),
+                PathSegment::key("uris"),
+            ],
+            issues,
+        );
     }
-    if !type_ok {
+    if let Some(enc_raw) = map_get(item_map, "enc") {
+        check_item_enc(item_map, enc_raw, idx, options, issues);
+    }
+}
+
+// Hash-map: non-empty, registry membership, per-algorithm digest length.
+fn check_item_hashes(
+    item_map: &[(CborValue, CborValue)],
+    idx: usize,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let base = vec![
+        PathSegment::key("items"),
+        PathSegment::Index(idx),
+        PathSegment::key("hashes"),
+    ];
+    let Some(CborValue::Map(entries)) = map_get(item_map, "hashes") else {
+        return; // unreachable: the schema pass pinned hashes to a map
+    };
+    if entries.is_empty() {
+        issues.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            base,
+            "hashes must be a non-empty CBOR map of <alg-id> -> <digest>".to_string(),
+        ));
         return;
     }
-    let uri = match reconstruct_chunked_uri(&typed) {
-        ReconstructUriResult::Ok(uri) => uri,
-        ReconstructUriResult::Invalid => {
-            issues.push(issue(
-                ErrorCode::InvalidUri,
-                "URI chunk reconstruction failed".to_string(),
-            ));
-            return;
+    for (alg_key, digest) in entries {
+        let (Some(alg), Some(digest)) = (as_text(alg_key), as_bytes(digest)) else {
+            continue; // unreachable past the pre-guard + schema pass
+        };
+        let path = with(&base, PathSegment::key(alg));
+        match registry_lookup(HASH_ALG_LENGTHS, alg) {
+            None => issues.push(issue(
+                ErrorCode::UnsupportedHashAlg,
+                path,
+                format!("unknown hash alg: {alg}"),
+            )),
+            Some(expected) => {
+                if digest.len() != expected {
+                    issues.push(issue(
+                        ErrorCode::HashDigestLengthMismatch,
+                        path,
+                        format!(
+                            "hashes['{alg}'] digest length {} != {expected}",
+                            digest.len()
+                        ),
+                    ));
+                }
+            }
         }
+    }
+}
+
+// URI shape: each entry is one absolute URI in a single text string.
+fn check_uris(raw: &CborValue, base: &[PathSegment], issues: &mut Vec<ValidationIssue>) {
+    let CborValue::Array(uris) = raw else {
+        return; // unreachable: the schema pass pinned uris to an array
     };
+    if uris.is_empty() {
+        issues.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            base.to_vec(),
+            "uris[] must be non-empty when present".to_string(),
+        ));
+        return;
+    }
+    for (j, uri) in uris.iter().enumerate() {
+        if let Some(uri) = as_text(uri) {
+            check_one_uri(uri, with(base, PathSegment::Index(j)), issues);
+        }
+    }
+}
+
+fn check_one_uri(uri: &str, path: Vec<PathSegment>, issues: &mut Vec<ValidationIssue>) {
+    // Absolute URI, no fragment, scheme in `{ar://, ipfs://}`.
     if uri.contains('#') {
         issues.push(issue(
             ErrorCode::InvalidUri,
+            path,
             "URI contains a fragment identifier ('#'), which is forbidden".to_string(),
         ));
         return;
     }
-    if !is_absolute_uri(&uri) {
+    let Some(sep_idx) = uri.find("://") else {
         issues.push(issue(
             ErrorCode::InvalidUri,
+            path,
+            "URI is not absolute (missing scheme://hierarchical-part)".to_string(),
+        ));
+        return;
+    };
+    if sep_idx == 0 || !is_uri_scheme(&uri[..sep_idx]) {
+        issues.push(issue(
+            ErrorCode::InvalidUri,
+            path,
             "URI is not absolute (missing scheme://hierarchical-part)".to_string(),
         ));
         return;
     }
-    // Permitted-scheme gate, applied case-INSENSITIVELY (`^(ar|ipfs)://`): any
-    // scheme outside {ar, ipfs} — in any casing — is rejected here.
-    if !is_permitted_scheme(&uri) {
-        issues.push(issue(
-            ErrorCode::InvalidUri,
-            "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}".to_string(),
-        ));
-        return;
-    }
-    // Body dispatch. RFC 3986 §3.1 makes the scheme case-insensitive, so fold
-    // the scheme to lowercase before dispatching — `AR://`/`IPFS://` resolve to
-    // the same fetch path as `ar://`/`ipfs://` and their bodies ARE shape-checked.
-    // Only the scheme is folded: the txid and CID bodies keep their exact case
-    // (they are case-sensitive identifiers).
-    let scheme_folded = fold_scheme_lowercase(&uri);
-    if scheme_folded.starts_with("ar://") {
-        if !is_arweave_txid(&scheme_folded) {
-            issues.push(issue(
-                ErrorCode::InvalidUri,
-                "ar:// URI does not match `^ar://[A-Za-z0-9_-]{43}$` \
-                 (43-char base64url txid, no path/query/fragment)"
-                    .to_string(),
-            ));
-        }
-    } else if let Some(rest) = scheme_folded.strip_prefix("ipfs://") {
-        let cid = rest.split('/').next().unwrap_or("");
-        if !is_valid_cid(cid) {
-            issues.push(issue(
-                ErrorCode::InvalidUri,
-                "ipfs:// URI is not a valid CID under the Label 309 profile".to_string(),
-            ));
-        }
-    }
-}
-
-/// Lowercase only the scheme component of an absolute URI (everything up to and
-/// including the first `://`), leaving the authority/path bytes untouched. The
-/// scheme is case-insensitive per RFC 3986 §3.1; the body is not.
-fn fold_scheme_lowercase(uri: &str) -> String {
-    match uri.find("://") {
-        Some(i) => {
-            let end = i + "://".len();
-            let mut out = uri[..end].to_ascii_lowercase();
-            out.push_str(&uri[end..]);
-            out
-        }
-        None => uri.to_string(),
-    }
-}
-
-/// `^(ar|ipfs)://` (case-insensitive) — the closed v1 fetch-scheme gate.
-fn is_permitted_scheme(uri: &str) -> bool {
-    let lower = uri.to_ascii_lowercase();
-    lower.starts_with("ar://") || lower.starts_with("ipfs://")
-}
-
-/// `^[a-z][a-z0-9+.-]*://` (case-insensitive).
-fn is_absolute_uri(uri: &str) -> bool {
-    let scheme_end = match uri.find("://") {
-        Some(i) => i,
-        None => return false,
-    };
-    if scheme_end == 0 {
-        return false;
-    }
-    let scheme = &uri.as_bytes()[..scheme_end];
-    if !scheme[0].is_ascii_alphabetic() {
-        return false;
-    }
-    scheme
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-')
-}
-
-/// `^ar://[A-Za-z0-9_-]{43}$`.
-fn is_arweave_txid(uri: &str) -> bool {
-    let rest = match uri.strip_prefix("ar://") {
-        Some(r) => r,
-        None => return false,
-    };
-    rest.len() == 43
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-// --- Encryption envelope ---
-
-fn validate_encryption(enc: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let enc_map = match as_map(enc) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "enc must be a map".to_string(),
-            ));
-            return;
-        }
-    };
-    check_unknown_keys(enc_map, REGISTERED_ENC_KEYS, "enc", issues);
-
-    // `scheme` MUST be the unsigned integer 1 (floats already rejected at decode).
-    if !matches!(map_get(enc_map, "scheme"), Some(CborValue::Unsigned(1))) {
-        issues.push(issue(
-            ErrorCode::UnsupportedEnvelopeScheme,
-            "enc.scheme must be the unsigned integer 1".to_string(),
-        ));
-    }
-
-    let aead = match map_get(enc_map, "aead").and_then(as_text) {
-        Some(a) => a,
-        None => {
-            issues.push(issue(
-                ErrorCode::UnsupportedAeadAlg,
-                "unknown aead alg".to_string(),
-            ));
-            return;
-        }
-    };
-    if is_unauthenticated_cipher(aead) {
-        issues.push(issue(
-            ErrorCode::UnauthenticatedCipherForbidden,
-            format!("{aead} is an unauthenticated cipher"),
-        ));
-        return;
-    }
-    let nonce_len = match registry_lookup(AEAD_NONCE_LENGTHS, aead) {
-        Some(len) => len,
-        None => {
-            issues.push(issue(
-                ErrorCode::UnsupportedAeadAlg,
-                format!("unknown aead alg: {aead}"),
-            ));
-            return;
-        }
-    };
-
-    // KEM resolution (only a registered KEM drives the slot-shape pass).
-    let has_kem = map_has(enc_map, "kem");
-    let mut kem_resolved: Option<&str> = None;
-    if has_kem {
-        match map_get(enc_map, "kem").and_then(as_text) {
-            Some(kem) if kem_slot_descriptor(kem).is_some() => kem_resolved = Some(kem),
-            _ => issues.push(issue(
-                ErrorCode::UnsupportedKemAlg,
-                "unknown kem alg".to_string(),
-            )),
-        }
-    }
-
-    // Nonce.
-    match map_get(enc_map, "nonce") {
-        Some(CborValue::Bytes(nonce)) => {
-            if nonce.len() != nonce_len {
+    // RFC 3986 §3.1: the scheme is case-insensitive, so case-fold the SCHEME
+    // ONLY, then ALWAYS validate the body. The body is matched verbatim — a
+    // base64url Arweave txid and a base58btc CID are case-significant.
+    let scheme = uri[..sep_idx].to_ascii_lowercase();
+    let rest = &uri[sep_idx + "://".len()..];
+    match scheme.as_str() {
+        "ar" => {
+            if !(rest.len() == 43
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+            {
                 issues.push(issue(
-                    ErrorCode::NonceLengthMismatch,
-                    format!("nonce length {} != {nonce_len} for {aead}", nonce.len()),
+                    ErrorCode::InvalidUri,
+                    path,
+                    "ar:// URI does not match `^ar://[A-Za-z0-9_-]{43}$` \
+                     (43-char base64url txid, no path/query/fragment)"
+                        .to_string(),
+                ));
+            }
+        }
+        "ipfs" => {
+            // Full offline CID parse (not a prefix heuristic).
+            let cid = rest.split('/').next().unwrap_or("");
+            if !validate_cid_profile(cid) {
+                issues.push(issue(
+                    ErrorCode::InvalidUri,
+                    path,
+                    "ipfs:// URI is not a valid CID under the Label 309 profile".to_string(),
                 ));
             }
         }
         _ => issues.push(issue(
+            ErrorCode::InvalidUri,
+            path,
+            "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}".to_string(),
+        )),
+    }
+}
+
+/// `^[a-z][a-z0-9+.-]*$`, case-insensitive (RFC 3986 §3.1 scheme grammar).
+fn is_uri_scheme(scheme: &str) -> bool {
+    let bytes = scheme.as_bytes();
+    match bytes.first() {
+        Some(b) if b.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-')
+}
+
+// ===========================================================================
+// Encryption envelope — the typed-vs-opaque union
+// ===========================================================================
+//
+// `enc = enc-scheme-1 / enc-opaque`. The disposition is decided by identifier
+// support, never by shape success:
+//
+//   - When `scheme`, `kem`, and `aead` are ALL supported identifiers, the
+//     envelope is held to the full scheme-1 shape and key-path rules; an
+//     envelope that fails them is rejected with its typed code, never
+//     reclassified as opaque.
+//   - When any of the three names an identifier this implementation does not
+//     support, the envelope becomes OPAQUE: no shape, length, or key-path rule
+//     is applied against an unknown identifier; the item is tagged
+//     ENC_UNSUPPORTED (info in the public reading; error co-firing with the
+//     identifier-specific UNSUPPORTED_* code in the recipient role / strict
+//     sealed-crypto mode).
+//   - Carve-out: an `aead` naming a forbidden unauthenticated cipher family is
+//     rejected UNAUTHENTICATED_CIPHER_FORBIDDEN in every role — a recognised
+//     hazard, not an unknown identifier.
+//
+// The content-hash binding (ENC_REQUIRES_CONTENT_HASH) inspects the item's
+// `hashes` map, not the envelope, so it applies even under an opaque envelope.
+
+fn check_item_enc(
+    item_map: &[(CborValue, CborValue)],
+    raw_enc: &CborValue,
+    idx: usize,
+    options: &ValidatorOptions,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let enc_path = vec![
+        PathSegment::key("items"),
+        PathSegment::Index(idx),
+        PathSegment::key("enc"),
+    ];
+
+    // Content-hash binding: an `enc`-bearing item MUST commit to at least one
+    // REGISTERED content hash — the ciphertext is otherwise bound to no
+    // plaintext digest. A presence check, not a non-empty check: `{md5: …}`
+    // fails it (and MAY co-fire with UNSUPPORTED_HASH_ALG on the same item).
+    let has_content_hash = matches!(map_get(item_map, "hashes"), Some(CborValue::Map(pairs))
+        if pairs.iter().any(|(k, _)| matches!(k, CborValue::Text(alg)
+            if registry_lookup(HASH_ALG_LENGTHS, alg).is_some())));
+    if !has_content_hash {
+        issues.push(issue(
+            ErrorCode::EncRequiresContentHash,
+            enc_path.clone(),
+            "item carries `enc` but `hashes` has no registered content-hash entry \
+             (sha2-256 or blake2b-256)"
+                .to_string(),
+        ));
+    }
+
+    // The pre-guard has already rejected an `enc` map carrying non-text keys,
+    // so a well-typed envelope arrives here as a text-keyed map.
+    let Some(enc_map) = as_map(raw_enc) else {
+        issues.push(issue(
             ErrorCode::SchemaTypeMismatch,
-            "nonce must be bytes".to_string(),
+            enc_path,
+            "enc must be a CBOR map".to_string(),
+        ));
+        return;
+    };
+
+    // Decoded-envelope byte resource bound — a generic decode limit that
+    // applies in every reading, opaque included. Canonical decode → canonical
+    // encode is byte-identical, so re-encoding the decoded envelope measures
+    // exactly the wire bytes of the `enc` subtree.
+    if let Ok(envelope_bytes) = encode_canonical_cbor(raw_enc) {
+        if envelope_bytes.len() > options.max_enc_envelope_bytes {
+            issues.push(issue(
+                ErrorCode::EncEnvelopeTooLarge,
+                enc_path.clone(),
+                format!(
+                    "decoded envelope is {} bytes; the resource bound is {}",
+                    envelope_bytes.len(),
+                    options.max_enc_envelope_bytes
+                ),
+            ));
+        }
+    }
+
+    // `scheme` is structurally required in BOTH readings, as a CBOR unsigned
+    // integer (the opaque grammar admits any uint; the typed grammar pins 1).
+    let scheme = match map_get(enc_map, "scheme") {
+        None => {
+            issues.push(issue(
+                ErrorCode::SchemaMissingRequired,
+                with(&enc_path, PathSegment::key("scheme")),
+                "enc.scheme is required".to_string(),
+            ));
+            return;
+        }
+        Some(CborValue::Unsigned(n)) => *n,
+        Some(_) => {
+            issues.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                with(&enc_path, PathSegment::key("scheme")),
+                "enc.scheme must be a CBOR unsigned integer".to_string(),
+            ));
+            return;
+        }
+    };
+
+    // Forbidden-cipher carve-out: rejected in every role, never opaque.
+    let aead = map_get(enc_map, "aead");
+    if let Some(CborValue::Text(aead)) = aead {
+        if is_unauthenticated_cipher(aead) {
+            issues.push(issue(
+                ErrorCode::UnauthenticatedCipherForbidden,
+                with(&enc_path, PathSegment::key("aead")),
+                format!(
+                    "'{aead}' is an unauthenticated cipher; \
+                     Label 309 mandates an authenticated (AEAD) cipher"
+                ),
+            ));
+            return;
+        }
+    }
+
+    // Unknown-envelope rule: collect every identifier outside the implemented
+    // set. A non-text `kem` / `aead` is not an identifier at all — it is a type
+    // violation of whichever reading applies, handled by the typed pass below.
+    let kem = map_get(enc_map, "kem");
+    let mut unsupported: Vec<(&'static str, ErrorCode, String)> = Vec::new();
+    if scheme != 1 {
+        unsupported.push((
+            "scheme",
+            ErrorCode::UnsupportedEnvelopeScheme,
+            scheme.to_string(),
+        ));
+    }
+    if let Some(CborValue::Text(kem)) = kem {
+        if kem_slot_descriptor(kem).is_none() {
+            unsupported.push(("kem", ErrorCode::UnsupportedKemAlg, kem.clone()));
+        }
+    }
+    if let Some(CborValue::Text(aead)) = aead {
+        if registry_lookup(AEAD_NONCE_LENGTHS, aead).is_none() {
+            unsupported.push(("aead", ErrorCode::UnsupportedAeadAlg, aead.clone()));
+        }
+    }
+    if !unsupported.is_empty() {
+        // Degrade to opaque: the envelope is bounded metadata only. No shape,
+        // length, nonce, slot, or key-path rule may be applied against an
+        // unknown identifier.
+        let named = unsupported
+            .iter()
+            .map(|(field, _, id)| format!("{field}={id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "envelope uses identifiers this implementation does not support ({named}); \
+             the envelope is opaque and only the content-hash claim is validated"
+        );
+        match options.role {
+            ValidatorRole::RecipientOrStrict => {
+                issues.push(ValidationIssue {
+                    path: enc_path.clone(),
+                    code: ErrorCode::EncUnsupported,
+                    severity: Severity::Error,
+                    message,
+                });
+                for (field, code, id) in unsupported {
+                    issues.push(issue(
+                        code,
+                        with(&enc_path, PathSegment::key(field)),
+                        format!("enc.{field} '{id}' is not supported"),
+                    ));
+                }
+            }
+            ValidatorRole::Public => issues.push(ValidationIssue {
+                path: enc_path.clone(),
+                code: ErrorCode::EncUnsupported,
+                severity: Severity::Info,
+                message,
+            }),
+        }
+        return;
+    }
+
+    // Fully supported identifiers → the typed scheme-1 pass is mandatory.
+    // Non-text-key maps inside the typed envelope (a slot, the passphrase
+    // block, its params) are rejected first, at the containing map — the same
+    // pre-guard rule the record level applies, scoped here because only the
+    // typed reading constrains the envelope interior.
+    let internal = enc_internal_non_text_key_issues(enc_map, &enc_path);
+    if !internal.is_empty() {
+        issues.extend(internal);
+        return;
+    }
+    let parse = enc_scheme1_schema_issues(enc_map, &enc_path);
+    if !parse.is_empty() {
+        issues.extend(parse);
+        return;
+    }
+    check_scheme1_envelope(enc_map, &enc_path, options, issues);
+}
+
+// Non-text-key maps at the typed envelope's interior positions: each slot, the
+// passphrase block, and its `params` map.
+fn enc_internal_non_text_key_issues(
+    enc_map: &[(CborValue, CborValue)],
+    enc_path: &[PathSegment],
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let flag = |issues: &mut Vec<ValidationIssue>, path: Vec<PathSegment>| {
+        issues.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            path,
+            "CBOR map carries a non-text key where a text-keyed map is required".to_string(),
+        ));
+    };
+    if let Some(CborValue::Array(slots)) = map_get(enc_map, "slots") {
+        for (j, slot) in slots.iter().enumerate() {
+            if is_non_text_key_map(slot) {
+                flag(
+                    &mut issues,
+                    with(
+                        &with(enc_path, PathSegment::key("slots")),
+                        PathSegment::Index(j),
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(passphrase) = map_get(enc_map, "passphrase") {
+        if is_non_text_key_map(passphrase) {
+            flag(&mut issues, with(enc_path, PathSegment::key("passphrase")));
+        } else if let Some(pp_map) = as_map(passphrase) {
+            if map_get(pp_map, "params").is_some_and(is_non_text_key_map) {
+                flag(
+                    &mut issues,
+                    with(
+                        &with(enc_path, PathSegment::key("passphrase")),
+                        PathSegment::key("params"),
+                    ),
+                );
+            }
+        }
+    }
+    issues
+}
+
+const ENC_KEYS: &[&str] = &[
+    "scheme",
+    "aead",
+    "kem",
+    "nonce",
+    "slots",
+    "slots_mac",
+    "passphrase",
+];
+const PASSPHRASE_KEYS: &[&str] = &["alg", "salt", "params"];
+
+// The closed scheme-1 envelope shape, applied only when `scheme` / `kem` /
+// `aead` are all supported identifiers. Every issue is collected; any issue
+// forecloses the key-path / length / registry domain rules below.
+fn enc_scheme1_schema_issues(
+    enc_map: &[(CborValue, CborValue)],
+    enc_path: &[PathSegment],
+) -> Vec<ValidationIssue> {
+    let mut out = Vec::new();
+
+    // `scheme` is the literal 1 — guaranteed by the dispatch.
+
+    match map_get(enc_map, "aead") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            with(enc_path, PathSegment::key("aead")),
+            "enc.aead is required".to_string(),
+        )),
+        Some(CborValue::Text(_)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(enc_path, PathSegment::key("aead")),
+            "enc.aead must be a text string".to_string(),
         )),
     }
 
-    let has_slots = map_has(enc_map, "slots");
-    let has_slots_mac = map_has(enc_map, "slots_mac");
-    let has_passphrase = map_has(enc_map, "passphrase");
+    if let Some(kem) = map_get(enc_map, "kem") {
+        if !matches!(kem, CborValue::Text(_)) {
+            out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                with(enc_path, PathSegment::key("kem")),
+                "enc.kem must be a text string".to_string(),
+            ));
+        }
+    }
 
-    // Slots.
-    if has_slots {
-        match map_get(enc_map, "slots") {
-            Some(CborValue::Array(slots)) => {
-                if slots.is_empty() {
-                    issues.push(issue(
-                        ErrorCode::EncSlotsEmpty,
-                        "slots must be a non-empty array".to_string(),
-                    ));
-                } else if slots.len() > MAX_SLOTS {
-                    // Slot-count resource bound — reject an over-large slot
-                    // array before walking every slot. This is the slot-count
-                    // half of the partitioning-oracle resource guard; the unwrap
-                    // layer trips the identical threshold first, so the two
-                    // layers agree. Skip the per-slot, duplicate, and byte-size
-                    // passes — the array is rejected outright.
-                    issues.push(issue(
-                        ErrorCode::EncSlotsTooMany,
-                        format!("slots length {} exceeds MAX_SLOTS={MAX_SLOTS}", slots.len()),
-                    ));
-                } else if let Some(kem) = kem_resolved {
-                    let descriptor = kem_slot_descriptor(kem);
-                    // Per-slot KEK uniqueness: the zero-nonce per-slot wrap is
-                    // safe only because each slot draws fresh KEM randomness, so
-                    // two slots sharing the same encapsulation material derive
-                    // the same KEK and repeat a (KEK, zero-nonce) pair. The
-                    // material that fixes the KEK is the `epk` (x25519) or the
-                    // reassembled `kem_ct` (hybrid); a repeat of either across
-                    // slots is rejected here, before any KEM/AEAD primitive — the
-                    // same check the unwrap layer runs.
-                    let mut seen_kem_material: std::collections::HashSet<Vec<u8>> =
-                        std::collections::HashSet::new();
-                    for slot in slots {
-                        validate_slot(slot, kem, issues);
-                        if let Some(material) = slot_kem_material(slot, kem) {
-                            if !seen_kem_material.insert(material) {
-                                issues.push(issue(
-                                    ErrorCode::EncSlotsDuplicateKemMaterial,
-                                    "slot encapsulation material duplicates an earlier slot \
-                                     — per-slot KEK uniqueness is violated"
-                                        .to_string(),
+    match map_get(enc_map, "nonce") {
+        None => out.push(issue(
+            ErrorCode::SchemaMissingRequired,
+            with(enc_path, PathSegment::key("nonce")),
+            "enc.nonce is required".to_string(),
+        )),
+        Some(CborValue::Bytes(_)) => {}
+        Some(_) => out.push(issue(
+            ErrorCode::SchemaTypeMismatch,
+            with(enc_path, PathSegment::key("nonce")),
+            "enc.nonce must be a CBOR byte string".to_string(),
+        )),
+    }
+
+    if let Some(slots_raw) = map_get(enc_map, "slots") {
+        match slots_raw {
+            CborValue::Array(slots) => {
+                let slots_base = with(enc_path, PathSegment::key("slots"));
+                for (j, slot) in slots.iter().enumerate() {
+                    let slot_path = with(&slots_base, PathSegment::Index(j));
+                    let Some(slot_map) = as_map(slot) else {
+                        out.push(issue(
+                            ErrorCode::EncSlotInvalidShape,
+                            slot_path,
+                            "recipient slot must be a CBOR map".to_string(),
+                        ));
+                        continue;
+                    };
+                    // The slot shape here is deliberately PERMISSIVE: which
+                    // ciphertext-bearing field is required depends on the
+                    // envelope-level `kem`, so the KEM-driven domain gate emits
+                    // the precise codes. Only per-field CBOR types are pinned.
+                    for field in SLOT_KEY_UNIVERSE {
+                        if let Some(value) = map_get(slot_map, field) {
+                            if !matches!(value, CborValue::Bytes(_)) {
+                                out.push(issue(
+                                    ErrorCode::EncSlotInvalidShape,
+                                    with(&slot_path, PathSegment::key(*field)),
+                                    format!("slot.{field} must be a CBOR byte string"),
                                 ));
                             }
                         }
                     }
-
-                    // Decoded-envelope byte backstop. Every per-slot field is
-                    // fixed-length (the descriptor pins them; a wrong length
-                    // already emitted its own code), so the decoded envelope's
-                    // aggregate size is determined by the slot count: nonce +
-                    // slots_mac + count * (ct-field + wrap). This is the
-                    // identical measure the unwrap layer computes, so the two
-                    // layers trip ENC_ENVELOPE_TOO_LARGE on the same envelopes. A
-                    // tighter cap than MAX_SLOTS for honest records.
-                    if let Some(d) = descriptor {
-                        let per_slot_bytes = d.field_length + d.wrap_length;
-                        let decoded_envelope_bytes =
-                            NONCE_LENGTH + SLOTS_MAC_LENGTH + slots.len() * per_slot_bytes;
-                        if decoded_envelope_bytes > MAX_DECODED_ENVELOPE_BYTES {
-                            issues.push(issue(
-                                ErrorCode::EncEnvelopeTooLarge,
-                                format!(
-                                    "decoded envelope size {decoded_envelope_bytes} exceeds \
-                                     MAX_DECODED_ENVELOPE_BYTES={MAX_DECODED_ENVELOPE_BYTES}"
-                                ),
-                            ));
-                        }
-                    }
                 }
             }
-            _ => issues.push(issue(
+            _ => out.push(issue(
                 ErrorCode::SchemaTypeMismatch,
-                "slots must be an array".to_string(),
+                with(enc_path, PathSegment::key("slots")),
+                "enc.slots must be a CBOR array".to_string(),
             )),
         }
     }
 
-    // slots_mac.
-    if has_slots_mac {
-        match map_get(enc_map, "slots_mac") {
-            Some(CborValue::Bytes(mac)) => {
+    if let Some(slots_mac) = map_get(enc_map, "slots_mac") {
+        match slots_mac {
+            CborValue::Bytes(mac) => {
                 if mac.len() != 32 {
-                    issues.push(issue(
+                    out.push(issue(
                         ErrorCode::EncSlotsMacInvalidLength,
+                        with(enc_path, PathSegment::key("slots_mac")),
                         format!("slots_mac length {} != 32", mac.len()),
                     ));
                 }
             }
-            _ => issues.push(issue(
+            _ => out.push(issue(
                 ErrorCode::SchemaTypeMismatch,
-                "slots_mac must be bytes".to_string(),
+                with(enc_path, PathSegment::key("slots_mac")),
+                "enc.slots_mac must be a CBOR byte string".to_string(),
             )),
         }
     }
 
-    // Key-path branching.
-    if has_slots && has_passphrase {
+    if let Some(passphrase) = map_get(enc_map, "passphrase") {
+        let pp_path = with(enc_path, PathSegment::key("passphrase"));
+        match as_map(passphrase) {
+            None => out.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                pp_path,
+                "enc.passphrase must be a CBOR map".to_string(),
+            )),
+            Some(pp_map) => {
+                match map_get(pp_map, "alg") {
+                    None => out.push(issue(
+                        ErrorCode::SchemaMissingRequired,
+                        with(&pp_path, PathSegment::key("alg")),
+                        "passphrase.alg is required".to_string(),
+                    )),
+                    Some(CborValue::Text(_)) => {}
+                    Some(_) => out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(&pp_path, PathSegment::key("alg")),
+                        "passphrase.alg must be a text string".to_string(),
+                    )),
+                }
+                match map_get(pp_map, "salt") {
+                    // An absent salt maps to the same code as a wrong-typed
+                    // one — the reference schema layer expresses the salt as a
+                    // byte string carrying its own length refinements, so its
+                    // absence surfaces as the type violation of that shape.
+                    None => out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(&pp_path, PathSegment::key("salt")),
+                        "passphrase.salt must be a CBOR byte string of 16..64 bytes".to_string(),
+                    )),
+                    Some(CborValue::Bytes(salt)) => {
+                        if salt.len() < 16 {
+                            out.push(issue(
+                                ErrorCode::EncPassphraseSaltTooShort,
+                                with(&pp_path, PathSegment::key("salt")),
+                                format!("passphrase.salt length {} < 16", salt.len()),
+                            ));
+                        } else if salt.len() > 64 {
+                            out.push(issue(
+                                ErrorCode::EncPassphraseSaltTooLong,
+                                with(&pp_path, PathSegment::key("salt")),
+                                format!("passphrase.salt length {} > 64", salt.len()),
+                            ));
+                        }
+                    }
+                    Some(_) => out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(&pp_path, PathSegment::key("salt")),
+                        "passphrase.salt must be a CBOR byte string".to_string(),
+                    )),
+                }
+                match map_get(pp_map, "params") {
+                    None => out.push(issue(
+                        ErrorCode::SchemaMissingRequired,
+                        with(&pp_path, PathSegment::key("params")),
+                        "passphrase.params is required".to_string(),
+                    )),
+                    Some(CborValue::Map(_)) => {}
+                    Some(_) => out.push(issue(
+                        ErrorCode::SchemaTypeMismatch,
+                        with(&pp_path, PathSegment::key("params")),
+                        "passphrase.params must be a CBOR map".to_string(),
+                    )),
+                }
+                for key in text_keys(pp_map) {
+                    if !PASSPHRASE_KEYS.contains(&key) {
+                        out.push(issue(
+                            ErrorCode::SchemaUnknownField,
+                            with(&pp_path, PathSegment::key(key)),
+                            format!("unrecognized key '{key}' in passphrase block"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for key in text_keys(enc_map) {
+        if !ENC_KEYS.contains(&key) {
+            out.push(issue(
+                ErrorCode::SchemaUnknownField,
+                with(enc_path, PathSegment::key(key)),
+                format!("unrecognized key '{key}' in a supported enc envelope"),
+            ));
+        }
+    }
+
+    out
+}
+
+fn check_scheme1_envelope(
+    enc_map: &[(CborValue, CborValue)],
+    enc_path: &[PathSegment],
+    options: &ValidatorOptions,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    // The schema sub-pass pinned the field types, so the accessors below see
+    // their expected shapes.
+    let aead = map_get(enc_map, "aead").and_then(as_text).unwrap_or("");
+    let kem = map_get(enc_map, "kem").and_then(as_text);
+
+    // Nonce length is registered per content format. Checked only under a
+    // supported `aead` — which is guaranteed on this path.
+    if let (Some(expected), Some(nonce)) = (
+        registry_lookup(AEAD_NONCE_LENGTHS, aead),
+        map_get(enc_map, "nonce").and_then(as_bytes),
+    ) {
+        if nonce.len() != expected {
+            issues.push(issue(
+                ErrorCode::NonceLengthMismatch,
+                with(enc_path, PathSegment::key("nonce")),
+                format!("nonce length {} != {expected} for {aead}", nonce.len()),
+            ));
+        }
+    }
+
+    // Key-path cross-field rules. Exactly one of `slots` / `passphrase` is
+    // present; `passphrase` forbids `kem`, `slots`, and `slots_mac`; `slots`
+    // requires both `kem` and `slots_mac`; `slots_mac` binds nothing without
+    // `slots`. Each independent rule emits its own code — they co-fire where
+    // several apply.
+    let has_slots = map_has(enc_map, "slots");
+    let has_slots_mac = map_has(enc_map, "slots_mac");
+    let has_passphrase = map_has(enc_map, "passphrase");
+    let has_kem = kem.is_some();
+
+    if has_passphrase && (has_slots || has_slots_mac || has_kem) {
         issues.push(issue(
             ErrorCode::EncExclusivityViolation,
-            "enc combines slots with passphrase; exactly one MUST be present".to_string(),
+            enc_path.to_vec(),
+            "enc.passphrase is mutually exclusive with kem / slots / slots_mac; \
+             exactly one key path is allowed"
+                .to_string(),
         ));
     }
     if has_slots && !has_slots_mac {
         issues.push(issue(
             ErrorCode::EncSlotsMacRequired,
+            enc_path.to_vec(),
             "enc.slots present but enc.slots_mac absent".to_string(),
         ));
     }
     if has_slots_mac && !has_slots {
         issues.push(issue(
             ErrorCode::EncSlotsRequired,
+            enc_path.to_vec(),
             "enc.slots_mac present but enc.slots absent".to_string(),
         ));
     }
     if has_slots && !has_kem {
         issues.push(issue(
             ErrorCode::EncKemRequired,
+            enc_path.to_vec(),
             "enc.slots present but enc.kem absent".to_string(),
         ));
     }
     if !has_slots && !has_passphrase {
         issues.push(issue(
             ErrorCode::EncNoKeyPath,
-            "enc requires either slots or passphrase".to_string(),
+            enc_path.to_vec(),
+            "enc requires either slots or passphrase — no on-chain key path otherwise".to_string(),
         ));
     }
 
+    if let Some(CborValue::Array(slots)) = map_get(enc_map, "slots") {
+        let slots_path = with(enc_path, PathSegment::key("slots"));
+        if slots.is_empty() {
+            issues.push(issue(
+                ErrorCode::EncSlotsEmpty,
+                slots_path,
+                "slots[] must carry at least one slot".to_string(),
+            ));
+        } else if slots.len() > options.max_slots {
+            // Slot-count resource bound: reject before walking any slot, so a
+            // hostile record cannot drive unbounded per-slot work.
+            issues.push(issue(
+                ErrorCode::EncSlotsTooMany,
+                slots_path,
+                format!(
+                    "slots length {} exceeds the slot-count bound {}",
+                    slots.len(),
+                    options.max_slots
+                ),
+            ));
+        } else if let Some(descriptor) = kem.and_then(kem_slot_descriptor) {
+            // Per-slot KEK uniqueness: the zero-nonce per-slot wrap is safe
+            // only because each slot draws fresh KEM randomness; two slots
+            // sharing the same encapsulation material would derive the same
+            // KEK. Reject the repeat before any cryptographic layer would.
+            let mut seen_kem_material: std::collections::HashSet<&[u8]> =
+                std::collections::HashSet::new();
+            for (j, slot) in slots.iter().enumerate() {
+                let slot_path = with(&slots_path, PathSegment::Index(j));
+                let Some(slot_map) = as_map(slot) else {
+                    continue; // the schema sub-pass already rejected non-map slots
+                };
+                check_slot_shape(slot_map, descriptor, kem.unwrap_or(""), &slot_path, issues);
+                if let Some(material) = map_get(slot_map, descriptor.field).and_then(as_bytes) {
+                    if !seen_kem_material.insert(material) {
+                        issues.push(issue(
+                            ErrorCode::EncSlotsDuplicateKemMaterial,
+                            with(&slot_path, PathSegment::key(descriptor.field)),
+                            format!(
+                                "slot {j} {} duplicates an earlier slot — \
+                                 per-slot KEK uniqueness is violated",
+                                descriptor.field
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     if has_passphrase {
-        if let Some(pp) = map_get(enc_map, "passphrase") {
-            validate_passphrase(pp, issues);
+        if let Some(pp_map) = map_get(enc_map, "passphrase").and_then(as_map) {
+            check_passphrase_block(
+                pp_map,
+                &with(enc_path, PathSegment::key("passphrase")),
+                options,
+                issues,
+            );
         }
     }
 }
 
-fn validate_slot(slot: &CborValue, kem: &str, issues: &mut Vec<ValidationIssue>) {
-    let slot_map = match as_map(slot) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::EncSlotInvalidShape,
-                "recipient slot must be a map".to_string(),
-            ));
-            return;
-        }
-    };
-    // kem is a resolved registered member, so the descriptor is present.
-    let descriptor = match kem_slot_descriptor(kem) {
-        Some(d) => d,
-        None => return,
-    };
-
-    // The foreign ciphertext field's presence is a shape violation regardless of
-    // length.
+// KEM-driven per-slot shape gate. The descriptor for the declared envelope
+// `kem` pins which ciphertext-bearing field MUST be present at what exact
+// length, and forbids everything else: the other KEM's field, any stray key
+// (a slot is a CLOSED 2-key map), and a missing required field all surface as
+// ENC_SLOT_INVALID_SHAPE.
+fn check_slot_shape(
+    slot_map: &[(CborValue, CborValue)],
+    descriptor: KemSlotDescriptor,
+    kem: &str,
+    slot_path: &[PathSegment],
+    issues: &mut Vec<ValidationIssue>,
+) {
     let foreign_field = if descriptor.field == "epk" {
         "kem_ct"
     } else {
@@ -1807,664 +2761,363 @@ fn validate_slot(slot: &CborValue, kem: &str, issues: &mut Vec<ValidationIssue>)
     if map_has(slot_map, foreign_field) {
         issues.push(issue(
             ErrorCode::EncSlotInvalidShape,
+            with(slot_path, PathSegment::key(foreign_field)),
             format!(
                 "slot carries '{foreign_field}' but kem='{kem}' expects '{}'",
                 descriptor.field
             ),
         ));
     }
-
-    // Any key outside {<ct field>, wrap} for this KEM is a closed-map violation.
-    for (key, _) in slot_map {
-        let known = matches!(key, CborValue::Text(k) if REGISTERED_SLOT_KEYS.contains(&k.as_str()));
-        if !known {
+    for key in text_keys(slot_map) {
+        if !SLOT_KEY_UNIVERSE.contains(&key) {
             issues.push(issue(
                 ErrorCode::EncSlotInvalidShape,
-                "slot carries an unexpected key".to_string(),
-            ));
-        }
-    }
-
-    // Required ciphertext-bearing field at the expected (reassembled) length.
-    if descriptor.field == "epk" {
-        match map_get(slot_map, "epk") {
-            None => issues.push(issue(
-                ErrorCode::EncSlotInvalidShape,
-                format!("slot for kem='{kem}' is missing required 'epk'"),
-            )),
-            Some(CborValue::Bytes(epk)) => {
-                if epk.len() != descriptor.field_length {
-                    issues.push(issue(
-                        ErrorCode::KemEpkLengthMismatch,
-                        format!(
-                            "epk length {} != {} for {kem}",
-                            epk.len(),
-                            descriptor.field_length
-                        ),
-                    ));
-                }
-            }
-            Some(_) => issues.push(issue(
-                ErrorCode::EncSlotInvalidShape,
-                "slot epk must be bytes".to_string(),
-            )),
-        }
-    } else if let Some(reassembled) = reassemble_kem_ct(map_get(slot_map, "kem_ct"), issues) {
-        if reassembled != descriptor.field_length {
-            issues.push(issue(
-                ErrorCode::KemCtLengthMismatch,
+                with(slot_path, PathSegment::key(key)),
                 format!(
-                    "kem_ct reassembles to {reassembled} bytes != {} for {kem}",
-                    descriptor.field_length
+                    "slot carries unexpected key '{key}'; a slot is a 2-key map {{{}, wrap}}",
+                    descriptor.field
                 ),
             ));
         }
     }
 
-    // `wrap` is 48 bytes for every KEM.
-    match map_get(slot_map, "wrap") {
+    match map_get(slot_map, descriptor.field).and_then(as_bytes) {
         None => issues.push(issue(
             ErrorCode::EncSlotInvalidShape,
+            with(slot_path, PathSegment::key(descriptor.field)),
+            format!(
+                "slot for kem='{kem}' is missing required '{}'",
+                descriptor.field
+            ),
+        )),
+        Some(ct_field) => {
+            if ct_field.len() != descriptor.field_length {
+                issues.push(issue(
+                    descriptor.field_length_code,
+                    with(slot_path, PathSegment::key(descriptor.field)),
+                    format!(
+                        "slot.{} length {} != {} for {kem}",
+                        descriptor.field,
+                        ct_field.len(),
+                        descriptor.field_length
+                    ),
+                ));
+            }
+        }
+    }
+
+    match map_get(slot_map, "wrap").and_then(as_bytes) {
+        None => issues.push(issue(
+            ErrorCode::EncSlotInvalidShape,
+            with(slot_path, PathSegment::key("wrap")),
             format!("slot for kem='{kem}' is missing required 'wrap'"),
         )),
-        Some(CborValue::Bytes(wrap)) => {
+        Some(wrap) => {
             if wrap.len() != descriptor.wrap_length {
                 issues.push(issue(
                     ErrorCode::WrapLengthMismatch,
-                    format!("wrap length {} != {}", wrap.len(), descriptor.wrap_length),
+                    with(slot_path, PathSegment::key("wrap")),
+                    format!(
+                        "slot.wrap length {} != {}",
+                        wrap.len(),
+                        descriptor.wrap_length
+                    ),
                 ));
             }
         }
-        Some(_) => issues.push(issue(
-            ErrorCode::EncSlotInvalidShape,
-            "slot wrap must be bytes".to_string(),
-        )),
     }
 }
 
-/// The encapsulation material that fixes a slot's per-slot KEK, used for the
-/// within-record duplicate check: the `epk` (x25519) or the reassembled
-/// `kem_ct` (hybrid). Returns `None` when the required field is absent or the
-/// wrong type — the shape defect already emitted `ENC_SLOT_INVALID_SHAPE`, so
-/// the duplicate pass simply skips that slot.
-fn slot_kem_material(slot: &CborValue, kem: &str) -> Option<Vec<u8>> {
-    let slot_map = as_map(slot)?;
-    let descriptor = kem_slot_descriptor(kem)?;
-    if descriptor.field == "epk" {
-        match map_get(slot_map, "epk") {
-            Some(CborValue::Bytes(epk)) => Some(epk.clone()),
-            _ => None,
-        }
-    } else {
-        match map_get(slot_map, "kem_ct") {
-            Some(CborValue::Array(chunks)) if !chunks.is_empty() => {
-                let mut out = Vec::new();
-                for chunk in chunks {
-                    match chunk {
-                        CborValue::Bytes(b) => out.extend_from_slice(b),
-                        _ => return None,
-                    }
-                }
-                Some(out)
-            }
-            _ => None,
-        }
-    }
-}
-
-/// Validate the chunked-bytes shape of `kem_ct` and return its reassembled byte
-/// length, or `None` when the field is missing or malformed.
-fn reassemble_kem_ct(raw: Option<&CborValue>, issues: &mut Vec<ValidationIssue>) -> Option<usize> {
-    let chunks = match raw {
-        None => {
-            issues.push(issue(
-                ErrorCode::EncSlotInvalidShape,
-                "hybrid slot is missing required 'kem_ct'".to_string(),
-            ));
-            return None;
-        }
-        Some(CborValue::Array(c)) if !c.is_empty() => c,
-        Some(_) => {
-            issues.push(issue(
-                ErrorCode::EncSlotInvalidShape,
-                "kem_ct must be a non-empty array of byte chunks".to_string(),
-            ));
-            return None;
-        }
-    };
-    let mut total = 0usize;
-    let mut shape_ok = true;
-    for chunk in chunks {
-        match chunk {
-            CborValue::Bytes(b) => {
-                if !(1..=64).contains(&b.len()) {
-                    issues.push(issue(
-                        ErrorCode::ChunkTooLarge,
-                        format!("chunk length {} not in [1, 64]", b.len()),
-                    ));
-                    shape_ok = false;
-                } else {
-                    total += b.len();
-                }
-            }
-            _ => {
-                issues.push(issue(
-                    ErrorCode::EncSlotInvalidShape,
-                    "kem_ct chunk must be a byte string".to_string(),
-                ));
-                shape_ok = false;
-            }
-        }
-    }
-    if shape_ok {
-        Some(total)
-    } else {
-        None
-    }
-}
-
-fn validate_passphrase(passphrase: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let pp = match as_map(passphrase) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "passphrase must be a map".to_string(),
-            ));
-            return;
-        }
-    };
-    check_unknown_keys(pp, REGISTERED_PASSPHRASE_KEYS, "passphrase", issues);
-
-    let alg = map_get(pp, "alg").and_then(as_text);
-    match alg {
-        Some(a) if PASSPHRASE_ALGS.contains(&a) => {}
-        _ => issues.push(issue(
+// Passphrase block: KDF registry membership, then the registered algorithm's
+// CLOSED parameter map with exact-integer range, floors, and the deployment
+// ceiling. Salt bounds are schema-layer refinements and have already fired.
+fn check_passphrase_block(
+    pp_map: &[(CborValue, CborValue)],
+    pp_path: &[PathSegment],
+    options: &ValidatorOptions,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let alg = map_get(pp_map, "alg").and_then(as_text).unwrap_or("");
+    if !PASSPHRASE_KDF_ALGS.contains(&alg) {
+        issues.push(issue(
             ErrorCode::EncPassphraseAlgUnsupported,
-            "unknown passphrase alg".to_string(),
-        )),
+            with(pp_path, PathSegment::key("alg")),
+            format!("unknown passphrase kdf alg: {alg}"),
+        ));
+        return; // no algorithm-specific params rule can apply
     }
 
-    match map_get(pp, "salt") {
-        Some(CborValue::Bytes(salt)) => {
-            if salt.len() < 16 {
-                issues.push(issue(
-                    ErrorCode::EncPassphraseSaltTooShort,
-                    format!("passphrase.salt length {} < 16", salt.len()),
-                ));
-            } else if salt.len() > 64 {
-                issues.push(issue(
-                    ErrorCode::EncPassphraseSaltTooLong,
-                    format!("passphrase.salt length {} > 64", salt.len()),
-                ));
-            }
-        }
-        _ => issues.push(issue(
-            ErrorCode::SchemaTypeMismatch,
-            "salt must be bytes".to_string(),
-        )),
-    }
-
-    let params = match map_get(pp, "params") {
-        Some(CborValue::Map(m)) => m,
-        Some(_) | None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "params must be a map".to_string(),
-            ));
-            return;
-        }
+    // argon2id: `params` is the CLOSED map of exactly {m, t, p}.
+    let params_path = with(pp_path, PathSegment::key("params"));
+    let Some(CborValue::Map(params)) = map_get(pp_map, "params") else {
+        return; // unreachable: the schema sub-pass pinned params to a map
     };
-
-    if alg == Some("argon2id") {
-        validate_argon2_params(params, issues);
-    }
-}
-
-fn validate_argon2_params(params: &[(CborValue, CborValue)], issues: &mut Vec<ValidationIssue>) {
-    for (key, _) in params {
-        let known = matches!(key, CborValue::Text(k) if matches!(k.as_str(), "m" | "t" | "p"));
-        if !known {
+    for key in text_keys(params) {
+        if !matches!(key, "m" | "t" | "p") {
             issues.push(issue(
                 ErrorCode::SchemaUnknownField,
-                "unknown argon2id params field".to_string(),
+                with(&params_path, PathSegment::key(key)),
+                format!("unknown argon2id params field: {key}"),
             ));
         }
     }
 
-    let int_param = |name: &str, issues: &mut Vec<ValidationIssue>| -> Option<u64> {
-        match map_get(params, name) {
-            Some(CborValue::Unsigned(n)) => Some(*n),
-            _ => {
+    let ceiling = options.passphrase_params_ceiling;
+    for (name, floor) in ARGON2_FLOORS {
+        let path = with(&params_path, PathSegment::key(name));
+        let value = match map_get(params, name) {
+            None => {
+                issues.push(issue(
+                    ErrorCode::SchemaMissingRequired,
+                    path,
+                    format!("argon2id params.{name} is required"),
+                ));
+                continue;
+            }
+            Some(CborValue::Unsigned(n)) => *n,
+            Some(_) => {
+                // Exact-integer discipline: a negative integer is a different
+                // CBOR major type and is never a uint.
                 issues.push(issue(
                     ErrorCode::SchemaTypeMismatch,
+                    path,
                     format!("argon2id params.{name} must be a CBOR unsigned integer"),
                 ));
-                None
+                continue;
             }
+        };
+        if value > UINT32_MAX {
+            issues.push(issue(
+                ErrorCode::SchemaTypeMismatch,
+                path,
+                format!("argon2id params.{name} exceeds the pinned wire range 0 .. 2^32 - 1"),
+            ));
+            continue;
         }
-    };
-
-    if let Some(m) = int_param("m", issues) {
-        if m < 65_536 {
+        if value < floor {
             issues.push(issue(
                 ErrorCode::EncPassphraseArgon2ParamsTooLow,
-                "argon2id requires m >= 65536 KiB".to_string(),
+                path,
+                format!("argon2id requires {name} >= {floor}"),
             ));
+            continue;
         }
-    }
-    if let Some(t) = int_param("t", issues) {
-        if t < 3 {
-            issues.push(issue(
-                ErrorCode::EncPassphraseArgon2ParamsTooLow,
-                "argon2id requires t >= 3".to_string(),
-            ));
-        }
-    }
-    if let Some(p) = int_param("p", issues) {
-        if p < 1 {
-            issues.push(issue(
-                ErrorCode::EncPassphraseArgon2ParamsTooLow,
-                "argon2id requires p >= 1".to_string(),
-            ));
+        if let Some(ceiling) = ceiling {
+            let max = match name {
+                "m" => ceiling.m,
+                "t" => ceiling.t,
+                _ => ceiling.p,
+            };
+            if value > max {
+                issues.push(issue(
+                    ErrorCode::EncPassphraseParamsExceedPolicy,
+                    path,
+                    format!(
+                        "argon2id params.{name} = {value} exceeds the deployment ceiling {max}"
+                    ),
+                ));
+            }
         }
     }
 }
 
-// --- Merkle commitments ---
+// ===========================================================================
+// Merkle commitments
+// ===========================================================================
 
-fn validate_merkle_commit(commit: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    let cm = match as_map(commit) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "merkle entry must be a map".to_string(),
-            ));
-            return;
-        }
+fn check_merkle_commit(commit: &CborValue, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    let base = vec![PathSegment::key("merkle"), PathSegment::Index(idx)];
+    let Some(commit_map) = as_map(commit) else {
+        return; // unreachable: the schema pass rejected non-map entries
     };
-    check_unknown_keys(cm, REGISTERED_MERKLE_COMMIT_KEYS, "merkle entry", issues);
 
-    let mut alg_resolved: Option<&str> = None;
-    match map_get(cm, "alg") {
+    let alg = map_get(commit_map, "alg").and_then(as_text).unwrap_or("");
+    match registry_lookup(MERKLE_COMMIT_ALG_LENGTHS, alg) {
         None => issues.push(issue(
-            ErrorCode::SchemaMissingRequired,
-            "merkle entry missing required 'alg'".to_string(),
+            ErrorCode::UnsupportedMerkleCommitAlg,
+            with(&base, PathSegment::key("alg")),
+            format!("unknown merkle commitment alg: {alg}"),
         )),
-        Some(CborValue::Text(alg)) => {
-            if registry_lookup(MERKLE_COMMIT_ALGS, alg).is_some() {
-                alg_resolved = Some(alg);
-            } else {
-                issues.push(issue(
-                    ErrorCode::UnsupportedMerkleCommitAlg,
-                    format!("unknown merkle commitment alg: {alg}"),
-                ));
-            }
-        }
-        Some(_) => issues.push(issue(
-            ErrorCode::SchemaTypeMismatch,
-            "merkle entry 'alg' must be a text string".to_string(),
-        )),
-    }
-
-    match map_get(cm, "root") {
-        None => issues.push(issue(
-            ErrorCode::SchemaMissingRequired,
-            "merkle entry missing required 'root'".to_string(),
-        )),
-        Some(CborValue::Bytes(root)) => {
-            if let Some(alg) = alg_resolved {
-                let expected = registry_lookup(MERKLE_COMMIT_ALGS, alg).unwrap_or(0);
+        Some(expected) => {
+            if let Some(root) = map_get(commit_map, "root").and_then(as_bytes) {
                 if root.len() != expected {
                     issues.push(issue(
                         ErrorCode::HashDigestLengthMismatch,
+                        with(&base, PathSegment::key("root")),
                         format!(
-                            "merkle entry 'root' length {} != {expected} for {alg}",
+                            "merkle entry root length {} != {expected} for {alg}",
                             root.len()
                         ),
                     ));
                 }
             }
         }
-        Some(_) => issues.push(issue(
-            ErrorCode::SchemaTypeMismatch,
-            "merkle entry 'root' must be CBOR bytes".to_string(),
-        )),
     }
 
-    match map_get(cm, "leaf_count") {
-        None => issues.push(issue(
-            ErrorCode::SchemaMissingRequired,
-            "merkle entry missing required 'leaf_count'".to_string(),
-        )),
-        Some(CborValue::Unsigned(n)) if *n >= 1 => {}
-        Some(_) => issues.push(issue(
-            ErrorCode::SchemaTypeMismatch,
-            "merkle entry 'leaf_count' must be a CBOR unsigned integer >= 1".to_string(),
-        )),
-    }
-
-    if let Some(uris) = map_get(cm, "uris") {
-        validate_item_uris(uris, issues);
-    }
-}
-
-// --- supersedes ---
-
-fn validate_supersedes(value: &CborValue, issues: &mut Vec<ValidationIssue>) {
-    // A wrong TYPE (non-bytes) and a wrong LENGTH (bytes ≠ 32) are distinct
-    // defects: the former violates the CDDL type, the latter the txid width.
-    match value {
-        CborValue::Bytes(b) if b.len() == 32 => {}
-        CborValue::Bytes(_) => issues.push(issue(
-            ErrorCode::SupersedesTxInvalidLength,
-            "supersedes must be a 32-byte transaction hash".to_string(),
-        )),
-        _ => issues.push(issue(
-            ErrorCode::SchemaTypeMismatch,
-            "supersedes must be a byte string".to_string(),
-        )),
-    }
-}
-
-// --- crit[] ---
-
-fn validate_crit(record_map: &[(CborValue, CborValue)], issues: &mut Vec<ValidationIssue>) {
-    let crit_arr = match map_get(record_map, "crit") {
-        Some(CborValue::Array(a)) if !a.is_empty() => a,
-        _ => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "crit must be a non-empty array of text strings".to_string(),
-            ));
-            return;
-        }
-    };
-    let mut seen: Vec<String> = Vec::new();
-    for entry in crit_arr {
-        let name = match entry {
-            CborValue::Text(t) => t,
-            _ => {
+    // `leaf_count` is REQUIRED and pinned to `1 .. 2^32 − 1`, compared as an
+    // exact integer (the CBOR argument is exact, so 2^53 + 1 cannot round to a
+    // boundary value before rejection). A negative value is a CBOR type
+    // violation (nint where uint is required), distinct from an out-of-range
+    // unsigned value.
+    match map_get(commit_map, "leaf_count") {
+        Some(CborValue::Unsigned(n)) => {
+            if !(1..=UINT32_MAX).contains(n) {
                 issues.push(issue(
-                    ErrorCode::SchemaTypeMismatch,
-                    "crit entry must be a text string".to_string(),
+                    ErrorCode::SchemaMerkleLeafCountInvalid,
+                    with(&base, PathSegment::key("leaf_count")),
+                    format!("leaf_count {n} is outside the pinned range 1 .. 2^32 - 1"),
                 ));
-                continue;
             }
-        };
-        let mut reason: Option<String> = None;
-        if REGISTERED_RECORD_KEYS.contains(&name.as_str()) {
-            reason = Some(format!(
-                "'{name}' is a base key and MUST NOT appear in crit[]"
-            ));
-        } else if !is_extension_key(name) {
-            reason = Some(format!("'{name}' does not match the extension-key regex"));
-        } else if !map_has(record_map, name) {
-            reason = Some(format!(
-                "'{name}' is named in crit but absent from the record map"
-            ));
-        } else if seen.contains(name) {
-            reason = Some(format!("'{name}' appears more than once in crit[]"));
         }
-        seen.push(name.clone());
-        if let Some(reason) = reason {
-            issues.push(issue(ErrorCode::CritShapeInvalid, reason));
-            continue;
-        }
-        // v1 implements zero extensions, so every shape-valid crit entry is
-        // unsupported.
-        issues.push(issue(
-            ErrorCode::ExtensionUnsupportedCritical,
-            format!("crit entry '{name}' names an extension this validator does not implement"),
-        ));
-    }
-}
-
-// --- sigs[] ---
-
-fn validate_sigs(
-    raw: &CborValue,
-    issues: &mut Vec<ValidationIssue>,
-    info: &mut Vec<ValidationIssue>,
-) {
-    let entries = match raw {
-        CborValue::Array(a) => a,
-        _ => {
-            issues.push(issue(
-                ErrorCode::SchemaTypeMismatch,
-                "sigs must be an array".to_string(),
-            ));
-            return;
-        }
-    };
-    if entries.is_empty() {
-        issues.push(issue(
+        Some(CborValue::Negative(_)) => issues.push(issue(
             ErrorCode::SchemaTypeMismatch,
-            "sigs must be a non-empty array when present".to_string(),
-        ));
-        return;
-    }
-    for entry in entries {
-        validate_sig_entry(entry, issues, info);
-    }
-}
-
-fn validate_sig_entry(
-    entry: &CborValue,
-    issues: &mut Vec<ValidationIssue>,
-    info: &mut Vec<ValidationIssue>,
-) {
-    let entry_map = match as_map(entry) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::SigEntryInvalidShape,
-                "each sigs entry must be a CBOR map { cose_sign1, cose_key? }".to_string(),
-            ));
-            return;
-        }
-    };
-
-    let cose_sign1_chunks = match map_get(entry_map, "cose_sign1") {
-        None => {
-            issues.push(issue(
-                ErrorCode::SigEntryInvalidShape,
-                "sigs entry missing required 'cose_sign1' field".to_string(),
-            ));
-            None
-        }
-        Some(raw) if is_chunked_bytes_shape(raw) => {
-            let chunks = chunked_bytes(raw);
-            validate_bytes_chunk_lengths(&chunks, issues);
-            Some(chunks)
-        }
-        Some(_) => {
-            issues.push(issue(
-                ErrorCode::SigEntryInvalidShape,
-                "sigs[i].cose_sign1 must be a non-empty list of byte chunks".to_string(),
-            ));
-            None
-        }
-    };
-
-    if let Some(cose_key_raw) = map_get(entry_map, "cose_key") {
-        if is_chunked_bytes_shape(cose_key_raw) {
-            let chunks = chunked_bytes(cose_key_raw);
-            validate_bytes_chunk_lengths(&chunks, issues);
-            validate_cose_key_blob(&chunks, issues);
-        } else {
-            issues.push(issue(
-                ErrorCode::SigEntryInvalidShape,
-                "sigs[i].cose_key must be a non-empty list of byte chunks".to_string(),
-            ));
-        }
-    }
-
-    // A sig entry is a closed map `{ cose_sign1, cose_key? }`. An unrecognised
-    // key is a shape violation, not a generic unknown-field one, so it emits
-    // SIG_ENTRY_INVALID_SHAPE inline rather than via the shared unknown-field
-    // helper (which item/enc/passphrase/merkle still use for SCHEMA_UNKNOWN_FIELD).
-    for (key, _) in entry_map {
-        let known = matches!(key, CborValue::Text(k)
-            if REGISTERED_SIG_ENTRY_KEYS.contains(&k.as_str()));
-        if !known {
-            issues.push(issue(
-                ErrorCode::SigEntryInvalidShape,
-                "sigs entry carries an unrecognised key (allowed: cose_sign1, cose_key)"
-                    .to_string(),
-            ));
-        }
-    }
-
-    if let Some(chunks) = cose_sign1_chunks {
-        check_cose_sign1(&chunks, entry_map, issues, info);
-    }
-}
-
-fn is_chunked_bytes_shape(value: &CborValue) -> bool {
-    matches!(value, CborValue::Array(a)
-        if !a.is_empty() && a.iter().all(|c| matches!(c, CborValue::Bytes(_))))
-}
-
-fn chunked_bytes(value: &CborValue) -> Vec<Vec<u8>> {
-    match value {
-        CborValue::Array(a) => a
-            .iter()
-            .filter_map(|c| match c {
-                CborValue::Bytes(b) => Some(b.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn validate_bytes_chunk_lengths(chunks: &[Vec<u8>], issues: &mut Vec<ValidationIssue>) {
-    for c in chunks {
-        if !(1..=64).contains(&c.len()) {
-            issues.push(issue(
-                ErrorCode::ChunkTooLarge,
-                format!("chunk length {} not in [1, 64]", c.len()),
-            ));
-        }
-    }
-}
-
-/// Inspect a path-2 `cbor<COSE_Key>` blob: private-material guard FIRST, then
-/// the positive Ed25519 OKP shape check.
-fn validate_cose_key_blob(chunks: &[Vec<u8>], issues: &mut Vec<ValidationIssue>) {
-    let joined = bytes_chunk_array_concat(chunks);
-    // A COSE_Key is an int-keyed CBOR map; the canonical decoder reads it.
-    let decoded = match decode_canonical_cbor(&joined) {
-        Ok(v) => v,
-        Err(_) => {
-            issues.push(issue(
-                ErrorCode::MalformedSigCoseSign1,
-                "cose_key failed to decode as cbor<COSE_Key>".to_string(),
-            ));
-            return;
-        }
-    };
-    let key_map = match as_map(&decoded) {
-        Some(map) => map,
-        None => {
-            issues.push(issue(
-                ErrorCode::MalformedSigCoseSign1,
-                "cose_key did not decode to a CBOR map".to_string(),
-            ));
-            return;
-        }
-    };
-
-    // Private-material guard FIRST.
-    let leaks_private = key_map
-        .iter()
-        .any(|(k, _)| int_key(k).is_some_and(|n| COSE_KEY_PRIVATE_MATERIAL_LABELS.contains(&n)));
-    if leaks_private {
-        issues.push(issue(
-            ErrorCode::SigPrivateKeyLeaked,
-            "cose_key carries COSE_Key private-key material (label -4, the OKP/EC2 \
-             private scalar d); publishing a private key on the permanent ledger is forbidden"
-                .to_string(),
-        ));
-        return;
-    }
-
-    // Positive Ed25519 OKP shape: kty(1)=1, crv(-1)=6, 32-byte x(-2).
-    if int_keyed_get(key_map, 1) != Some(&CborValue::Unsigned(1)) {
-        issues.push(issue(
-            ErrorCode::MalformedSigCoseSign1,
-            "cose_key kty (label 1) must be 1 (OKP)".to_string(),
-        ));
-        return;
-    }
-    // crv label -1 → CborValue::Negative(0); value 6 → CborValue::Unsigned(6).
-    if int_keyed_get(key_map, -1) != Some(&CborValue::Unsigned(6)) {
-        issues.push(issue(
-            ErrorCode::MalformedSigCoseSign1,
-            "cose_key crv (label -1) must be 6 (Ed25519)".to_string(),
-        ));
-        return;
-    }
-    match int_keyed_get(key_map, -2) {
-        Some(CborValue::Bytes(x)) if x.len() == 32 => {}
-        _ => issues.push(issue(
-            ErrorCode::MalformedSigCoseSign1,
-            "cose_key label -2 must be a 32-byte byte string (Ed25519 public key)".to_string(),
+            with(&base, PathSegment::key("leaf_count")),
+            "leaf_count must be a CBOR unsigned integer".to_string(),
         )),
+        _ => {} // unreachable: the schema pass pinned leaf_count to an integer
+    }
+
+    if let Some(uris_raw) = map_get(commit_map, "uris") {
+        check_uris(uris_raw, &with(&base, PathSegment::key("uris")), issues);
     }
 }
 
-/// Step 4g — COSE_Sign1 structural decode + algorithm + path mutual-exclusion.
-fn check_cose_sign1(
-    chunks: &[Vec<u8>],
-    entry_map: &[(CborValue, CborValue)],
-    issues: &mut Vec<ValidationIssue>,
-    info: &mut Vec<ValidationIssue>,
-) {
-    let merged = bytes_chunk_array_concat(chunks);
-    let cose = match decode_cose_sign1(&merged) {
+// ===========================================================================
+// Record-level signature entries
+// ===========================================================================
+
+fn check_sig_entry(entry: &CborValue, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    let base = vec![PathSegment::key("sigs"), PathSegment::Index(idx)];
+    let Some(entry_map) = as_map(entry) else {
+        return; // unreachable: the schema pass rejected non-map entries
+    };
+
+    // Path-2 `cose_key` private-material guard runs FIRST: a leaked private
+    // scalar must be named even when the COSE_Sign1 is also malformed.
+    let cose_key = map_get(entry_map, "cose_key").and_then(as_bytes);
+    if let Some(key_bytes) = cose_key {
+        if let Some(key_issue) =
+            inspect_cose_key(key_bytes, idx, with(&base, PathSegment::key("cose_key")))
+        {
+            issues.push(key_issue);
+            return;
+        }
+    }
+
+    let Some(cose_bytes) = map_get(entry_map, "cose_sign1").and_then(as_bytes) else {
+        return; // unreachable: the schema pass requires a byte-string cose_sign1
+    };
+    let cose = match decode_cose_sign1_structural(cose_bytes) {
         Ok(c) => c,
         Err(message) => {
-            issues.push(issue(ErrorCode::MalformedSigCoseSign1, message));
+            issues.push(issue(ErrorCode::MalformedSigCoseSign1, base, message));
             return;
         }
     };
+
+    // Detached-only: the COSE_Sign1 payload MUST be CBOR null. An attached
+    // payload — even zero-length — is rejected; a producer chaining a CIP-30
+    // signData result must null the payload before embedding.
     if cose.payload_present {
         issues.push(issue(
             ErrorCode::MalformedSigCoseSign1,
+            base,
             "COSE_Sign1 payload must be null (detached); attached form forbidden".to_string(),
         ));
         return;
     }
 
-    // Signature-algorithm registry check (info-severity).
+    // Signature-algorithm registry check (info severity — signatures are
+    // optional, so an unrecognised algorithm never fails the record alone).
     let alg = cose
         .protected_header
         .as_ref()
         .and_then(|h| int_keyed_get(h, 1))
         .and_then(int_value);
     if !alg.is_some_and(|a| KNOWN_SIG_ALG_IDS.contains(&a)) {
-        info.push(issue(
+        issues.push(issue(
             ErrorCode::SignatureUnsupported,
-            "alg not in KNOWN_SIG_ALG_IDS".to_string(),
+            base.clone(),
+            "COSE_Sign1 protected alg not in {-8, -19}".to_string(),
         ));
     }
 
-    // Path-1 / path-2 mutual exclusion.
+    // Path-1 (32-byte protected-header `kid`) and path-2 (`cose_key` sidecar)
+    // are mutually exclusive.
     let kid = cose
         .protected_header
         .as_ref()
         .and_then(|h| int_keyed_get(h, 4));
     let kid_32 = matches!(kid, Some(CborValue::Bytes(b)) if b.len() == 32);
-    if kid_32 && map_has(entry_map, "cose_key") {
+    if kid_32 && cose_key.is_some() {
         issues.push(issue(
             ErrorCode::SigEntryKidCoseKeyConflict,
-            "sigs[i] carries both a 32-byte protected `kid` (path 1) and an inline `cose_key` \
-             (path 2); paths are mutually exclusive"
+            base,
+            "sigs[i] carries both a 32-byte protected `kid` (path 1) and an inline \
+             `cose_key` (path 2); paths are mutually exclusive"
                 .to_string(),
         ));
+    }
+}
+
+// COSE_Key inspector (path-2 `sigs[i].cose_key` blob). Two structural checks:
+//   1. Private-material guard (FIRST). COSE_Key label `-4` (the private scalar
+//      `d` for OKP / EC2 per RFC 9052 §7.1) → SIG_PRIVATE_KEY_LEAKED.
+//      Publishing a private key on the permanent ledger is catastrophic and
+//      irreversible, so this is a load-bearing producer-side preflight.
+//   2. Positive-shape guard: `kty = 1` (OKP), `crv = 6` (Ed25519), and a
+//      32-byte `-2` (x). Any failure → MALFORMED_SIG_COSE_SIGN1.
+fn inspect_cose_key(key_bytes: &[u8], i: usize, path: Vec<PathSegment>) -> Option<ValidationIssue> {
+    let decoded = match decode_canonical_cbor(key_bytes) {
+        Ok(v) => v,
+        Err(cause) => {
+            return Some(issue(
+                ErrorCode::MalformedSigCoseSign1,
+                path,
+                format!("sigs[{i}].cose_key failed to decode as cbor<COSE_Key>: {cause}"),
+            ));
+        }
+    };
+    // A COSE_Key map is int-keyed; the label lookups below simply miss on any
+    // other decoded shape, failing the positive kty check.
+    let get_label = |label: i64| -> Option<&CborValue> {
+        as_map(&decoded).and_then(|pairs| int_keyed_get(pairs, label))
+    };
+
+    if get_label(-4).is_some() {
+        return Some(issue(
+            ErrorCode::SigPrivateKeyLeaked,
+            path,
+            "cose_key carries COSE_Key private-key material (label -4, the OKP/EC2 private \
+             scalar d); publishing a private key on the permanent ledger is forbidden"
+                .to_string(),
+        ));
+    }
+
+    if get_label(1) != Some(&CborValue::Unsigned(1)) {
+        return Some(issue(
+            ErrorCode::MalformedSigCoseSign1,
+            path,
+            format!("sigs[{i}].cose_key COSE_Key kty (label 1) must be 1 (OKP)"),
+        ));
+    }
+    if get_label(-1) != Some(&CborValue::Unsigned(6)) {
+        return Some(issue(
+            ErrorCode::MalformedSigCoseSign1,
+            path,
+            format!("sigs[{i}].cose_key COSE_Key crv (label -1) must be 6 (Ed25519)"),
+        ));
+    }
+    match get_label(-2) {
+        Some(CborValue::Bytes(x)) if x.len() == 32 => None,
+        _ => Some(issue(
+            ErrorCode::MalformedSigCoseSign1,
+            path,
+            format!(
+                "sigs[{i}].cose_key COSE_Key label -2 must be a 32-byte byte string \
+                 (Ed25519 public key)"
+            ),
+        )),
     }
 }
 
@@ -2472,25 +3125,27 @@ fn check_cose_sign1(
 ///
 /// The structural validator needs only the protected header map (to read `alg`
 /// and `kid`) and whether the payload is present (detached form requires null).
-struct CoseSign1Decoded {
+struct CoseSign1Structural {
     protected_header: Option<Vec<(CborValue, CborValue)>>,
     payload_present: bool,
 }
 
 /// Structurally decode a COSE_Sign1 blob, reproducing the cross-SDK
-/// `decode_cose_sign1` accept/reject rules.
+/// accept/reject rules: a 4-element array, a byte-string protected header
+/// (zero-length `0x40` for an empty header — the wrapped-empty-map form is
+/// rejected), a map unprotected header, a `bstr / null` payload, and a 64-byte
+/// signature.
 ///
 /// Returns the error message on rejection; the caller surfaces it as
 /// [`ErrorCode::MalformedSigCoseSign1`].
-fn decode_cose_sign1(data: &[u8]) -> Result<CoseSign1Decoded, String> {
+fn decode_cose_sign1_structural(data: &[u8]) -> Result<CoseSign1Structural, String> {
     let arr = decode_canonical_cbor(data).map_err(|_| "cose decode failed".to_string())?;
     let elems = match arr {
         CborValue::Array(a) if a.len() == 4 => a,
         _ => return Err("expected 4-element array".to_string()),
     };
-    let protected_bytes = match &elems[0] {
-        CborValue::Bytes(b) => b.clone(),
-        _ => return Err("protected_bytes must be bytes".to_string()),
+    let CborValue::Bytes(protected_bytes) = &elems[0] else {
+        return Err("protected_bytes must be bytes".to_string());
     };
     if !matches!(&elems[1], CborValue::Map(_)) {
         return Err("unprotected header must be map".to_string());
@@ -2508,44 +3163,29 @@ fn decode_cose_sign1(data: &[u8]) -> Result<CoseSign1Decoded, String> {
     let protected_header = if protected_bytes.is_empty() {
         None
     } else {
-        let decoded = decode_canonical_cbor(&protected_bytes)
+        let decoded = decode_canonical_cbor(protected_bytes)
             .map_err(|_| "protected header decode failed".to_string())?;
         let map = match decoded {
             CborValue::Map(m) => m,
             _ => return Err("protected header must decode to map".to_string()),
         };
-        // An empty protected header MUST encode as the zero-length bstr 0x40, not
-        // as a 1-byte bstr wrapping an empty map. Reaching here with an empty map
-        // means it was the non-canonical wrapped form.
+        // An empty protected header MUST encode as the zero-length bstr 0x40,
+        // not as a 1-byte bstr wrapping an empty map.
         if map.is_empty() {
             return Err(
                 "empty protected header must encode as 0x40 (zero-length bstr)".to_string(),
             );
         }
-        // The protected bytes MUST be canonical CBOR. The strict decoder above
-        // already enforces canonical form, so a successful decode is canonical;
-        // re-encoding and comparing is the explicit byte-pin the Python twin
-        // applies because its CBOR library is permissive.
-        let reencoded = encode_canonical_cbor(&CborValue::Map(map.clone()))
-            .map_err(|_| "protected header re-encode failed".to_string())?;
-        if reencoded != protected_bytes {
-            return Err("protected header bytes are not canonical CBOR".to_string());
-        }
         Some(map)
     };
 
-    Ok(CoseSign1Decoded {
+    Ok(CoseSign1Structural {
         protected_header,
         payload_present,
     })
 }
 
 // --- int-keyed map helpers (COSE_Key / COSE protected header) ---
-
-/// Interpret a CBOR map key as a signed integer label, if it is one.
-fn int_key(key: &CborValue) -> Option<i64> {
-    int_value(key)
-}
 
 /// Interpret a CBOR integer value as `i64` (uint or nint within range).
 fn int_value(value: &CborValue) -> Option<i64> {
@@ -2560,7 +3200,7 @@ fn int_value(value: &CborValue) -> Option<i64> {
 /// Look up an integer-labelled entry in a CBOR map.
 fn int_keyed_get(map: &[(CborValue, CborValue)], label: i64) -> Option<&CborValue> {
     map.iter().find_map(|(k, v)| {
-        if int_key(k) == Some(label) {
+        if int_value(k) == Some(label) {
             Some(v)
         } else {
             None
@@ -2569,14 +3209,50 @@ fn int_keyed_get(map: &[(CborValue, CborValue)], label: i64) -> Option<&CborValu
 }
 
 // ===========================================================================
+// Issue ordering
+// ===========================================================================
+
+// Segment-wise path order: integer segments compare numerically, text segments
+// compare by the bytewise order of their UTF-8 encodings, an integer segment
+// orders before a text segment where the kinds differ, and a strict prefix
+// orders before its extensions. Issues on an identical path tie-break by the
+// position of their code in the canonical error-code registry. No
+// locale-dependent collation — the ordering is byte-stable across runs and
+// across language implementations.
+fn compare_issues(a: &ValidationIssue, b: &ValidationIssue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let n = a.path.len().min(b.path.len());
+    for i in 0..n {
+        let ord = match (&a.path[i], &b.path[i]) {
+            (PathSegment::Index(x), PathSegment::Index(y)) => x.cmp(y),
+            (PathSegment::Index(_), PathSegment::Key(_)) => Ordering::Less,
+            (PathSegment::Key(_), PathSegment::Index(_)) => Ordering::Greater,
+            (PathSegment::Key(x), PathSegment::Key(y)) => x.as_bytes().cmp(y.as_bytes()),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.path
+        .len()
+        .cmp(&b.path.len())
+        .then_with(|| a.code.registry_index().cmp(&b.code.registry_index()))
+}
+
+fn sort_issues(mut issues: Vec<ValidationIssue>) -> Vec<ValidationIssue> {
+    issues.sort_by(compare_issues);
+    issues
+}
+
+// ===========================================================================
 // Decode CborValue → PoeRecord (for the validator's Ok branch)
 // ===========================================================================
 
 /// Reconstruct a [`PoeRecord`] from a decoded, structurally-valid CBOR map.
 ///
-/// Called only after the domain pass has emitted zero issues, so every field is
-/// the expected type; a `None` return is therefore unreachable in practice and
-/// is mapped to a type-mismatch issue rather than panicking.
+/// Called only after the domain pass has emitted zero error issues, so every
+/// field has its validated shape; a `None` return is therefore unreachable in
+/// practice and is mapped to a type-mismatch issue rather than panicking.
 fn record_from_cbor(decoded: &CborValue) -> Option<PoeRecord> {
     let map = as_map(decoded)?;
     let mut record = PoeRecord {
@@ -2587,27 +3263,37 @@ fn record_from_cbor(decoded: &CborValue) -> Option<PoeRecord> {
         ..PoeRecord::default()
     };
     if let Some(CborValue::Array(items)) = map_get(map, "items") {
-        record.items = Some(items.iter().filter_map(item_from_cbor).collect());
+        record.items = Some(
+            items
+                .iter()
+                .map(item_from_cbor)
+                .collect::<Option<Vec<_>>>()?,
+        );
     }
     if let Some(CborValue::Array(merkle)) = map_get(map, "merkle") {
-        record.merkle = Some(merkle.iter().filter_map(merkle_from_cbor).collect());
+        record.merkle = Some(
+            merkle
+                .iter()
+                .map(merkle_from_cbor)
+                .collect::<Option<Vec<_>>>()?,
+        );
     }
     if let Some(CborValue::Bytes(s)) = map_get(map, "supersedes") {
         record.supersedes = Some(s.clone());
     }
     if let Some(CborValue::Array(sigs)) = map_get(map, "sigs") {
-        record.sigs = Some(sigs.iter().filter_map(sig_from_cbor).collect());
+        record.sigs = Some(sigs.iter().map(sig_from_cbor).collect::<Option<Vec<_>>>()?);
     }
     if let Some(CborValue::Array(crit)) = map_get(map, "crit") {
         record.crit = Some(
             crit.iter()
-                .filter_map(|c| as_text(c).map(str::to_string))
-                .collect(),
+                .map(|c| as_text(c).map(str::to_string))
+                .collect::<Option<Vec<_>>>()?,
         );
     }
     for (key, value) in map {
         if let CborValue::Text(k) = key {
-            if !REGISTERED_RECORD_KEYS.contains(&k.as_str()) {
+            if !TOP_LEVEL_BASE_KEYS.contains(&k.as_str()) {
                 record.extensions.push((k.clone(), value.clone()));
             }
         }
@@ -2620,68 +3306,77 @@ fn item_from_cbor(value: &CborValue) -> Option<ItemEntry> {
     let hashes = match map_get(map, "hashes")? {
         CborValue::Map(m) => m
             .iter()
-            .filter_map(|(k, v)| Some((as_text(k)?.to_string(), as_bytes(v)?.to_vec())))
-            .collect(),
+            .map(|(k, v)| Some((as_text(k)?.to_string(), as_bytes(v)?.to_vec())))
+            .collect::<Option<Vec<_>>>()?,
         _ => return None,
     };
     let uris = match map_get(map, "uris") {
-        Some(CborValue::Array(u)) => Some(uris_from_cbor(u)),
+        Some(CborValue::Array(u)) => Some(
+            u.iter()
+                .map(|t| as_text(t).map(str::to_string))
+                .collect::<Option<Vec<_>>>()?,
+        ),
         _ => None,
     };
-    let enc = map_get(map, "enc").and_then(envelope_from_cbor);
+    let enc = match map_get(map, "enc") {
+        Some(enc) => Some(envelope_from_cbor(enc)?),
+        None => None,
+    };
     Some(ItemEntry { hashes, uris, enc })
 }
 
-fn uris_from_cbor(uris: &[CborValue]) -> Vec<Vec<String>> {
-    uris.iter()
-        .filter_map(|u| match u {
-            CborValue::Array(chunks) => Some(
-                chunks
-                    .iter()
-                    .filter_map(|c| as_text(c).map(str::to_string))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect()
-}
-
+// The typed-vs-opaque dispatch, replayed for the Ok-branch record: an envelope
+// whose `scheme` / `kem` / `aead` are all supported identifiers was validated
+// against the scheme-1 shape and lowers to the typed arm; anything else was
+// validated as opaque bounded metadata and is preserved verbatim, so the
+// record re-encodes to its original bytes.
 fn envelope_from_cbor(value: &CborValue) -> Option<EncryptionEnvelope> {
     let map = as_map(value)?;
-    Some(EncryptionEnvelope {
-        scheme: match map_get(map, "scheme")? {
-            CborValue::Unsigned(n) => *n,
-            _ => return None,
-        },
+    let scheme = match map_get(map, "scheme") {
+        Some(CborValue::Unsigned(n)) => *n,
+        _ => return Some(EncryptionEnvelope::Opaque(value.clone())),
+    };
+    let kem_supported = match map_get(map, "kem") {
+        Some(CborValue::Text(kem)) => kem_slot_descriptor(kem).is_some(),
+        None => true,
+        Some(_) => false,
+    };
+    let aead_supported = matches!(map_get(map, "aead"), Some(CborValue::Text(aead))
+        if registry_lookup(AEAD_NONCE_LENGTHS, aead).is_some());
+    if scheme != 1 || !kem_supported || !aead_supported {
+        return Some(EncryptionEnvelope::Opaque(value.clone()));
+    }
+    Some(EncryptionEnvelope::Scheme1(EncScheme1 {
+        scheme,
         aead: as_text(map_get(map, "aead")?)?.to_string(),
         nonce: as_bytes(map_get(map, "nonce")?)?.to_vec(),
         kem: map_get(map, "kem").and_then(as_text).map(str::to_string),
         slots: match map_get(map, "slots") {
-            Some(CborValue::Array(slots)) => {
-                Some(slots.iter().filter_map(slot_from_cbor).collect())
-            }
+            Some(CborValue::Array(slots)) => Some(
+                slots
+                    .iter()
+                    .map(slot_from_cbor)
+                    .collect::<Option<Vec<_>>>()?,
+            ),
             _ => None,
         },
         slots_mac: map_get(map, "slots_mac")
             .and_then(as_bytes)
             .map(<[u8]>::to_vec),
-        passphrase: map_get(map, "passphrase").and_then(passphrase_from_cbor),
-    })
+        passphrase: match map_get(map, "passphrase") {
+            Some(pp) => Some(passphrase_from_cbor(pp)?),
+            None => None,
+        },
+    }))
 }
 
 fn slot_from_cbor(value: &CborValue) -> Option<Slot> {
     let map = as_map(value)?;
     Some(Slot {
         epk: map_get(map, "epk").and_then(as_bytes).map(<[u8]>::to_vec),
-        kem_ct: match map_get(map, "kem_ct") {
-            Some(CborValue::Array(chunks)) => Some(
-                chunks
-                    .iter()
-                    .filter_map(|c| as_bytes(c).map(<[u8]>::to_vec))
-                    .collect(),
-            ),
-            _ => None,
-        },
+        kem_ct: map_get(map, "kem_ct")
+            .and_then(as_bytes)
+            .map(<[u8]>::to_vec),
         wrap: map_get(map, "wrap").and_then(as_bytes).map(<[u8]>::to_vec),
     })
 }
@@ -2691,11 +3386,11 @@ fn passphrase_from_cbor(value: &CborValue) -> Option<PassphraseBlock> {
     let params = match map_get(map, "params")? {
         CborValue::Map(m) => m
             .iter()
-            .filter_map(|(k, v)| match v {
+            .map(|(k, v)| match v {
                 CborValue::Unsigned(n) => Some((as_text(k)?.to_string(), *n)),
                 _ => None,
             })
-            .collect(),
+            .collect::<Option<Vec<_>>>()?,
         _ => return None,
     };
     Some(PassphraseBlock {
@@ -2715,7 +3410,11 @@ fn merkle_from_cbor(value: &CborValue) -> Option<MerkleCommit> {
             _ => return None,
         },
         uris: match map_get(map, "uris") {
-            Some(CborValue::Array(u)) => Some(uris_from_cbor(u)),
+            Some(CborValue::Array(u)) => Some(
+                u.iter()
+                    .map(|t| as_text(t).map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
             _ => None,
         },
     })
@@ -2723,57 +3422,42 @@ fn merkle_from_cbor(value: &CborValue) -> Option<MerkleCommit> {
 
 fn sig_from_cbor(value: &CborValue) -> Option<SigEntry> {
     let map = as_map(value)?;
-    let cose_sign1 = match map_get(map, "cose_sign1")? {
-        CborValue::Array(chunks) => chunks
-            .iter()
-            .filter_map(|c| as_bytes(c).map(<[u8]>::to_vec))
-            .collect(),
-        _ => return None,
-    };
-    let cose_key = match map_get(map, "cose_key") {
-        Some(CborValue::Array(chunks)) => Some(
-            chunks
-                .iter()
-                .filter_map(|c| as_bytes(c).map(<[u8]>::to_vec))
-                .collect(),
-        ),
-        _ => None,
-    };
     Some(SigEntry {
-        cose_sign1,
-        cose_key,
+        cose_sign1: as_bytes(map_get(map, "cose_sign1")?)?.to_vec(),
+        cose_key: map_get(map, "cose_key")
+            .and_then(as_bytes)
+            .map(<[u8]>::to_vec),
     })
 }
 
 // ===========================================================================
-// CID profile
+// Label 309 CID profile
 // ===========================================================================
 
-/// Whether a CID conforms to the accepted-CID profile for `ipfs://` URIs.
+/// Whether a CID conforms to the Label 309 profile for `ipfs://` URIs.
 ///
-/// Accepts CIDv0 (`Qm…`, 46-char base58btc, sha2-256 multihash) and CIDv1
-/// (multibase prefix ∈ {b,B,f,F,z} → `<version=1><multicodec><multihash>`,
-/// multicodec ∈ {0x55, 0x70, 0x71}, multihash ∈ {0x12→32, 0xb220→32}).
+/// Accepts CIDv0 (`Qm` prefix, base58btc, sha2-256 multihash) and CIDv1
+/// (multibase prefix + version 0x01 + codec + multihash) per the closed
+/// profile:
+///
+/// - Multibase: `b`, `B`, `f`, `F`, `z`
+/// - Multicodec: `0x55` (raw), `0x70` (dag-pb), `0x71` (dag-cbor)
+/// - Multihash: `0x12` (sha2-256, 32 B), `0xb220` (blake2b-256, 32 B)
 #[must_use]
-pub fn is_valid_cid(cid: &str) -> bool {
+pub fn validate_cid_profile(cid: &str) -> bool {
     if cid.is_empty() {
         return false;
     }
+    // CIDv0: a base58btc-encoded sha2-256 multihash. Decode the WHOLE string
+    // and verify the multihash prefix (0x12 = sha2-256, 0x20 = 32-byte digest)
+    // and total length (34 bytes); a `Qm` prefix alone is not sufficient.
     if cid.starts_with("Qm") {
-        // CIDv0: a 46-char base58btc string that base58btc-decodes to exactly
-        // 34 bytes whose multihash prefix is sha2-256 (`0x12` code, `0x20` =
-        // 32-byte length). A length/prefix check on the DECODED bytes is what
-        // separates a real CIDv0 from any `Qm…`-shaped base58 string of the
-        // right character length (e.g. `Qm1…` decodes to the wrong multihash
-        // length byte and is rejected).
-        if cid.len() != 46 {
-            return false;
-        }
         return match decode_base58btc(cid) {
             Some(decoded) => decoded.len() == 34 && decoded[0] == 0x12 && decoded[1] == 0x20,
             None => false,
         };
     }
+    // CIDv1: multibase + binary CID body.
     let mb_prefix = cid.as_bytes()[0] as char;
     if !matches!(mb_prefix, 'b' | 'B' | 'f' | 'F' | 'z') {
         return false;
@@ -2785,7 +3469,7 @@ pub fn is_valid_cid(cid: &str) -> bool {
     if bytes.len() < 4 {
         return false;
     }
-    // <version varint> <multicodec varint> <multihash code varint> <len varint> <digest>
+    // CIDv1 layout: <version varint> <multicodec varint> <multihash>
     let (version, pos) = match read_varint(&bytes, 0) {
         Some(v) => v,
         None => return false,
@@ -2809,10 +3493,10 @@ pub fn is_valid_cid(cid: &str) -> bool {
         None => return false,
     };
     let expected = match mh_code {
-        0x12 | 0xb220 => 32usize,
+        0x12 | 0xb220 => 32u64,
         _ => return false,
     };
-    if digest_len as usize != expected {
+    if digest_len != expected {
         return false;
     }
     pos + digest_len as usize == bytes.len()
@@ -2831,18 +3515,18 @@ fn read_varint(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
         }
         shift += 7;
         if shift > 28 {
-            return None;
+            return None; // overflow guard; the profile uses ≤ 16-bit codes
         }
     }
     None
 }
 
+// Multibase decoders for the closed set the CID profile admits.
 fn decode_multibase(prefix: char, body: &str) -> Option<Vec<u8>> {
     match prefix {
         'b' => decode_base32(&body.to_ascii_lowercase(), false),
         'B' => decode_base32(&body.to_ascii_uppercase(), true),
-        'f' => decode_base16(&body.to_ascii_lowercase()),
-        'F' => decode_base16(&body.to_ascii_uppercase()),
+        'f' | 'F' => decode_base16(body),
         'z' => decode_base58btc(body),
         _ => None,
     }
@@ -2879,6 +3563,7 @@ fn decode_base32(s: &str, upper: bool) -> Option<Vec<u8>> {
     } else {
         b"abcdefghijklmnopqrstuvwxyz234567"
     };
+    // Multibase strips padding per spec; accept either form for robustness.
     let trimmed = s.trim_end_matches('=');
     let mut out: Vec<u8> = Vec::new();
     let mut buf: u32 = 0;
@@ -2953,27 +3638,15 @@ mod tests {
     #[test]
     fn encode_minimal_round_trips_through_validator() {
         let bytes = encode_poe_record(&minimal_record()).unwrap();
-        let result = validate_poe_record(&bytes);
+        let result = validate_poe_record(&bytes, &ValidatorOptions::default());
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn encode_is_deterministic_regardless_of_insertion_order() {
-        let mut record = minimal_record();
-        record.sigs = Some(vec![SigEntry {
-            cose_sign1: vec![vec![0u8; 60]],
-            cose_key: None,
-        }]);
-        let a = encode_poe_record(&record).unwrap();
-        let b = encode_poe_record(&record).unwrap();
-        assert_eq!(a, b);
     }
 
     #[test]
     fn body_encoding_strips_sigs_only() {
         let mut with_sigs = minimal_record();
         with_sigs.sigs = Some(vec![SigEntry {
-            cose_sign1: vec![vec![0x99u8; 64]],
+            cose_sign1: vec![0x99u8; 64],
             cose_key: None,
         }]);
         let body = encode_record_body_for_signing(&with_sigs).unwrap();
@@ -2982,12 +3655,19 @@ mod tests {
     }
 
     #[test]
-    fn extension_key_regex_matches_expected() {
+    fn extension_key_form() {
         assert!(is_extension_key("x-note"));
         assert!(is_extension_key("seal-foo"));
+        assert!(is_extension_key("abc-1"));
         assert!(!is_extension_key("x-"));
-        assert!(!is_extension_key("UPPERCASE-FOO"));
+        assert!(!is_extension_key("X-note"));
+        assert!(!is_extension_key("x9-foo"));
         assert!(!is_extension_key("nohyphen"));
+        // Control characters anywhere — including a trailing newline — put the
+        // key outside the namespace.
+        assert!(!is_extension_key("x-note\n"));
+        assert!(!is_extension_key("x-a\nb"));
+        assert!(!is_extension_key("x-a\u{007f}"));
     }
 
     #[test]
@@ -3000,29 +3680,32 @@ mod tests {
             "aes-128-ecb",
             "rc4",
             "des-ede3-cbc",
+            "3des-cbc",
         ] {
             assert!(is_unauthenticated_cipher(aead), "{aead}");
         }
-        for aead in ["aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305"] {
+        for aead in [
+            "aes-256-gcm",
+            "chacha20-poly1305",
+            "chacha20-poly1305-stream64k",
+            "aes-256-cbc\n",
+        ] {
             assert!(!is_unauthenticated_cipher(aead), "{aead}");
         }
     }
 
     #[test]
-    fn cidv0_profile_accepts_known_cid() {
-        assert!(is_valid_cid(
+    fn cid_profile_accepts_known_cidv0() {
+        assert!(validate_cid_profile(
             "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH"
         ));
-        assert!(!is_valid_cid("mAYIKsomethingbase64"));
+        assert!(!validate_cid_profile("mAYIKsomethingbase64"));
     }
 
     #[test]
-    fn error_code_strings_are_screaming_snake() {
-        assert_eq!(ErrorCode::MalformedCbor.code(), "MALFORMED_CBOR");
-        assert_eq!(
-            ErrorCode::EncSlotInvalidShape.code(),
-            "ENC_SLOT_INVALID_SHAPE"
-        );
-        assert_eq!(ErrorCode::SignatureUnsupported.severity(), Severity::Info);
+    fn registry_index_is_declaration_order() {
+        for (i, code) in ERROR_CODES.iter().enumerate() {
+            assert_eq!(code.registry_index(), i);
+        }
     }
 }

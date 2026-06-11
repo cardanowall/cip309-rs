@@ -1,146 +1,102 @@
-//! Sealed-PoE decryption (the recipient-verifier trial decrypt).
+//! Sealed-PoE decryption (the recipient verifier).
 //!
-//! For each `input.decryption[]` entry the verifier dispatches on the on-wire
-//! `enc` shape (`slots[]` → recipient path, `passphrase` → KDF path), acquires
-//! the ciphertext (caller-supplied bytes first, then `items[i].uris[]` over the
-//! gateway chain), unwraps, and recomputes every committed content hash against
-//! the recovered plaintext.
+//! For each `enc`-bearing item — when the run's decryption keyring is
+//! non-empty — the verifier acquires the ciphertext blob (out-of-band bytes,
+//! or fetched from `item.uris[]`), dispatches on the item's on-wire key path,
+//! and attempts every applicable keyring credential independently:
 //!
-//! This function never throws: a single malformed or unavailable item cannot
-//! abort the whole report — every failure becomes a `DecryptResult { ok: false }`
-//! row, and each ciphertext-fetch attempt surfaces as a `UriCheck` diagnostic.
+//! - `enc.slots` — the sealed-PoE trial-decrypt loop: per-slot acceptance
+//!   folds the KEM validity bit, the wrap-open, and the slot-set MAC over
+//!   `slots_hash` into one constant-time decision, then the recovered CEK
+//!   opens the segmented STREAM chunk by chunk.
+//! - `enc.passphrase` — Argon2id over the pinned-normalization passphrase,
+//!   the leading 32-byte key-commitment header verified in constant time
+//!   BEFORE any chunk opens, then the same STREAM open.
+//!
+//! Failure attribution:
+//!
+//! - `WRONG_RECIPIENT_KEY` / `TAMPERED_HEADER` bind to ON-CHAIN data (the
+//!   slot set and its MAC), so they are terminal for the item no matter which
+//!   blob was tried.
+//! - `TAMPERED_CIPHERTEXT` is blob-dependent: it holds the blob against the
+//!   record only when the blob is ATTRIBUTABLE (out-of-band, or fetched with
+//!   a verified content-address binding). The same failure over an
+//!   unattributable fetched blob is `URI_PROVIDER_INTEGRITY_MISMATCH`
+//!   (warning) and the remaining sources are tried; exhaustion without an
+//!   attributable blob ends as `CIPHERTEXT_UNAVAILABLE`.
+//! - The post-decryption plaintext-hash recheck needs no attribution
+//!   qualifier: ciphertext that opens under the authenticated envelope is
+//!   attributed by the AEAD itself, so a recheck mismatch is always
+//!   `URI_INTEGRITY_MISMATCH` and the record's verdict is `failed` — no
+//!   "decrypted" surface may outrank it.
+//!
+//! The crypto layer owns the whole passphrase path — the input cap, the
+//! pinned normalization profile, Argon2id, the constant-time commitment
+//! check, and the chunked content open — so no normalization is re-implemented
+//! here.
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use std::collections::BTreeMap;
 
-use crate::hash::{blake2b256, sha256};
-use crate::poe_standard::{EncryptionEnvelope, ItemEntry, PassphraseBlock, PoeRecord, Slot};
+use crate::poe_standard::{
+    EncScheme1, EncryptionEnvelope, ErrorCode, ItemEntry, PassphraseBlock, PathSegment, Slot,
+};
 use crate::sealed_poe::{
-    ad_content_passphrase, assert_ciphertext_within_bound, ecies_sealed_poe_unwrap,
-    passphrase_payload_key, sealed_envelope_from_parsed, xchacha20_poly1305_decrypt,
-    ParsedEnvelope, ParsedSlot, UnwrapFailureReason, UnwrapKeys, UnwrapResult,
+    ecies_sealed_poe_unwrap, passphrase_sealed_poe_open, sealed_envelope_from_parsed,
+    EciesSealedPoeError, EciesSealedPoeErrorCode, ParsedEnvelope, ParsedSlot, PassphraseOpenArgs,
+    PassphraseOpenResult, UnwrapFailureReason, UnwrapKeys, UnwrapResult,
 };
 
+use crate::verifier::content::{
+    provider_mismatch_path, recompute_item_hashes, walk_blob_sources, BlobWalkEnd,
+    ContentFetchPolicy, SourceDecision,
+};
 use crate::verifier::egress::GatewayFetcher;
-use crate::verifier::fetch_item::{fetch_item_ciphertext, FetchItemError};
-use crate::verifier::types::{
-    DecryptResult, Decryption, DecryptionFailureReason, UriCheck, VerifyTxInput,
-};
+use crate::verifier::types::{ContentCheck, Decryption, DecryptionOutcome, VerifierIssue};
 
-/// The single registered passphrase-KDF identifier in v1.
-const PASSPHRASE_KDF_ARGON2ID: &str = "argon2id";
+pub use crate::sealed_poe::MAX_PASSPHRASE_INPUT_BYTES;
 
-/// Maximum raw passphrase length, in UTF-8 bytes, enforced BEFORE normalization
-/// and the Argon2id KDF.
-///
-/// An oversized passphrase would otherwise drive unbounded NFKC /
-/// whitespace-collapse work and a large Argon2id input before any cost-bounded
-/// primitive runs; capping the raw input closes that pre-KDF DoS. The bound is
-/// byte length (`s.len()`), not code-point count, so a short string of wide
-/// multi-byte characters is still measured by its encoded size. 4096 bytes is
-/// far above any human-chosen passphrase. Identical across every SDK.
-pub const MAX_PASSPHRASE_INPUT_BYTES: usize = 4096;
+/// The result of one item's decryption attempt set.
+pub struct ItemDecryptionResult {
+    /// The item's per-claim content-check status.
+    pub content_check: ContentCheck,
+    /// The decryption outcome surfaced on the report's per-item entry.
+    pub decryption: DecryptionOutcome,
+}
 
-/// Walk `input.decryption[]` and produce one [`DecryptResult`] per entry, plus
-/// the per-attempt [`UriCheck`] diagnostics from any ciphertext fetches.
-#[must_use]
-pub fn try_decryptions(
-    record: &PoeRecord,
-    input: &VerifyTxInput<'_>,
-    fetcher: &mut GatewayFetcher<'_>,
-) -> (Vec<DecryptResult>, Vec<UriCheck>) {
-    let mut out = Vec::new();
-    let mut uri_checks = Vec::new();
-    let Some(reqs) = &input.decryption else {
-        return (out, uri_checks);
+/// One credential-set attempt over one blob.
+enum AttemptOutcome {
+    /// The envelope opened end-to-end.
+    Opened { plaintext: Vec<u8> },
+    /// Bound to on-chain data — retrying with a different blob cannot change
+    /// it (`WRONG_RECIPIENT_KEY` or `TAMPERED_HEADER`).
+    HeaderFailure { code: ErrorCode },
+    /// Blob-dependent: subject to the attribution split.
+    BlobFailure,
+    /// A caller-input / KDF problem independent of the blob — terminal.
+    InputFailure { code: ErrorCode, message: String },
+}
+
+/// Map a construction-API rejection to the wire error-code vocabulary. Codes
+/// that exist in the wire registry pass through verbatim; every other
+/// construction-local rejection maps to `KDF_DERIVATION_FAILED` (the input was
+/// rejected before derivation could run).
+fn input_failure_from(e: &EciesSealedPoeError) -> AttemptOutcome {
+    let code = match e.code {
+        EciesSealedPoeErrorCode::EncPassphraseUnnormalizable => {
+            ErrorCode::EncPassphraseUnnormalizable
+        }
+        EciesSealedPoeErrorCode::EncPassphraseEmpty => ErrorCode::EncPassphraseEmpty,
+        _ => ErrorCode::KdfDerivationFailed,
     };
-    let empty = Vec::new();
-    let items = record.items.as_ref().unwrap_or(&empty);
-
-    for dec in reqs {
-        let item_index = dec.item_index();
-        let idx = match usize::try_from(item_index) {
-            Ok(i) if i < items.len() => i,
-            _ => {
-                out.push(fail(item_index, DecryptionFailureReason::NoEncEnvelope));
-                continue;
-            }
-        };
-        let item = &items[idx];
-        let Some(enc) = &item.enc else {
-            out.push(fail(item_index, DecryptionFailureReason::NoEncEnvelope));
-            continue;
-        };
-
-        let is_sealed = is_sealed_envelope(enc);
-        let is_kdf = is_kdf_envelope(enc);
-        let req_recipient = matches!(dec, Decryption::Recipient { .. });
-        let req_passphrase = matches!(dec, Decryption::Passphrase { .. });
-
-        if is_sealed && !req_recipient {
-            out.push(fail(
-                item_index,
-                DecryptionFailureReason::WrongDecryptionInputShape,
-            ));
-            continue;
-        }
-        if is_kdf && !req_passphrase {
-            out.push(fail(
-                item_index,
-                DecryptionFailureReason::WrongDecryptionInputShape,
-            ));
-            continue;
-        }
-        if !is_sealed && !is_kdf {
-            out.push(fail(item_index, DecryptionFailureReason::NoEncEnvelope));
-            continue;
-        }
-
-        let ciphertext = match acquire_ciphertext(item, item_index, input, fetcher, &mut uri_checks)
-        {
-            Ok(bytes) => bytes,
-            Err(reason) => {
-                out.push(fail(item_index, reason));
-                continue;
-            }
-        };
-
-        let result = match dec {
-            Decryption::Recipient {
-                recipient_secret_key,
-                ..
-            } => try_sealed(item, enc, item_index, recipient_secret_key, &ciphertext),
-            Decryption::Passphrase { passphrase, .. } => {
-                try_kdf(item, enc, item_index, passphrase, &ciphertext)
-            }
-        };
-        out.push(result);
+    AttemptOutcome::InputFailure {
+        code,
+        message: e.to_string(),
     }
-
-    (out, uri_checks)
-}
-
-fn fail(item_index: i64, reason: DecryptionFailureReason) -> DecryptResult {
-    DecryptResult {
-        item_index,
-        ok: false,
-        plaintext_hash_ok: None,
-        reason: Some(reason),
-    }
-}
-
-fn is_sealed_envelope(enc: &EncryptionEnvelope) -> bool {
-    enc.slots.is_some() && enc.slots_mac.is_some()
-}
-
-fn is_kdf_envelope(enc: &EncryptionEnvelope) -> bool {
-    enc.passphrase.is_some() && enc.slots.is_none() && enc.slots_mac.is_none()
 }
 
 /// Convert the typed `enc` block into the permissive [`ParsedEnvelope`] the
 /// crypto layer's [`sealed_envelope_from_parsed`] consumes.
-fn to_parsed_envelope(enc: &EncryptionEnvelope) -> ParsedEnvelope {
+fn to_parsed_envelope(enc: &EncScheme1) -> ParsedEnvelope {
     ParsedEnvelope {
         scheme: i64::try_from(enc.scheme).ok(),
         aead: Some(enc.aead.clone()),
@@ -160,107 +116,51 @@ fn to_parsed_envelope(enc: &EncryptionEnvelope) -> ParsedEnvelope {
     }
 }
 
-fn try_sealed(
+/// The item's content-hash map in the shape the crypto layer consumes.
+fn item_hashes(item: &ItemEntry) -> BTreeMap<String, Vec<u8>> {
+    item.hashes.iter().cloned().collect()
+}
+
+fn attempt_slots_path(
+    enc: &EncScheme1,
     item: &ItemEntry,
-    enc: &EncryptionEnvelope,
-    item_index: i64,
-    recipient_secret_key: &[u8],
     ciphertext: &[u8],
-) -> DecryptResult {
+    secret_keys: &[Vec<u8>],
+) -> AttemptOutcome {
     let Some(envelope) = sealed_envelope_from_parsed(&to_parsed_envelope(enc)) else {
-        return fail(item_index, DecryptionFailureReason::NoEncEnvelope);
+        // Unreachable on a structurally validated record (the recipient-role
+        // validator hard-rejects every envelope it cannot fully validate);
+        // defensively classed as a header failure.
+        return AttemptOutcome::HeaderFailure {
+            code: ErrorCode::TamperedHeader,
+        };
     };
-    // constant_time_n = true so the standalone verifier visits every slot: it
-    // keeps the per-slot timing uniform AND lets the CEK-conflict defence see a
-    // later slot recovering a CEK that differs from the selected one (a
-    // commitment collision is rejected, never silently decrypted under the first
-    // CEK). A one-shot recipient verify is not a hot loop, so the full-scan cost
-    // is irrelevant here.
+    let hashes = item_hashes(item);
     let unwrap = match ecies_sealed_poe_unwrap(
         &envelope,
         ciphertext,
-        UnwrapKeys::Single(recipient_secret_key),
-        true,
+        &hashes,
+        UnwrapKeys::Multi(secret_keys),
         None,
     ) {
         Ok(u) => u,
-        Err(_) => return fail(item_index, DecryptionFailureReason::NoEncEnvelope),
+        Err(e) => return input_failure_from(&e),
     };
     match unwrap {
-        UnwrapResult::Matched { plaintext } => hash_check_result(item, item_index, &plaintext),
-        UnwrapResult::NotMatched { reason } => {
-            let r = match reason {
-                UnwrapFailureReason::WrongRecipientKey => {
-                    DecryptionFailureReason::WrongRecipientKey
-                }
-                UnwrapFailureReason::TamperedHeader => DecryptionFailureReason::TamperedHeader,
-                UnwrapFailureReason::TamperedCiphertext => {
-                    DecryptionFailureReason::TamperedCiphertext
-                }
-            };
-            fail(item_index, r)
-        }
+        UnwrapResult::Matched { plaintext } => AttemptOutcome::Opened { plaintext },
+        UnwrapResult::NotMatched { reason } => match reason {
+            UnwrapFailureReason::WrongRecipientKey => AttemptOutcome::HeaderFailure {
+                code: ErrorCode::WrongRecipientKey,
+            },
+            UnwrapFailureReason::TamperedHeader => AttemptOutcome::HeaderFailure {
+                code: ErrorCode::TamperedHeader,
+            },
+            UnwrapFailureReason::TamperedCiphertext => AttemptOutcome::BlobFailure,
+        },
     }
 }
 
-fn try_kdf(
-    item: &ItemEntry,
-    enc: &EncryptionEnvelope,
-    item_index: i64,
-    passphrase: &str,
-    ciphertext: &[u8],
-) -> DecryptResult {
-    let Some(block) = &enc.passphrase else {
-        return fail(item_index, DecryptionFailureReason::NoEncEnvelope);
-    };
-    if block.alg != PASSPHRASE_KDF_ARGON2ID {
-        return fail(item_index, DecryptionFailureReason::KdfDerivationFailed);
-    }
-    // Pre-KDF input cap: reject an oversized raw passphrase before normalization
-    // or Argon2id, so it cannot drive unbounded pre-KDF work. Byte length of the
-    // raw UTF-8 string, not code-point count.
-    if passphrase.len() > MAX_PASSPHRASE_INPUT_BYTES {
-        return fail(item_index, DecryptionFailureReason::KdfDerivationFailed);
-    }
-    let normalised = normalise_passphrase(passphrase);
-    let mut cek = match derive_kek_from_passphrase(normalised.as_bytes(), block) {
-        Ok(k) => k,
-        Err(()) => return fail(item_index, DecryptionFailureReason::KdfDerivationFailed),
-    };
-    if enc.aead != "xchacha20-poly1305" {
-        cek.zeroize();
-        return fail(item_index, DecryptionFailureReason::KdfDerivationFailed);
-    }
-    // Reject an over-large ciphertext before the single-shot AEAD open.
-    if assert_ciphertext_within_bound(ciphertext.len() as u64).is_err() {
-        cek.zeroize();
-        return fail(item_index, DecryptionFailureReason::KdfDerivationFailed);
-    }
-    // Content is opened under a payload_key derived from the CEK, with a
-    // structured AAD that binds the passphrase-KDF parameters: tampering with
-    // `salt` or any `params` value after encryption changes the AAD and makes
-    // the AEAD open fail. The normalization profile id is pinned into the AAD as
-    // a scheme-fixed constant. The CEK never keys the content AEAD directly.
-    let (m, t, p) = match (param(block, "m"), param(block, "t"), param(block, "p")) {
-        (Some(m), Some(t), Some(p)) => (m, t, p),
-        _ => {
-            cek.zeroize();
-            return fail(item_index, DecryptionFailureReason::KdfDerivationFailed);
-        }
-    };
-    let mut payload_key = passphrase_payload_key(&cek, &enc.nonce);
-    cek.zeroize();
-    let aad = ad_content_passphrase(&enc.nonce, &block.alg, &block.salt, m, t, p);
-    let result = match xchacha20_poly1305_decrypt(&payload_key, &enc.nonce, &aad, ciphertext) {
-        Ok(plaintext) => hash_check_result(item, item_index, &plaintext),
-        Err(_) => fail(item_index, DecryptionFailureReason::TamperedCiphertext),
-    };
-    payload_key.zeroize();
-    result
-}
-
-/// Read a named Argon2id parameter, returning `None` when absent. The AAD binds
-/// the unsigned parameter values exactly as they appear on the wire.
+/// Read a named Argon2id parameter from the on-wire params list.
 fn param(block: &PassphraseBlock, name: &str) -> Option<u64> {
     block
         .params
@@ -269,236 +169,350 @@ fn param(block: &PassphraseBlock, name: &str) -> Option<u64> {
         .map(|(_, v)| *v)
 }
 
-/// The 25 codepoints carrying the Unicode `White_Space` property under Unicode
-/// 16.0. The passphrase normalization profile collapses every maximal run of
-/// these to a single U+0020. This is an explicit set on purpose: neither a regex
-/// `\s` class nor a language `is_whitespace` predicate matches this set exactly,
-/// and the CEK derivation must be byte-identical across implementations. In
-/// particular, `char::is_whitespace` also matches the C0 information separators
-/// U+001C–U+001F, which are NOT `White_Space` and must NOT collapse here.
-const UNICODE_WHITE_SPACE: [char; 25] = [
-    '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}', '\u{00a0}',
-    '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
-    '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}',
-    '\u{3000}',
-];
-
-/// Apply the `cardano-poe-pw-norm-v1` profile: NFKC (UAX #15, Unicode 16.0),
-/// collapse every maximal run of `White_Space` to a single U+0020, trim a single
-/// leading/trailing space, then return the UTF-8 string. The producer applies
-/// the identical transform, so a single divergence here yields a CEK that fails
-/// to decrypt an honest record. Case is deliberately NOT folded — the
-/// CEK-derivation path is case-sensitive.
-fn normalise_passphrase(passphrase: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let nfkc: String = passphrase.nfkc().collect();
-    let mut collapsed = String::with_capacity(nfkc.len());
-    let mut in_run = false;
-    for ch in nfkc.chars() {
-        if is_normalise_whitespace(ch) {
-            if !in_run {
-                collapsed.push(' ');
-                in_run = true;
-            }
-        } else {
-            collapsed.push(ch);
-            in_run = false;
-        }
-    }
-    // Trim a single leading then a single trailing collapsed U+0020 (every run
-    // is already a single space). Mirrors the reference `strip(" ")` over a
-    // string whose only spaces are the collapsed separators.
-    let after_lead = collapsed.strip_prefix(' ').unwrap_or(&collapsed);
-    after_lead
-        .strip_suffix(' ')
-        .unwrap_or(after_lead)
-        .to_string()
-}
-
-/// Whether `ch` is `White_Space` for passphrase normalisation, per the explicit
-/// [`UNICODE_WHITE_SPACE`] set. `char::is_whitespace` is deliberately NOT used —
-/// it includes the C0 information separators U+001C–U+001F, which are not
-/// `White_Space` and would derive a different CEK from the same passphrase.
-fn is_normalise_whitespace(ch: char) -> bool {
-    UNICODE_WHITE_SPACE.contains(&ch)
-}
-
-/// Derive the 32-byte CEK from a normalised passphrase via Argon2id v1.3.
-///
-/// Returns `Err(())` for an unsupported KDF alg or any out-of-range Argon2
-/// parameter (so the caller surfaces `KDF_DERIVATION_FAILED` rather than
-/// panicking on untrusted record-supplied parameters).
-fn derive_kek_from_passphrase(passphrase: &[u8], block: &PassphraseBlock) -> Result<[u8; 32], ()> {
-    if block.alg != PASSPHRASE_KDF_ARGON2ID {
-        return Err(());
-    }
-    let get = |name: &str| {
-        block
-            .params
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| *v)
-    };
-    let m = u32::try_from(get("m").ok_or(())?).map_err(|_| ())?;
-    let t = u32::try_from(get("t").ok_or(())?).map_err(|_| ())?;
-    let p = u32::try_from(get("p").ok_or(())?).map_err(|_| ())?;
-    let params = Params::new(m, t, p, Some(32)).map_err(|_| ())?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; 32];
-    argon
-        .hash_password_into(passphrase, &block.salt, &mut out)
-        .map_err(|_| ())?;
-    Ok(out)
-}
-
-/// Recompute every committed content hash against the recovered plaintext.
-///
-/// A single mismatch (or an unrecognised hash alg) yields `ok: true,
-/// plaintext_hash_ok: false, reason: URI_INTEGRITY_MISMATCH`; an all-match yields
-/// `ok: true, plaintext_hash_ok: true`.
-fn hash_check_result(item: &ItemEntry, item_index: i64, plaintext: &[u8]) -> DecryptResult {
-    let mut any_mismatch = false;
-    for (alg, claimed) in &item.hashes {
-        let recomputed: Vec<u8> = match alg.as_str() {
-            "sha2-256" => sha256(plaintext).to_vec(),
-            "blake2b-256" => blake2b256(plaintext).to_vec(),
-            _ => {
-                any_mismatch = true;
-                continue;
-            }
-        };
-        if recomputed.ct_eq(claimed).unwrap_u8() != 1 {
-            any_mismatch = true;
-        }
-    }
-    if any_mismatch {
-        DecryptResult {
-            item_index,
-            ok: true,
-            plaintext_hash_ok: Some(false),
-            reason: Some(DecryptionFailureReason::UriIntegrityMismatch),
-        }
-    } else {
-        DecryptResult {
-            item_index,
-            ok: true,
-            plaintext_hash_ok: Some(true),
-            reason: None,
-        }
-    }
-}
-
-/// Acquire an item's ciphertext: caller-supplied bytes, then `item.uris[]` over
-/// the Arweave gateway chain, then a typed failure.
-/// Acquire an item's ciphertext: caller-supplied out-of-band bytes first, then
-/// (when the item carries `uris[]`) the canonical [`fetch_item_ciphertext`]
-/// primitive over the gateway chain, which records one [`UriCheck`] per attempt.
-///
-/// The error projects to the decryption verdict exactly as the reference
-/// verifier does: no `uris[]` → [`DecryptionFailureReason::CiphertextUnavailable`];
-/// an in-set scheme with no reachable gateway → `ContentUnavailable`; a URI whose
-/// scheme is out of the fetch set → `UriTargetForbidden`.
-fn acquire_ciphertext(
+fn attempt_passphrase_path(
+    enc: &EncScheme1,
+    block: &PassphraseBlock,
     item: &ItemEntry,
-    item_index: i64,
-    input: &VerifyTxInput<'_>,
+    blob: &[u8],
+    passphrases: &[String],
+) -> AttemptOutcome {
+    let (Some(m), Some(t), Some(p)) = (param(block, "m"), param(block, "t"), param(block, "p"))
+    else {
+        return AttemptOutcome::InputFailure {
+            code: ErrorCode::KdfDerivationFailed,
+            message: "the on-wire Argon2id parameter set is missing m, t, or p".to_string(),
+        };
+    };
+    let hashes = item_hashes(item);
+    let mut first_failure: Option<AttemptOutcome> = None;
+    for passphrase in passphrases {
+        let outcome = match passphrase_sealed_poe_open(PassphraseOpenArgs {
+            blob,
+            passphrase,
+            aead: &enc.aead,
+            alg: &block.alg,
+            salt: &block.salt,
+            m,
+            t,
+            p,
+            nonce: &enc.nonce,
+            hashes: &hashes,
+        }) {
+            Ok(PassphraseOpenResult::Opened { plaintext }) => AttemptOutcome::Opened { plaintext },
+            // Wrong passphrase, tampered salt/params/header fields, a spliced
+            // envelope, or a tampered stream — indistinguishable by design.
+            Ok(PassphraseOpenResult::Rejected) => AttemptOutcome::BlobFailure,
+            Err(e) => input_failure_from(&e),
+        };
+        if matches!(outcome, AttemptOutcome::Opened { .. }) {
+            return outcome;
+        }
+        first_failure.get_or_insert(outcome);
+    }
+    // The credential list is non-empty by construction (the caller filtered
+    // applicable credentials before dispatching here).
+    first_failure.unwrap_or(AttemptOutcome::InputFailure {
+        code: ErrorCode::KdfDerivationFailed,
+        message: "no passphrase credential was supplied".to_string(),
+    })
+}
+
+/// Decrypt one `enc`-bearing item with the run's keyring.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_item(
+    item: &ItemEntry,
+    item_index: usize,
+    credentials: &[Decryption],
+    out_of_band_ciphertext: Option<&[u8]>,
+    fetch_content: bool,
+    policy: &ContentFetchPolicy<'_>,
     fetcher: &mut GatewayFetcher<'_>,
-    uri_checks: &mut Vec<UriCheck>,
-) -> Result<Vec<u8>, DecryptionFailureReason> {
-    if let Some(bytes_map) = &input.ciphertext_bytes {
-        if let Some(bytes) = bytes_map.get(&item_index) {
-            return Ok(bytes.clone());
+    issues: &mut Vec<VerifierIssue>,
+) -> ItemDecryptionResult {
+    let item_path = vec![
+        PathSegment::Key("items".to_string()),
+        PathSegment::Index(item_index),
+    ];
+    let enc_path = || {
+        let mut p = item_path.clone();
+        p.push(PathSegment::Key("enc".to_string()));
+        p
+    };
+
+    // Dispatch on the item's on-wire key path. The two paths are mutually
+    // exclusive on a validated record (ENC_EXCLUSIVITY_VIOLATION), and the
+    // recipient-role validator hard-rejects an envelope it cannot fully
+    // validate, so an opaque or path-less envelope here is defensively classed
+    // as a header failure.
+    let (scheme1, is_slots_path) = match &item.enc {
+        Some(EncryptionEnvelope::Scheme1(enc)) if enc.slots.is_some() => (Some(enc), true),
+        Some(EncryptionEnvelope::Scheme1(enc)) if enc.passphrase.is_some() => (Some(enc), false),
+        _ => (None, false),
+    };
+    let Some(enc) = scheme1 else {
+        issues.push(VerifierIssue::new(
+            ErrorCode::TamperedHeader,
+            enc_path(),
+            "the envelope carries no decryptable key path",
+        ));
+        return ItemDecryptionResult {
+            content_check: ContentCheck::NotChecked,
+            decryption: DecryptionOutcome {
+                decrypted: false,
+                plaintext_hash_ok: None,
+                code: Some(ErrorCode::TamperedHeader),
+            },
+        };
+    };
+
+    // Applicable credentials for the item's key path. The keyring is global to
+    // the run: every credential of the applicable shape is attempted.
+    let mut secret_keys: Vec<Vec<u8>> = Vec::new();
+    let mut passphrases: Vec<String> = Vec::new();
+    for credential in credentials {
+        match credential {
+            Decryption::Recipient {
+                recipient_secret_key,
+            } => secret_keys.push(recipient_secret_key.clone()),
+            Decryption::Passphrase { passphrase } => passphrases.push(passphrase.clone()),
         }
     }
-
-    let has_uris = item.uris.as_ref().is_some_and(|u| !u.is_empty());
-    if !has_uris {
-        return Err(DecryptionFailureReason::CiphertextUnavailable);
+    let applicable = if is_slots_path {
+        secret_keys.len()
+    } else {
+        passphrases.len()
+    };
+    if applicable == 0 {
+        issues.push(VerifierIssue::new(
+            ErrorCode::WrongDecryptionInputShape,
+            enc_path(),
+            if is_slots_path {
+                "the keyring holds no recipient secret key for this slots-path item"
+            } else {
+                "the keyring holds no passphrase for this passphrase-path item"
+            },
+        ));
+        return ItemDecryptionResult {
+            content_check: ContentCheck::NotChecked,
+            decryption: DecryptionOutcome {
+                decrypted: false,
+                plaintext_hash_ok: None,
+                code: Some(ErrorCode::WrongDecryptionInputShape),
+            },
+        };
     }
 
-    let uris = item.uris.as_deref().unwrap_or(&[]);
-    match fetch_item_ciphertext(
-        uris,
+    let walk = walk_blob_sources(
+        out_of_band_ciphertext,
+        item.uris.as_deref().unwrap_or(&[]),
+        fetch_content,
+        &item_path,
+        policy,
         fetcher,
-        uri_checks,
-        item_index,
-        input.arweave_gateway_chain.as_deref(),
-        input.ipfs_gateway_chain.as_deref(),
-    ) {
-        Ok(bytes) => Ok(bytes),
-        Err(FetchItemError::UriTargetForbidden) => Err(DecryptionFailureReason::UriTargetForbidden),
-        Err(FetchItemError::ContentUnavailable(_)) => {
-            Err(DecryptionFailureReason::ContentUnavailable)
+        issues,
+        |blob, issues| {
+            let outcome = if is_slots_path {
+                attempt_slots_path(enc, item, blob.bytes, &secret_keys)
+            } else {
+                let block: &PassphraseBlock = match &enc.passphrase {
+                    Some(b) => b,
+                    None => unreachable!("passphrase path implies a passphrase block"),
+                };
+                attempt_passphrase_path(enc, block, item, blob.bytes, &passphrases)
+            };
+            match outcome {
+                AttemptOutcome::Opened { plaintext } => {
+                    let plaintext_hash_ok = recompute_item_hashes(&item.hashes, &plaintext);
+                    if plaintext_hash_ok {
+                        SourceDecision::Accept(ItemDecryptionResult {
+                            content_check: ContentCheck::Checked,
+                            decryption: DecryptionOutcome {
+                                decrypted: true,
+                                plaintext_hash_ok: Some(true),
+                                code: None,
+                            },
+                        })
+                    } else {
+                        issues.push(VerifierIssue::new(
+                            ErrorCode::UriIntegrityMismatch,
+                            item_path.clone(),
+                            "decryption succeeded but the post-decryption plaintext-hash recheck failed; decrypted bytes are attributed by the AEAD itself, so the record is condemned",
+                        ));
+                        SourceDecision::Accept(ItemDecryptionResult {
+                            content_check: ContentCheck::Mismatched,
+                            decryption: DecryptionOutcome {
+                                decrypted: true,
+                                plaintext_hash_ok: Some(false),
+                                code: Some(ErrorCode::UriIntegrityMismatch),
+                            },
+                        })
+                    }
+                }
+                AttemptOutcome::HeaderFailure { code } => {
+                    issues.push(VerifierIssue::new(
+                        code,
+                        enc_path(),
+                        match code {
+                            ErrorCode::WrongRecipientKey => {
+                                "no slot accepted any supplied recipient key — the key is not a recipient of this sealed PoE"
+                            }
+                            _ => {
+                                "a slot wrap-opened but no candidate content-encryption key reproduces slots_mac — the authenticated envelope header fails its integrity check"
+                            }
+                        },
+                    ));
+                    SourceDecision::Accept(ItemDecryptionResult {
+                        content_check: ContentCheck::NotChecked,
+                        decryption: DecryptionOutcome {
+                            decrypted: false,
+                            plaintext_hash_ok: None,
+                            code: Some(code),
+                        },
+                    })
+                }
+                AttemptOutcome::BlobFailure => {
+                    if blob.attributable() {
+                        issues.push(VerifierIssue::new(
+                            ErrorCode::TamperedCiphertext,
+                            enc_path(),
+                            "the ciphertext blob failed the decryption layer and is attributable (out-of-band, or content-address-bound to its URI); the record is condemned",
+                        ));
+                        SourceDecision::Accept(ItemDecryptionResult {
+                            content_check: ContentCheck::Mismatched,
+                            decryption: DecryptionOutcome {
+                                decrypted: false,
+                                plaintext_hash_ok: None,
+                                code: Some(ErrorCode::TamperedCiphertext),
+                            },
+                        })
+                    } else {
+                        issues.push(VerifierIssue::new(
+                            ErrorCode::UriProviderIntegrityMismatch,
+                            provider_mismatch_path(&item_path, blob),
+                            format!(
+                                "ciphertext bytes fetched from {:?} fail the decryption layer and could not be attributed to the URI's content address; the serving provider is indicted, not the record",
+                                blob.uri.unwrap_or("unknown source")
+                            ),
+                        ));
+                        SourceDecision::NextSource
+                    }
+                }
+                AttemptOutcome::InputFailure { code, message } => {
+                    issues.push(VerifierIssue::new(code, enc_path(), message));
+                    SourceDecision::Accept(ItemDecryptionResult {
+                        content_check: ContentCheck::NotChecked,
+                        decryption: DecryptionOutcome {
+                            decrypted: false,
+                            plaintext_hash_ok: None,
+                            code: Some(code),
+                        },
+                    })
+                }
+            }
+        },
+    );
+
+    match walk {
+        BlobWalkEnd::Done(result) => result,
+        BlobWalkEnd::Exhausted { limit_exceeded } => {
+            let end_code = if limit_exceeded {
+                ErrorCode::ContentFetchLimitExceeded
+            } else {
+                ErrorCode::CiphertextUnavailable
+            };
+            issues.push(VerifierIssue::new(
+                end_code,
+                item_path,
+                if limit_exceeded {
+                    "a ciphertext fetch for this item was aborted at the max-fetch-bytes ceiling; decryption could not proceed"
+                } else {
+                    "no out-of-band ciphertext was supplied and no URI yielded an attributable blob; decryption could not proceed"
+                },
+            ));
+            ItemDecryptionResult {
+                content_check: ContentCheck::NotChecked,
+                decryption: DecryptionOutcome {
+                    decrypted: false,
+                    plaintext_hash_ok: None,
+                    code: Some(end_code),
+                },
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod cap_tests {
-    //! A4 — pre-KDF passphrase length cap (4096 UTF-8 bytes), enforced before
-    //! normalization / Argon2id. Exercised at the `try_kdf` function level: an
-    //! over-cap passphrase is rejected as KdfDerivationFailed before any KDF
-    //! work; an at-cap passphrase still decrypts.
+    //! The pre-KDF passphrase length cap (4096 UTF-8 bytes), enforced by the
+    //! crypto layer before normalization / Argon2id, exercised through the
+    //! verifier's passphrase attempt: an over-cap passphrase is rejected as
+    //! KDF_DERIVATION_FAILED before any KDF work; an at-cap passphrase still
+    //! decrypts.
 
     use super::*;
     use crate::hash::sha256;
-    use crate::sealed_poe::xchacha20_poly1305_encrypt;
+    use crate::sealed_poe::{passphrase_sealed_poe_seal, PassphraseSealArgs};
 
-    // Cost-minimal Argon2id params for test speed (below the producer floor, but
-    // the verifier does not re-enforce floors).
-    const M: u32 = 8;
-    const T: u32 = 1;
-    const P: u32 = 1;
+    // Floor-valued Argon2id params: the construction enforces the registry
+    // floors at both seal and open, so this is the cheapest set it accepts.
+    const M: u64 = 65536;
+    const T: u64 = 3;
+    const P: u64 = 1;
 
     fn passphrase_block(salt: &[u8]) -> PassphraseBlock {
         PassphraseBlock {
-            alg: PASSPHRASE_KDF_ARGON2ID.to_string(),
+            alg: "argon2id".to_string(),
             salt: salt.to_vec(),
             params: vec![
-                ("m".to_string(), u64::from(M)),
-                ("t".to_string(), u64::from(T)),
-                ("p".to_string(), u64::from(P)),
+                ("m".to_string(), M),
+                ("t".to_string(), T),
+                ("p".to_string(), P),
             ],
         }
     }
 
-    fn build_ciphertext(passphrase: &str, salt: &[u8], nonce: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        // Producer recompute matching `try_kdf`'s derivation.
-        let normalised = normalise_passphrase(passphrase);
-        let params = Params::new(M, T, P, Some(32)).expect("argon2 params");
-        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut cek = [0u8; 32];
-        argon
-            .hash_password_into(normalised.as_bytes(), salt, &mut cek)
-            .expect("argon2 derive");
-        let payload_key = passphrase_payload_key(&cek, nonce);
-        let aad = ad_content_passphrase(
-            nonce,
-            PASSPHRASE_KDF_ARGON2ID,
+    fn build_blob(passphrase: &str, salt: &[u8], nonce: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let hashes: BTreeMap<String, Vec<u8>> =
+            [("sha2-256".to_string(), sha256(plaintext).to_vec())].into();
+        passphrase_sealed_poe_seal(PassphraseSealArgs {
+            plaintext,
+            passphrase,
             salt,
-            u64::from(M),
-            u64::from(T),
-            u64::from(P),
-        );
-        xchacha20_poly1305_encrypt(&payload_key, nonce, &aad, plaintext)
+            m: M,
+            t: T,
+            p: P,
+            nonce,
+            hashes: &hashes,
+        })
+        .expect("seal")
     }
 
-    fn item_with(salt: &[u8], nonce: &[u8], plaintext: &[u8]) -> (ItemEntry, EncryptionEnvelope) {
+    fn item_with(salt: &[u8], nonce: &[u8], plaintext: &[u8]) -> (ItemEntry, EncScheme1) {
+        let enc = EncScheme1 {
+            scheme: 1,
+            aead: "chacha20-poly1305-stream64k".to_string(),
+            nonce: nonce.to_vec(),
+            kem: None,
+            slots: None,
+            slots_mac: None,
+            passphrase: Some(passphrase_block(salt)),
+        };
         let item = ItemEntry {
             hashes: vec![("sha2-256".to_string(), sha256(plaintext).to_vec())],
             uris: None,
-            enc: Some(EncryptionEnvelope {
-                scheme: 1,
-                aead: "xchacha20-poly1305".to_string(),
-                nonce: nonce.to_vec(),
-                kem: None,
-                slots: None,
-                slots_mac: None,
-                passphrase: Some(passphrase_block(salt)),
-            }),
+            enc: Some(EncryptionEnvelope::Scheme1(enc.clone())),
         };
-        let enc = item.enc.clone().expect("enc set");
         (item, enc)
+    }
+
+    fn attempt(
+        item: &ItemEntry,
+        enc: &EncScheme1,
+        blob: &[u8],
+        passphrase: &str,
+    ) -> AttemptOutcome {
+        let block = enc.passphrase.as_ref().expect("passphrase block");
+        attempt_passphrase_path(enc, block, item, blob, &[passphrase.to_string()])
     }
 
     #[test]
@@ -511,15 +525,19 @@ mod cap_tests {
         let salt = [0x42u8; 16];
         let nonce = [0x00u8; 24];
         let plaintext = b"cap test";
+        // The blob is sealed under an in-cap passphrase; the oversized entry is
+        // rejected at the input cap before any KDF work.
+        let blob = build_blob("in-cap passphrase", &salt, &nonce, plaintext);
         let oversized = "a".repeat(MAX_PASSPHRASE_INPUT_BYTES + 1); // 4097 ASCII bytes
-        let ciphertext = build_ciphertext(&oversized, &salt, &nonce, plaintext);
         let (item, enc) = item_with(&salt, &nonce, plaintext);
-        let result = try_kdf(&item, &enc, 0, &oversized, &ciphertext);
-        assert!(!result.ok);
-        assert_eq!(
-            result.reason,
-            Some(DecryptionFailureReason::KdfDerivationFailed)
-        );
+        let outcome = attempt(&item, &enc, &blob, &oversized);
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::InputFailure {
+                code: ErrorCode::KdfDerivationFailed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -528,11 +546,13 @@ mod cap_tests {
         let nonce = [0x00u8; 24];
         let plaintext = b"cap test";
         let at_cap = "a".repeat(MAX_PASSPHRASE_INPUT_BYTES); // 4096 ASCII bytes
-        let ciphertext = build_ciphertext(&at_cap, &salt, &nonce, plaintext);
+        let blob = build_blob(&at_cap, &salt, &nonce, plaintext);
         let (item, enc) = item_with(&salt, &nonce, plaintext);
-        let result = try_kdf(&item, &enc, 0, &at_cap, &ciphertext);
-        assert!(result.ok, "at-cap passphrase must decrypt");
-        assert_eq!(result.plaintext_hash_ok, Some(true));
+        let outcome = attempt(&item, &enc, &blob, &at_cap);
+        let AttemptOutcome::Opened { plaintext: opened } = outcome else {
+            panic!("at-cap passphrase must decrypt");
+        };
+        assert_eq!(opened, plaintext);
     }
 
     #[test]
@@ -543,16 +563,18 @@ mod cap_tests {
         let salt = [0x42u8; 16];
         let nonce = [0x00u8; 24];
         let plaintext = b"cap test";
+        let blob = build_blob("in-cap passphrase", &salt, &nonce, plaintext);
         let multibyte_over_cap = "\u{1F680}".repeat(1025);
         assert!(multibyte_over_cap.chars().count() < MAX_PASSPHRASE_INPUT_BYTES);
         assert!(multibyte_over_cap.len() > MAX_PASSPHRASE_INPUT_BYTES);
-        let ciphertext = build_ciphertext(&multibyte_over_cap, &salt, &nonce, plaintext);
         let (item, enc) = item_with(&salt, &nonce, plaintext);
-        let result = try_kdf(&item, &enc, 0, &multibyte_over_cap, &ciphertext);
-        assert!(!result.ok);
-        assert_eq!(
-            result.reason,
-            Some(DecryptionFailureReason::KdfDerivationFailed)
-        );
+        let outcome = attempt(&item, &enc, &blob, &multibyte_over_cap);
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::InputFailure {
+                code: ErrorCode::KdfDerivationFailed,
+                ..
+            }
+        ));
     }
 }

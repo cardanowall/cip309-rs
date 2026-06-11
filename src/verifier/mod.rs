@@ -18,10 +18,10 @@
 //!   DNS-rebinding.
 
 pub mod cbor_walker;
+pub mod content;
 pub mod decrypt;
 pub mod egress;
 pub mod fetch;
-pub mod fetch_item;
 pub mod merkle;
 pub mod profile;
 pub mod resolve;
@@ -31,21 +31,30 @@ pub mod tx_witnesses;
 pub mod types;
 pub mod verify;
 
-pub use cbor_walker::extract_label_309_metadata;
+pub use cbor_walker::{
+    bind_transaction, extract_auxiliary_data_hash, extract_label_309_metadata,
+    reassemble_label_309_value, slice_tx, unwrap_auxiliary_data, CarriageError, TxBindingError,
+    TxSlices, UnwrappedAux,
+};
+pub use content::{
+    parse_cid, recompute_item_hashes, verify_ipfs_cid_binding, CidBindingOutcome,
+    ContentFetchPolicy, ParsedCid, ARWEAVE_GATEWAY_DEFAULTS,
+};
+pub use decrypt::{decrypt_item, ItemDecryptionResult};
 pub use egress::GatewayFetcher;
-pub use fetch_item::{fetch_item_ciphertext, FetchItemError};
+pub use merkle::{check_merkle_commit, MerkleCommitOutcome};
 pub use profile::{detect_conformance_profile, out_of_profile_issues, profile_at_least};
 pub use resolve::{
-    resolve_cardano_tx, ResolveError, ResolvedTx, BLOCKFROST_MAINNET_HOST, KOIOS_MAINNET_URL,
+    resolve_cardano_tx, ResolveFailure, ResolvedTx, BLOCKFROST_MAINNET_HOST, KOIOS_MAINNET_URL,
 };
 pub use serialize::verify_report_to_dict;
 pub use signatures::verify_record_signatures;
 pub use tx_witnesses::{decode_tx_summary, decode_tx_witnesses};
 pub use types::{
-    CardanoNetwork, DecryptResult, Decryption, DecryptionFailureReason, ExitCode, MerkleCheck,
-    MerkleCheckReason, PathSegment, Profile, SigFailureReason, SignatureCheck, SignerType,
-    TxDescription, UriCheck, UriFailureReason, ValidationSummary, Verdict, VerifierIssue,
-    VerifyReport, VerifyTxInput, VerifyTxOutput, VerifyTxSummary, VerifyTxWitness,
-    CONFIRMATION_DEPTH_THRESHOLD_DEFAULT, DEFAULT_PROFILE, NETWORK_CARDANO_MAINNET,
+    compare_verifier_issues, BlockInfo, CardanoNetwork, ContentCheck, Decryption,
+    DecryptionOutcome, ItemReportEntry, MerkleReportEntry, Profile, SigFailureReason,
+    SignatureCheck, SignerType, TxDescription, Verdict, VerifierIssue, VerifyReport, VerifyTxInput,
+    VerifyTxOutput, VerifyTxSummary, VerifyTxWitness, CONFIRMATION_DEPTH_THRESHOLD_DEFAULT,
+    DEFAULT_PROFILE,
 };
-pub use verify::verify_tx;
+pub use verify::{verify_record_bytes, verify_tx, ZeroConfirmationDepthError};

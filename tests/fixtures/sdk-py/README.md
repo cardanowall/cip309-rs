@@ -25,6 +25,12 @@ One subdirectory per primitive family:
 - `cose/` — COSE_Sign1 (build + verify + strict-Ed25519 + Sig_structure)
 - `sealed-poe/` — multi-recipient sealed-PoE wrap + unwrap (N=1, 3, 32 + negative)
 - `seed-derive/` — seed → Ed25519/X25519/X-Wing derivation
+- `validator/` — structural-validator corpora (negative, positive, role-dependent, bounds)
+- `carriage/` — label-309 chunk-array transport + auxiliary-data envelope forms
+- `cardano/` — transaction-reference integrity binding + confirmation-depth semantics
+
+`verify-report.schema.json` is the mirrored published verifier-report JSON
+Schema, consumed by the report-projection tests.
 
 ## Parity contract
 

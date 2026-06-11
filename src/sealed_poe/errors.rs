@@ -1,16 +1,20 @@
 //! Sealed-PoE wire-shape and input-validation error taxonomy.
 //!
-//! These are the typed failures the wrap, unwrap, and trial-decrypt paths
-//! raise *before* (and around) the cryptographic core: a bad recipient-key
-//! length, an unsupported algorithm identifier, a slot field that is the wrong
-//! size. They map one-to-one onto the `EciesSealedPoeError` codes the
-//! TypeScript and Python SDKs raise, so cross-implementation tests can assert
-//! the exact same `code` string.
+//! These are the typed failures the wrap, unwrap, trial-decrypt, and
+//! passphrase seal/open paths raise *before* (and around) the cryptographic
+//! core: a bad recipient-key length, an unsupported algorithm identifier, a
+//! slot field that is the wrong size. They map one-to-one onto the
+//! `EciesSealedPoeError` codes the TypeScript and Python SDKs raise, so
+//! cross-implementation tests can assert the exact same `code` string. Codes
+//! that name a condition the wire-format registry also names reuse the
+//! registry string verbatim; conditions with no wire counterpart (RNG
+//! failures, raw input length errors) carry construction-only names.
 //!
 //! A failed *decryption* (wrong recipient key, a tampered MAC, a tampered
-//! ciphertext) is NOT an error here — it is a structured non-match returned by
-//! the unwrap path, never an exception. The codes below are reserved for
-//! malformed input and unsupported-algorithm conditions the caller can fix.
+//! ciphertext, a wrong passphrase) is NOT an error here — it is a structured
+//! non-match returned by the unwrap / open path, never an exception. The codes
+//! below are reserved for malformed input and unsupported-algorithm conditions
+//! the caller can fix.
 
 use thiserror::Error;
 
@@ -62,11 +66,12 @@ pub enum EciesSealedPoeErrorCode {
     EncSlotsMacInvalidLength,
     /// A recipient public key (wrap) or slot `epk` was the wrong length.
     KemEpkLengthMismatch,
-    /// A hybrid slot's `kem_ct` did not reassemble to the 1120-byte X-Wing enc.
+    /// A hybrid slot's `kem_ct` was not exactly the 1120-byte X-Wing
+    /// ciphertext.
     KemCtLengthMismatch,
     /// The content-encryption key was not exactly 32 bytes.
     InvalidCekLength,
-    /// The content nonce was not exactly 24 bytes.
+    /// The envelope nonce was not exactly 24 bytes.
     NonceLengthMismatch,
     /// A supplied ephemeral secret / `eseed` was the wrong length.
     InvalidEphemeralSecretLength,
@@ -74,8 +79,8 @@ pub enum EciesSealedPoeErrorCode {
     /// recipient count, or an override was supplied for the wrong KEM.
     EphemeralSecretsCountMismatch,
     /// The envelope `scheme` was not the supported value `1`.
-    UnsupportedEncVersion,
-    /// The envelope `aead` was not `xchacha20-poly1305`.
+    UnsupportedEnvelopeScheme,
+    /// The envelope `aead` was not `chacha20-poly1305-stream64k`.
     UnsupportedAeadAlg,
     /// The envelope `kem` was not `x25519` or `mlkem768x25519`.
     UnsupportedKemAlg,
@@ -87,11 +92,11 @@ pub enum EciesSealedPoeErrorCode {
     /// A per-slot `wrap` field was not exactly 48 bytes.
     WrapLengthMismatch,
     /// Two slots carry identical per-slot KEM material (a duplicate `epk` for
-    /// x25519, or a duplicate reassembled `kem_ct` for the hybrid path). The
-    /// zero-nonce per-slot wrap is sound only under per-slot KEK uniqueness;
-    /// repeated KEM material derives the same KEK and so repeats the (KEK,
-    /// nonce) pair. Rejected on both the producer side (before committing to the
-    /// wire) and the verifier side (before any decapsulation).
+    /// x25519, or a duplicate `kem_ct` for the hybrid path). The zero-nonce
+    /// per-slot wrap is sound only under per-slot KEK uniqueness; repeated KEM
+    /// material derives the same KEK and so repeats the (KEK, nonce) pair.
+    /// Rejected on both the producer side (before committing to the wire) and
+    /// the verifier side (before any decapsulation).
     EncSlotsDuplicateKemMaterial,
     /// The envelope carried more than `MAX_SLOTS` slots. A resource bound a
     /// public parser enforces before any KEM/AEAD primitive, so a malformed
@@ -101,10 +106,42 @@ pub enum EciesSealedPoeErrorCode {
     /// `MAX_DECODED_ENVELOPE_BYTES`. A resource backstop enforced before any
     /// KEM/AEAD primitive.
     EncEnvelopeTooLarge,
-    /// A payload at or above the XChaCha20-Poly1305 single-shot keystream bound
-    /// (`2^38 - 64` plaintext bytes, `+16` for the ciphertext). Enforced on both
-    /// encrypt and decrypt before the AEAD primitive runs.
-    PayloadTooLarge,
+    /// An `enc`-bearing item's `hashes` map was empty. The construction binds
+    /// the ciphertext to the plaintext only through the item's content-hash
+    /// claim, so there must be at least one entry to bind.
+    EncRequiresContentHash,
+    /// The passphrase KDF identifier was not `argon2id` (the sole registered
+    /// passphrase KDF).
+    EncPassphraseAlgUnsupported,
+    /// The passphrase salt was shorter than 16 bytes.
+    EncPassphraseSaltTooShort,
+    /// The passphrase salt was longer than 64 bytes.
+    EncPassphraseSaltTooLong,
+    /// The Argon2id parameters were below the registry floors (`m >= 65536`
+    /// KiB, `t >= 3`, `p >= 1`). Enforced at both seal and open, before any
+    /// KDF work, so a below-floor passphrase envelope is categorically
+    /// outside the construction.
+    EncPassphraseArgon2ParamsTooLow,
+    /// An Argon2id parameter was outside the wire range `0..2^32-1` (a raw
+    /// caller-input error with no wire counterpart: the wire encoding cannot
+    /// carry such a value as a valid uint).
+    InvalidPassphraseParams,
+    /// The supplied passphrase normalized to the empty string under the
+    /// pinned normalization profile — a whitespace-only or otherwise vacuous
+    /// passphrase, which would key the record to a CEK any party can derive.
+    EncPassphraseEmpty,
+    /// The supplied passphrase contains a code point that Unicode 16.0 leaves
+    /// unassigned, refused before any normalization step runs: normalization
+    /// of an unassigned code point is not stable across Unicode versions, so
+    /// accepting one could silently change the derived key later.
+    EncPassphraseUnnormalizable,
+    /// The raw passphrase exceeded `MAX_PASSPHRASE_INPUT_BYTES` UTF-8 bytes,
+    /// rejected before any normalization or KDF work (a pre-KDF
+    /// denial-of-service bound on caller input; no wire counterpart).
+    PassphraseInputTooLong,
+    /// The passphrase KDF (Argon2id) rejected its inputs at runtime — a
+    /// derivation failure distinct from structural parameter checks.
+    KdfDerivationFailed,
     /// The operating-system CSPRNG could not be read while drawing the CEK,
     /// content nonce, or per-recipient ephemeral material for a secure wrap.
     /// This is reported, never panicked: a wrap with no entropy must fail
@@ -131,7 +168,7 @@ impl EciesSealedPoeErrorCode {
             Self::NonceLengthMismatch => "NONCE_LENGTH_MISMATCH",
             Self::InvalidEphemeralSecretLength => "INVALID_EPHEMERAL_SECRET_LENGTH",
             Self::EphemeralSecretsCountMismatch => "EPHEMERAL_SECRETS_COUNT_MISMATCH",
-            Self::UnsupportedEncVersion => "UNSUPPORTED_ENC_VERSION",
+            Self::UnsupportedEnvelopeScheme => "UNSUPPORTED_ENVELOPE_SCHEME",
             Self::UnsupportedAeadAlg => "UNSUPPORTED_AEAD_ALG",
             Self::UnsupportedKemAlg => "UNSUPPORTED_KEM_ALG",
             Self::InvalidEnvelopeShape => "INVALID_ENVELOPE_SHAPE",
@@ -140,7 +177,16 @@ impl EciesSealedPoeErrorCode {
             Self::EncSlotsDuplicateKemMaterial => "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
             Self::EncSlotsTooMany => "ENC_SLOTS_TOO_MANY",
             Self::EncEnvelopeTooLarge => "ENC_ENVELOPE_TOO_LARGE",
-            Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
+            Self::EncRequiresContentHash => "ENC_REQUIRES_CONTENT_HASH",
+            Self::EncPassphraseAlgUnsupported => "ENC_PASSPHRASE_ALG_UNSUPPORTED",
+            Self::EncPassphraseSaltTooShort => "ENC_PASSPHRASE_SALT_TOO_SHORT",
+            Self::EncPassphraseSaltTooLong => "ENC_PASSPHRASE_SALT_TOO_LONG",
+            Self::EncPassphraseArgon2ParamsTooLow => "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW",
+            Self::InvalidPassphraseParams => "INVALID_PASSPHRASE_PARAMS",
+            Self::EncPassphraseEmpty => "ENC_PASSPHRASE_EMPTY",
+            Self::EncPassphraseUnnormalizable => "ENC_PASSPHRASE_UNNORMALIZABLE",
+            Self::PassphraseInputTooLong => "PASSPHRASE_INPUT_TOO_LONG",
+            Self::KdfDerivationFailed => "KDF_DERIVATION_FAILED",
             Self::RngUnavailable => "RNG_UNAVAILABLE",
         }
     }

@@ -43,4 +43,7 @@ pub mod poe_standard;
 pub mod recipient;
 pub mod sealed_poe;
 pub mod seed_derive;
+pub mod seed_encoding;
+pub mod unicode_nfkc16;
+mod unicode_nfkc16_data;
 pub mod verifier;

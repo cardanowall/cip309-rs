@@ -40,20 +40,13 @@ use reqwest::dns::{Addrs, Resolve, Resolving};
 use std::sync::Arc;
 
 /// Canonical deny-host list a service-independent verifier rejects so a record
-/// can never be made to "verify" only because it reached the operator's own host
-/// or a loopback address.
+/// can never be made to "verify" only because it reached a loopback address.
 ///
-/// Producers SHOULD pass this through the deny-host configuration on every
-/// verifier invocation. The wrapper accepts arbitrary lists, but this canonical
-/// set is exported so callers do not duplicate it inline. The `cardanowall.com`
-/// entries are the operator-host hazard; `localhost` / `127.0.0.1` close the
-/// loopback-indirection hazard.
-pub const DENY_HOSTS_DEFAULT: [&str; 4] = [
-    "cardanowall.com",
-    "*.cardanowall.com",
-    "localhost",
-    "127.0.0.1",
-];
+/// The wrapper accepts arbitrary lists; this canonical set is exported so
+/// callers do not duplicate it inline. Deployments add their own operator
+/// hosts on top — the service-independence hazard is any host the verifying
+/// party itself controls, which only the deployment can name.
+pub const DENY_HOSTS_DEFAULT: [&str; 2] = ["localhost", "127.0.0.1"];
 
 /// Default per-request timeout for an outbound gateway fetch.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -116,12 +109,19 @@ impl HttpPurpose {
 }
 
 /// The closed set of HTTP methods the egress allows.
+///
+/// `PUT` is admitted because the gateway's resumable-upload protocol uploads each
+/// chunk with an idempotent positional `PUT`; it carries the same deny-host /
+/// SSRF / protocol pre-flight every other method does, so the security boundary
+/// is unchanged. `DELETE`, `PATCH`, and the rest remain unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     /// HTTP `GET`.
     Get,
     /// HTTP `POST`.
     Post,
+    /// HTTP `PUT` (idempotent positional chunk upload).
+    Put,
 }
 
 impl HttpMethod {
@@ -131,6 +131,7 @@ impl HttpMethod {
         match self {
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
         }
     }
 }
@@ -182,7 +183,7 @@ pub struct FetchOutboundResult {
 
 /// Audit-log entry for one outbound HTTP fetch.
 ///
-/// Field names mirror the wire shape (`VerifyReport.http_calls[]`) so the record
+/// Field names mirror the wire shape (the report's audit trail) so the record
 /// can land there without a key-renaming pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpCallRecord {
@@ -190,8 +191,9 @@ pub struct HttpCallRecord {
     pub url: String,
     /// The method as recorded (a rejected pre-flight is recorded as `GET`).
     pub method: HttpMethod,
-    /// HTTP status, or `0` for a call that never produced a response.
-    pub status: u16,
+    /// The HTTP status when a response was received; `None` when none was
+    /// (refused call, transport failure) — serialised as JSON null.
+    pub status: Option<u16>,
     /// Number of body bytes received (`0` for a failed/rejected call).
     pub bytes: u64,
     /// Wall-clock duration, in milliseconds.
@@ -487,9 +489,9 @@ pub trait FetchTransport: Send + Sync {
 /// the audit trail.
 ///
 /// Pre-flight rejections (deny-host, protocol, method, webhook) record a single
-/// audit row with `status: 0` and a `GET` method, then return immediately. On
-/// each transport invocation one audit row is appended. With `retries == 0` the
-/// terminal transport error is returned verbatim; with `retries > 0` it is
+/// audit row with a null `status` and a `GET` method, then return immediately.
+/// On each transport invocation one audit row is appended. With `retries == 0`
+/// the terminal transport error is returned verbatim; with `retries > 0` it is
 /// wrapped in [`OutboundError::Exhausted`].
 #[allow(clippy::too_many_arguments)]
 pub fn wrap_fetch_outbound(
@@ -530,7 +532,7 @@ pub fn wrap_fetch_outbound(
             audit.push(HttpCallRecord {
                 url: url.to_string(),
                 method: opts.method,
-                status: 0,
+                status: None,
                 bytes: 0,
                 duration_ms: 0,
                 purpose: opts.purpose,
@@ -554,7 +556,7 @@ pub fn wrap_fetch_outbound(
                 audit.push(HttpCallRecord {
                     url: url.to_string(),
                     method: opts.method,
-                    status: result.status,
+                    status: Some(result.status),
                     bytes: result.bytes.len() as u64,
                     duration_ms: result.duration_ms,
                     purpose: opts.purpose,
@@ -579,7 +581,7 @@ pub fn wrap_fetch_outbound(
                 audit.push(HttpCallRecord {
                     url: url.to_string(),
                     method: opts.method,
-                    status: 0,
+                    status: None,
                     bytes: 0,
                     duration_ms: 0,
                     purpose: opts.purpose,
@@ -609,12 +611,13 @@ pub fn wrap_fetch_outbound(
     })
 }
 
-/// The audit row recorded for a pre-flight rejection: `GET`, all-zero counters.
+/// The audit row recorded for a pre-flight rejection: `GET`, null status,
+/// zero counters.
 fn preflight_row(url: &str, purpose: HttpPurpose) -> HttpCallRecord {
     HttpCallRecord {
         url: url.to_string(),
         method: HttpMethod::Get,
-        status: 0,
+        status: None,
         bytes: 0,
         duration_ms: 0,
         purpose,
@@ -638,6 +641,7 @@ pub fn parse_http_method(method: &str, url: &str) -> Result<HttpMethod, Outbound
     match method {
         "GET" => Ok(HttpMethod::Get),
         "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
         other => Err(OutboundError::UnsupportedMethod {
             method: other.to_string(),
             url: url.to_string(),
@@ -723,10 +727,20 @@ impl ReqwestTransport {
             .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
             .redirect(reqwest::redirect::Policy::none());
         if let Some((host, addr)) = &self.pinned {
-            builder = builder.dns_resolver(Arc::new(PinnedResolver {
-                host: host.clone(),
-                addr: *addr,
-            }));
+            builder = builder
+                .dns_resolver(Arc::new(PinnedResolver {
+                    host: host.clone(),
+                    addr: *addr,
+                }))
+                // Pinned mode is the user-supplied-URL (webhook) path: the
+                // connection must target the IP the SSRF guard validated. reqwest
+                // honours HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the environment by
+                // default, which would route the request through a proxy and
+                // around the pin — the proxy could then reach a private host the
+                // range-block thought it had excluded. Clearing proxy inheritance
+                // keeps the socket pointed at the validated address. The generic
+                // (unpinned) path leaves proxy support intact for chain fetches.
+                .no_proxy();
         }
         builder.build().map_err(|e| OutboundError::Transport {
             url: String::new(),
@@ -749,6 +763,7 @@ impl FetchTransport for ReqwestTransport {
         let method = match opts.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
         };
         let mut req = client.request(method, url);
         for (k, v) in &opts.headers {
@@ -1429,30 +1444,36 @@ mod tests {
 
     #[test]
     fn deny_exact_and_negative() {
-        assert!(matches_deny_list("cardanowall.com", &["cardanowall.com"]));
-        assert!(!matches_deny_list("other.com", &["cardanowall.com"]));
+        assert!(matches_deny_list("operator.example", &["operator.example"]));
+        assert!(!matches_deny_list("other.example", &["operator.example"]));
     }
 
     #[test]
     fn deny_wildcard_subdomain_but_not_bare() {
         assert!(matches_deny_list(
-            "api.cardanowall.com",
-            &["*.cardanowall.com"]
+            "api.operator.example",
+            &["*.operator.example"]
         ));
         assert!(matches_deny_list(
-            "nested.api.cardanowall.com",
-            &["*.cardanowall.com"]
+            "nested.api.operator.example",
+            &["*.operator.example"]
         ));
         assert!(!matches_deny_list(
-            "cardanowall.com",
-            &["*.cardanowall.com"]
+            "operator.example",
+            &["*.operator.example"]
         ));
     }
 
     #[test]
     fn deny_case_and_trailing_dot() {
-        assert!(matches_deny_list("CardanoWall.com.", &["cardanowall.com"]));
-        assert!(matches_deny_list("CARDANOWALL.COM.", &["cardanowall.com"]));
+        assert!(matches_deny_list(
+            "Operator.Example.",
+            &["operator.example"]
+        ));
+        assert!(matches_deny_list(
+            "OPERATOR.EXAMPLE.",
+            &["operator.example"]
+        ));
     }
 
     #[test]
@@ -1473,21 +1494,13 @@ mod tests {
     #[test]
     fn deny_public_control_and_empty_list() {
         assert!(!matches_deny_list("8.8.8.8", &["localhost", "127.0.0.1"]));
-        assert!(!matches_deny_list("cardanowall.com", &[] as &[&str]));
+        assert!(!matches_deny_list("operator.example", &[] as &[&str]));
         assert!(!matches_deny_list("127.0.0.1", &[] as &[&str]));
     }
 
     #[test]
     fn deny_hosts_default_constant() {
-        assert_eq!(
-            DENY_HOSTS_DEFAULT,
-            [
-                "cardanowall.com",
-                "*.cardanowall.com",
-                "localhost",
-                "127.0.0.1"
-            ]
-        );
+        assert_eq!(DENY_HOSTS_DEFAULT, ["localhost", "127.0.0.1"]);
     }
 
     // ---- wrapper: deny short-circuit ----
@@ -1499,22 +1512,22 @@ mod tests {
         let err = run(
             &transport,
             &mut audit,
-            &cfg(&["cardanowall.com"], 0),
-            "https://cardanowall.com/x",
+            &cfg(&["operator.example"], 0),
+            "https://operator.example/x",
             &FetchOutboundOptions::new(HttpMethod::Get, HttpPurpose::Https),
         )
         .unwrap_err();
         assert_eq!(err.code(), "SERVICE_INDEPENDENCE_VIOLATION");
         match err {
             OutboundError::DenyHost { host, url } => {
-                assert_eq!(host, "cardanowall.com");
-                assert_eq!(url, "https://cardanowall.com/x");
+                assert_eq!(host, "operator.example");
+                assert_eq!(url, "https://operator.example/x");
             }
             other => panic!("expected DenyHost, got {other:?}"),
         }
         assert_eq!(transport.call_count(), 0);
         assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].status, 0);
+        assert_eq!(audit[0].status, None);
         assert_eq!(audit[0].duration_ms, 0);
         assert_eq!(audit[0].purpose, HttpPurpose::Https);
     }
@@ -1546,13 +1559,13 @@ mod tests {
             assert_eq!(transport.call_count(), 0);
             assert_eq!(audit.len(), 1);
             assert_eq!(audit[0].method, HttpMethod::Get);
-            assert_eq!(audit[0].status, 0);
+            assert_eq!(audit[0].status, None);
         }
     }
 
     #[test]
-    fn parse_method_rejects_non_get_post() {
-        for m in ["PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+    fn parse_method_rejects_methods_outside_the_allowlist() {
+        for m in ["DELETE", "PATCH", "HEAD", "OPTIONS"] {
             let err = parse_http_method(m, "https://example.com/x").unwrap_err();
             assert_eq!(err.code(), "UNSUPPORTED_METHOD");
             match err {
@@ -1567,6 +1580,12 @@ mod tests {
         assert_eq!(
             parse_http_method("POST", "https://x/").unwrap(),
             HttpMethod::Post
+        );
+        // PUT is admitted for the resumable-upload chunk path; it rides the same
+        // deny-host / SSRF pre-flight as GET and POST.
+        assert_eq!(
+            parse_http_method("PUT", "https://x/").unwrap(),
+            HttpMethod::Put
         );
     }
 
@@ -1585,7 +1604,7 @@ mod tests {
         assert!(matches!(err, OutboundError::WebhookPurposeRejected { .. }));
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].purpose, HttpPurpose::Webhook);
-        assert_eq!(audit[0].status, 0);
+        assert_eq!(audit[0].status, None);
     }
 
     // ---- wrapper: audit shape + ordering ----
@@ -1610,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_errored_fetch_records_status_zero_then_rethrows() {
+    fn wrap_errored_fetch_records_null_status_then_rethrows() {
         let transport = StubTransport::from(vec![Err(OutboundError::Transport {
             url: "https://example.com/x".into(),
             message: "boom".into(),
@@ -1626,7 +1645,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, OutboundError::Transport { .. }));
         assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].status, 0);
+        assert_eq!(audit[0].status, None);
         assert_eq!(audit[0].bytes, 0);
     }
 
@@ -1678,7 +1697,7 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(
             audit.iter().map(|a| a.status).collect::<Vec<_>>(),
-            vec![503, 200]
+            vec![Some(503), Some(200)]
         );
         // One backoff before attempt 2, base 1000ms × jitter 1.0.
         assert_eq!(clock.millis(), vec![1000.0]);

@@ -1,37 +1,38 @@
-//! Byte-parity tests for the sealed-PoE enc.scheme 1 construction: the
-//! passphrase-path KAT, the hybrid (X-Wing) per-slot KEK salt, the construction
-//! negatives, and the cross-implementation behavioural pins (the single-shot
-//! payload bound, per-slot KEK-uniqueness rejection, the 25-codepoint
-//! `White_Space` normalization set, and passphrase round-trip / AAD-tamper /
-//! normalization-equivalence).
+//! Byte-parity and behavioural tests for the sealed-PoE `enc.scheme: 1`
+//! construction: the passphrase-path seal/open KAT and behaviour matrix, the
+//! per-slot KEK-salt pins for both KEMs, the construction negatives, the
+//! passphrase normalization profile, per-slot KEK-uniqueness rejection, the
+//! verifier resource bounds, and the canonical transcript byte pins.
 //!
 //! Every assertion pins bytes, verdicts, or structural error codes against the
-//! shared fixtures under `crypto-core/tests/fixtures/sealed-poe/`, never log
-//! strings.
+//! shared fixtures under `crypto-core/tests/fixtures/sealed-poe/` (or against
+//! in-test constructions), never log strings.
 
 mod common;
 
 use std::collections::BTreeMap;
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use cardanowall::cbor::{encode_canonical_cbor, CborValue};
 use cardanowall::hex;
-use cardanowall::poe_standard::{EncryptionEnvelope, ItemEntry, PassphraseBlock, PoeRecord, Slot};
+use cardanowall::poe_standard::{
+    EncScheme1, EncryptionEnvelope, ItemEntry, PassphraseBlock, PoeRecord, Slot,
+};
 use cardanowall::sealed_poe::{
-    ad_content_passphrase, ad_content_slots, assert_ciphertext_within_bound,
-    assert_plaintext_within_bound, canonicalize_slots, chunk_kem_ct, compute_slots_hash,
-    ecies_sealed_poe_unwrap, ecies_sealed_poe_wrap_with_rng, mlkem768x25519_public_key_from_seed,
-    passphrase_payload_key, xchacha20_poly1305_encrypt, xwing_kek_salt, Mlkem768X25519Slot,
-    SealedEnvelope, SealedSlots, UnwrapFailureReason, UnwrapKeys, UnwrapResult, WrapArgs,
-    X25519Slot, AEAD_XCHACHA20_POLY1305, MAX_DECODED_ENVELOPE_BYTES, MAX_SEALED_CIPHERTEXT,
-    MAX_SEALED_PLAINTEXT, MAX_SLOTS,
+    compute_passphrase_hash, compute_slots_hash, ecies_sealed_poe_unwrap,
+    ecies_sealed_poe_wrap_with_rng, item_hashes_hash, mlkem768x25519_public_key_from_seed,
+    normalize_passphrase, passphrase_sealed_poe_open, passphrase_sealed_poe_seal,
+    passphrase_transcript_bytes, slots_transcript_bytes, x25519_kek_salt, x25519_public_key,
+    xwing_kek_salt, EciesSealedPoeError, Mlkem768X25519Slot, PassphraseOpenArgs,
+    PassphraseOpenResult, PassphraseSealArgs, SealedEnvelope, SealedSlots, UnwrapFailureReason,
+    UnwrapKeys, UnwrapResult, WrapArgs, X25519Slot, AEAD_CHACHA20_POLY1305_STREAM64K,
+    MAX_DECODED_ENVELOPE_BYTES, MAX_SLOTS, PASSPHRASE_COMMITMENT_LENGTH, PASSPHRASE_KDF_ARGON2ID,
 };
 use cardanowall::seed_derive::xwing_keygen;
-use cardanowall::verifier::decrypt::try_decryptions;
 use cardanowall::verifier::fetch::{
     FetchOutboundOptions, FetchOutboundResult, FetchTransport, OutboundError,
 };
-use cardanowall::verifier::{Decryption, GatewayFetcher, VerifyTxInput};
+use cardanowall::verifier::{
+    decrypt_item, ContentFetchPolicy, Decryption, DecryptionOutcome, GatewayFetcher,
+};
 use common::{crypto_core_fixtures, read_fixture_json};
 use serde_json::Value;
 
@@ -57,6 +58,28 @@ fn fill(byte: u8, n: usize) -> Vec<u8> {
     vec![byte; n]
 }
 
+/// The fixture's `hashes` object (algorithm identifier → digest hex).
+fn hashes_from(v: &Value) -> BTreeMap<String, Vec<u8>> {
+    v["hashes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("field `hashes` must be an object: {v}"))
+        .iter()
+        .map(|(alg, digest)| {
+            (
+                alg.clone(),
+                hex::decode(digest.as_str().expect("hex digest")).expect("valid hex"),
+            )
+        })
+        .collect()
+}
+
+/// A deterministic in-test hashes map for behavioural cases.
+fn test_hashes() -> BTreeMap<String, Vec<u8>> {
+    let mut map = BTreeMap::new();
+    map.insert("sha2-256".to_string(), vec![0x5au8; 32]);
+    map
+}
+
 /// A transport that refuses every call — every decrypt test here supplies the
 /// ciphertext out-of-band, so the gateway is never consulted.
 struct NoFetchTransport;
@@ -74,52 +97,6 @@ impl FetchTransport for NoFetchTransport {
     }
 }
 
-/// Argon2id v1.3 over the explicit (m, t, p) cost parameters — the reference
-/// CEK-derivation, recomputed here so the passphrase KAT can pin the CEK→
-/// payload_key→ciphertext chain end-to-end without exporting the KDF.
-fn argon2id_cek(password: &[u8], salt: &[u8], m: u32, t: u32, p: u32) -> [u8; 32] {
-    let params = Params::new(m, t, p, Some(32)).expect("valid Argon2 params");
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; 32];
-    argon
-        .hash_password_into(password, salt, &mut out)
-        .expect("Argon2id derivation");
-    out
-}
-
-/// The `cardano-poe-pw-norm-v1` profile, recomputed in-test to pin the
-/// normalization equivalence cases against the production normaliser without
-/// depending on its internal symbol.
-fn normalize_passphrase(passphrase: &str) -> Vec<u8> {
-    use unicode_normalization::UnicodeNormalization;
-    let white_space: [char; 25] = [
-        '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
-        '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
-        '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
-        '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
-    ];
-    let nfkc: String = passphrase.nfkc().collect();
-    let mut collapsed = String::new();
-    let mut in_run = false;
-    for ch in nfkc.chars() {
-        if white_space.contains(&ch) {
-            if !in_run {
-                collapsed.push(' ');
-                in_run = true;
-            }
-        } else {
-            collapsed.push(ch);
-            in_run = false;
-        }
-    }
-    let after_lead = collapsed.strip_prefix(' ').unwrap_or(&collapsed);
-    after_lead
-        .strip_suffix(' ')
-        .unwrap_or(after_lead)
-        .as_bytes()
-        .to_vec()
-}
-
 /// Build a passphrase-path single-item record around an `enc.passphrase` block.
 fn passphrase_record(
     salt: &[u8],
@@ -134,15 +111,15 @@ fn passphrase_record(
         items: Some(vec![ItemEntry {
             hashes: vec![("sha2-256".to_string(), digest)],
             uris: None,
-            enc: Some(EncryptionEnvelope {
+            enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
                 scheme: 1,
-                aead: "xchacha20-poly1305".to_string(),
+                aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
                 nonce: nonce.to_vec(),
                 kem: None,
                 slots: None,
                 slots_mac: None,
                 passphrase: Some(PassphraseBlock {
-                    alg: "argon2id".to_string(),
+                    alg: PASSPHRASE_KDF_ARGON2ID.to_string(),
                     salt: salt.to_vec(),
                     params: vec![
                         ("m".to_string(), m),
@@ -150,37 +127,55 @@ fn passphrase_record(
                         ("p".to_string(), p),
                     ],
                 }),
-            }),
+            })),
         }]),
         ..PoeRecord::default()
     }
 }
 
-/// Run `try_decryptions` for one passphrase entry with out-of-band ciphertext,
-/// returning the single decryption row.
+/// Run the recipient verifier's per-item decrypt over the record's first item
+/// with out-of-band ciphertext and a single-credential keyring, returning the
+/// per-item decryption outcome.
+fn decrypt_row(record: &PoeRecord, ciphertext: &[u8], credential: Decryption) -> DecryptionOutcome {
+    let transport = NoFetchTransport;
+    let mut fetcher = GatewayFetcher::new(&transport, None);
+    let mut issues = Vec::new();
+    let policy = ContentFetchPolicy {
+        arweave_gateways: &[],
+        ipfs_gateways: &[],
+        max_fetch_bytes: None,
+    };
+    let item = &record.items.as_ref().expect("items")[0];
+    decrypt_item(
+        item,
+        0,
+        &[credential],
+        Some(ciphertext),
+        true,
+        &policy,
+        &mut fetcher,
+        &mut issues,
+    )
+    .decryption
+}
+
+/// [`decrypt_row`] for a passphrase credential.
 fn decrypt_passphrase_row(
     record: &PoeRecord,
     ciphertext: Vec<u8>,
     passphrase: &str,
-) -> cardanowall::verifier::DecryptResult {
-    let transport = NoFetchTransport;
-    let mut fetcher = GatewayFetcher::new(&transport, None);
-    let mut ciphertext_bytes = BTreeMap::new();
-    ciphertext_bytes.insert(0, ciphertext);
-    let input = VerifyTxInput {
-        decryption: Some(vec![Decryption::Passphrase {
-            item_index: 0,
+) -> DecryptionOutcome {
+    decrypt_row(
+        record,
+        &ciphertext,
+        Decryption::Passphrase {
             passphrase: passphrase.to_string(),
-        }]),
-        ciphertext_bytes: Some(ciphertext_bytes),
-        ..VerifyTxInput::new("00")
-    };
-    let (rows, _checks) = try_decryptions(record, &input, &mut fetcher);
-    rows.into_iter().next().expect("one decryption row")
+        },
+    )
 }
 
 // --------------------------------------------------------------------------
-// Passphrase-path KAT (passphrase-n1.json)
+// Passphrase-path KAT (passphrase-n1.json; fixture-driven)
 // --------------------------------------------------------------------------
 
 #[test]
@@ -194,49 +189,132 @@ fn passphrase_n1_full_kat() {
     let p = v["params"]["p"].as_u64().unwrap();
     let nonce = b(v, "nonce_hex");
     let plaintext = b(v, "plaintext_hex");
-    let expected_ciphertext = b(v, "expected_ciphertext_hex");
+    let hashes = hashes_from(v);
 
-    // Reproduce the producer byte recipe: CEK = Argon2id(normalize(pw));
-    // payload_key = HKDF(CEK, salt=nonce, info=payload-passphrase-v1);
-    // AAD = canonicalEncode(AD_CONTENT_PASSPHRASE); ct = XChaCha20-Poly1305.
-    let password = normalize_passphrase(passphrase);
-    let cek = argon2id_cek(
-        &password,
-        &salt,
-        u32::try_from(m).unwrap(),
-        u32::try_from(t).unwrap(),
-        u32::try_from(p).unwrap(),
-    );
-    let payload_key = passphrase_payload_key(&cek, &nonce);
-    let aad = ad_content_passphrase(&nonce, "argon2id", &salt, m, t, p);
-    let ciphertext = xchacha20_poly1305_encrypt(&payload_key, &nonce, &aad, &plaintext);
+    // Producer: blob = commitment(32) || STREAM chunks, byte-for-byte.
+    let blob = passphrase_sealed_poe_seal(PassphraseSealArgs {
+        plaintext: &plaintext,
+        passphrase,
+        salt: &salt,
+        m,
+        t,
+        p,
+        nonce: &nonce,
+        hashes: &hashes,
+    })
+    .expect("seal");
     assert_eq!(
-        hex::encode(&ciphertext),
+        hex::encode(&blob[..PASSPHRASE_COMMITMENT_LENGTH]),
+        s(v, "expected_commitment_hex"),
+        "commitment header must match the fixture byte-for-byte"
+    );
+    assert_eq!(
+        hex::encode(&blob),
         s(v, "expected_ciphertext_hex"),
-        "passphrase ciphertext must match the fixture byte-for-byte"
+        "blob (commitment || STREAM) must match the fixture byte-for-byte"
+    );
+
+    // Verifier: the pinned blob opens back to the plaintext.
+    let opened = passphrase_sealed_poe_open(PassphraseOpenArgs {
+        blob: &blob,
+        passphrase,
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K,
+        alg: PASSPHRASE_KDF_ARGON2ID,
+        salt: &salt,
+        m,
+        t,
+        p,
+        nonce: &nonce,
+        hashes: &hashes,
+    })
+    .expect("open");
+    assert_eq!(
+        opened,
+        PassphraseOpenResult::Opened {
+            plaintext: b(v, "expected_plaintext_hex")
+        }
     );
 
     // End-to-end through the production verifier decrypt path: the recovered
     // plaintext re-hashes to the committed digest (plaintext_hash_ok).
     let digest = cardanowall::hash::sha256(&plaintext).to_vec();
     let record = passphrase_record(&salt, m, t, p, &nonce, digest);
-    let row = decrypt_passphrase_row(&record, expected_ciphertext, passphrase);
-    assert!(row.ok, "passphrase decrypt should succeed");
+    let row = decrypt_passphrase_row(&record, blob, passphrase);
+    assert!(row.decrypted, "passphrase decrypt should succeed");
     assert_eq!(row.plaintext_hash_ok, Some(true));
-    assert!(row.reason.is_none());
+    assert!(row.code.is_none());
 }
 
 // --------------------------------------------------------------------------
-// Hybrid (X-Wing) per-slot KEK salt (hybrid-kek-salt.json)
+// Passphrase-path negatives (passphrase-negative.json; fixture-driven)
+// --------------------------------------------------------------------------
+
+/// Open a fixture passphrase vector: envelope fields from the vector's
+/// `envelope` object, blob from `ciphertext_hex`.
+fn open_passphrase_vector(v: &Value) -> Result<PassphraseOpenResult, EciesSealedPoeError> {
+    let env = &v["envelope"];
+    let pw = &env["passphrase"];
+    let hashes = hashes_from(v);
+    passphrase_sealed_poe_open(PassphraseOpenArgs {
+        blob: &b(v, "ciphertext_hex"),
+        passphrase: s(v, "passphrase"),
+        aead: s(env, "aead"),
+        alg: s(pw, "alg"),
+        salt: &b(pw, "salt_hex"),
+        m: pw["params"]["m"].as_u64().expect("params.m"),
+        t: pw["params"]["t"].as_u64().expect("params.t"),
+        p: pw["params"]["p"].as_u64().expect("params.p"),
+        nonce: &b(env, "nonce_hex"),
+        hashes: &hashes,
+    })
+}
+
+#[test]
+fn passphrase_negative_matched_false_kats() {
+    // Wrong passphrase, tampered salt/params, a flipped commitment header, and
+    // a hashes splice all fail the in-ciphertext commitment BEFORE any chunk
+    // opens, surfacing the single generic rejection.
+    let corpus = fixture("passphrase-negative.json");
+    for v in corpus["matched_false_vectors"]
+        .as_array()
+        .expect("matched_false_vectors")
+    {
+        let name = s(v, "name");
+        assert_eq!(
+            s(v, "expected_reason"),
+            "TAMPERED_CIPHERTEXT",
+            "{name}: the passphrase path has exactly one generic failure"
+        );
+        let result = open_passphrase_vector(v)
+            .unwrap_or_else(|e| panic!("{name}: must be a structured rejection, not error: {e}"));
+        assert_eq!(result, PassphraseOpenResult::Rejected, "{name}");
+    }
+}
+
+#[test]
+fn passphrase_negative_raise_kats() {
+    // A whitespace-only passphrase and one carrying an unassigned codepoint
+    // are typed rejections raised before any key derivation.
+    let corpus = fixture("passphrase-negative.json");
+    for v in corpus["raise_vectors"].as_array().expect("raise_vectors") {
+        let name = s(v, "name");
+        let err = open_passphrase_vector(v).expect_err(name);
+        assert_eq!(err.code(), s(v, "expected_error_code"), "{name}");
+    }
+}
+
+// --------------------------------------------------------------------------
+// Per-slot KEK-salt pins (fixture-driven)
 // --------------------------------------------------------------------------
 
 #[test]
-fn hybrid_kek_salt_recomputed_from_kem_ct_and_pub_r() {
+fn hybrid_kek_salt_recomputed_from_nonce_kem_ct_and_pub_r() {
     let corpus = fixture("hybrid-kek-salt.json");
     let v = &corpus["vector"];
     let seed = b(v, "recipient_seed_hex");
     let expected_public = b(v, "recipient_public_hex");
     let kem_ct = b(v, "kem_ct_hex");
+    let enc_nonce = b(v, "enc_nonce_hex");
     let expected_kek_salt = b(v, "expected_kek_salt_hex");
 
     // pub_R is recomputed from the 32-byte seed via X-Wing keygen.
@@ -250,18 +328,34 @@ fn hybrid_kek_salt_recomputed_from_kem_ct_and_pub_r() {
     // The seed_derive keygen is the same derivation; both must agree.
     assert_eq!(xwing_keygen(&seed_arr).to_vec(), expected_public);
 
-    // kek_salt = SHA-256("cardano-poe-xwing-kek-salt-v1" || kem_ct || pub_R).
-    let salt = xwing_kek_salt(&kem_ct, &pub_r);
+    // kek_salt = SHA-256(label || enc.nonce || kem_ct || pub_R).
+    let salt = xwing_kek_salt(&enc_nonce, &kem_ct, &pub_r);
+    assert_eq!(salt.to_vec(), expected_kek_salt);
+}
+
+#[test]
+fn x25519_kek_salt_recomputed_from_nonce_epk_and_pub_r() {
+    let corpus = fixture("x25519-kek-salt.json");
+    let v = &corpus["vector"];
+    let recipient_secret = b(v, "recipient_secret_hex");
+    let epk = b(v, "epk_hex");
+    let enc_nonce = b(v, "enc_nonce_hex");
+    let expected_kek_salt = b(v, "expected_kek_salt_hex");
+
+    let pub_r = x25519_public_key(&recipient_secret).expect("derive pub_R");
     assert_eq!(
-        hex::encode(&salt),
-        s(v, "expected_kek_salt_hex"),
-        "kek_salt must match the pinned SHA-256 over kem_ct || pub_R"
+        hex::encode(&pub_r),
+        s(v, "recipient_public_hex"),
+        "pub_R recomputed from the secret must match the pinned recipient public key"
     );
+
+    // kek_salt = SHA-256(label || enc.nonce || epk || pub_R).
+    let salt = x25519_kek_salt(&enc_nonce, &epk, &pub_r);
     assert_eq!(salt.to_vec(), expected_kek_salt);
 }
 
 // --------------------------------------------------------------------------
-// Construction negatives (construction-negative.json)
+// Construction negatives (construction-negative.json; fixture-driven)
 // --------------------------------------------------------------------------
 
 /// Build an x25519 `SealedEnvelope` from a fixture envelope shape.
@@ -285,24 +379,16 @@ fn x25519_envelope_from_json(env: &Value) -> SealedEnvelope {
     }
 }
 
-/// Build a hybrid `SealedEnvelope` from a fixture envelope whose slots store
-/// `kem_ct` as a list of hex chunks (exact wire chunk boundaries preserved).
-fn hybrid_envelope_from_chunked_json(env: &Value) -> SealedEnvelope {
+/// Build a hybrid `SealedEnvelope` from a fixture envelope (single flat
+/// `kem_ct_hex` per slot).
+fn hybrid_envelope_from_json(env: &Value) -> SealedEnvelope {
     let slots = env["slots"]
         .as_array()
         .expect("slots array")
         .iter()
-        .map(|sv| {
-            let kem_ct = sv["kem_ct_chunks_hex"]
-                .as_array()
-                .expect("kem_ct_chunks_hex array")
-                .iter()
-                .map(|c| hex::decode(c.as_str().expect("hex chunk")).expect("valid hex"))
-                .collect();
-            Mlkem768X25519Slot {
-                kem_ct,
-                wrap: b(sv, "wrap_hex"),
-            }
+        .map(|sv| Mlkem768X25519Slot {
+            kem_ct: b(sv, "kem_ct_hex"),
+            wrap: b(sv, "wrap_hex"),
         })
         .collect();
     SealedEnvelope {
@@ -335,11 +421,12 @@ fn construction_negative_all_zero_shared() {
         let envelope = x25519_envelope_from_json(&v["envelope"]);
         let ciphertext = b(v, "ciphertext_hex");
         let secret = b(v, "recipient_secret_hex");
+        let hashes = hashes_from(v);
         let result = ecies_sealed_poe_unwrap(
             &envelope,
             &ciphertext,
+            &hashes,
             UnwrapKeys::Single(&secret),
-            true,
             None,
         )
         .unwrap_or_else(|e| panic!("{name}: must be a structured non-match, not error: {e}"));
@@ -361,14 +448,16 @@ fn construction_negative_hybrid_header_binding() {
         .expect("hybrid_header_binding_vectors")
     {
         let name = s(v, "name");
-        let envelope = hybrid_envelope_from_chunked_json(&v["envelope"]);
+        let envelope = hybrid_envelope_from_json(&v["envelope"]);
         let ciphertext = b(v, "ciphertext_hex");
-        let seed = b(v, "recipient_seed_hex");
+        // The recipient's X-Wing secret seed (the hybrid path's recipient secret).
+        let seed = b(v, "recipient_secret_hex");
+        let hashes = hashes_from(v);
         let result = ecies_sealed_poe_unwrap(
             &envelope,
             &ciphertext,
+            &hashes,
             UnwrapKeys::Single(&seed),
-            true,
             None,
         )
         .unwrap_or_else(|e| panic!("{name}: must be a structured non-match, not error: {e}"));
@@ -377,7 +466,7 @@ fn construction_negative_hybrid_header_binding() {
             UnwrapResult::NotMatched {
                 reason: reason_from_str(s(v, "expected_reason"))
             },
-            "{name}: a swapped nonce breaks the slots-transcript binding"
+            "{name}: a swapped header field breaks the slots-transcript binding"
         );
     }
 }
@@ -386,10 +475,9 @@ fn construction_negative_hybrid_header_binding() {
 fn construction_negative_cross_path_confusion() {
     // A slots-shaped record decrypted with a passphrase input, and a
     // passphrase-shaped record decrypted with a recipient key, MUST both be
-    // refused as WRONG_DECRYPTION_INPUT_SHAPE before any AEAD.
+    // refused as WRONG_DECRYPTION_INPUT_SHAPE before any crypto.
     let corpus = fixture("construction-negative.json");
     let v = &corpus["cross_path_vectors"][0];
-    let transport = NoFetchTransport;
 
     // Slots-shaped record, passphrase input → wrong-input-shape.
     let slots_env = &v["slots_envelope"];
@@ -399,9 +487,9 @@ fn construction_negative_cross_path_confusion() {
         items: Some(vec![ItemEntry {
             hashes: vec![("sha2-256".to_string(), fill(0u8, 32))],
             uris: None,
-            enc: Some(EncryptionEnvelope {
+            enc: Some(EncryptionEnvelope::Scheme1(EncScheme1 {
                 scheme: 1,
-                aead: "xchacha20-poly1305".to_string(),
+                aead: s(slots_env, "aead").to_string(),
                 nonce: b(slots_env, "nonce_hex"),
                 kem: Some(s(slots_env, "kem").to_string()),
                 slots: Some(vec![Slot {
@@ -411,26 +499,21 @@ fn construction_negative_cross_path_confusion() {
                 }]),
                 slots_mac: Some(b(slots_env, "slots_mac_hex")),
                 passphrase: None,
-            }),
+            })),
         }]),
         ..PoeRecord::default()
     };
-    let mut fetcher = GatewayFetcher::new(&transport, None);
-    let mut ct = BTreeMap::new();
-    ct.insert(0, fill(0u8, 32));
-    let input = VerifyTxInput {
-        decryption: Some(vec![Decryption::Passphrase {
-            item_index: 0,
+    let row = decrypt_row(
+        &record,
+        &fill(0u8, 48),
+        Decryption::Passphrase {
             passphrase: "anything".to_string(),
-        }]),
-        ciphertext_bytes: Some(ct),
-        ..VerifyTxInput::new("00")
-    };
-    let (rows, _) = try_decryptions(&record, &input, &mut fetcher);
+        },
+    );
     assert_eq!(
-        rows[0].reason.map(|r| r.as_str()),
+        row.code.map(|c| c.code()),
         Some("WRONG_DECRYPTION_INPUT_SHAPE"),
-        "slots record + passphrase input is a shape mismatch"
+        "slots record + passphrase keyring is a shape mismatch"
     );
 
     // Passphrase-shaped record, recipient-key input → wrong-input-shape.
@@ -444,83 +527,18 @@ fn construction_negative_cross_path_confusion() {
         &b(pw_env, "nonce_hex"),
         fill(0u8, 32),
     );
-    let mut fetcher = GatewayFetcher::new(&transport, None);
-    let mut ct = BTreeMap::new();
-    ct.insert(0, fill(0u8, 32));
-    let input = VerifyTxInput {
-        decryption: Some(vec![Decryption::Recipient {
-            item_index: 0,
+    let row = decrypt_row(
+        &record,
+        &fill(0u8, 48),
+        Decryption::Recipient {
             recipient_secret_key: fill(0x11, 32),
-        }]),
-        ciphertext_bytes: Some(ct),
-        ..VerifyTxInput::new("00")
-    };
-    let (rows, _) = try_decryptions(&record, &input, &mut fetcher);
+        },
+    );
     assert_eq!(
-        rows[0].reason.map(|r| r.as_str()),
+        row.code.map(|c| c.code()),
         Some("WRONG_DECRYPTION_INPUT_SHAPE"),
         "passphrase record + recipient key is a shape mismatch"
     );
-}
-
-// --------------------------------------------------------------------------
-// Behavioural pins: single-shot payload bound
-// --------------------------------------------------------------------------
-
-#[test]
-fn max_sealed_payload_constant_is_two_pow_38_minus_64() {
-    assert_eq!(MAX_SEALED_PLAINTEXT, 274_877_906_880);
-    assert_eq!(MAX_SEALED_PLAINTEXT, (1u64 << 38) - 64);
-    assert_eq!(MAX_SEALED_CIPHERTEXT, MAX_SEALED_PLAINTEXT + 16);
-}
-
-#[test]
-fn payload_and_ciphertext_bound_guards_reject_at_or_above_the_threshold() {
-    // The guards operate on a LENGTH, before any keystream is drawn, so the bound
-    // is pinned without allocating a multi-hundred-GB buffer: a real wrap never
-    // reaches the over-bound case in a unit test, but the guard the wrap and the
-    // unwrap both call is exercised directly at the boundary.
-    assert!(assert_plaintext_within_bound(0).is_ok());
-    assert!(assert_plaintext_within_bound(MAX_SEALED_PLAINTEXT - 1).is_ok());
-    assert_eq!(
-        assert_plaintext_within_bound(MAX_SEALED_PLAINTEXT)
-            .unwrap_err()
-            .code(),
-        "PAYLOAD_TOO_LARGE",
-    );
-    assert_eq!(
-        assert_plaintext_within_bound(MAX_SEALED_PLAINTEXT + 1)
-            .unwrap_err()
-            .code(),
-        "PAYLOAD_TOO_LARGE",
-    );
-
-    assert!(assert_ciphertext_within_bound(MAX_SEALED_CIPHERTEXT - 1).is_ok());
-    assert_eq!(
-        assert_ciphertext_within_bound(MAX_SEALED_CIPHERTEXT)
-            .unwrap_err()
-            .code(),
-        "PAYLOAD_TOO_LARGE",
-    );
-
-    // A normal-sized wrap is well below the bound and produces ciphertext =
-    // plaintext + 16 (the Poly1305 tag), confirming the +16 ciphertext offset.
-    let recipient_priv = fill(0x21, 32);
-    let recipient_pub = cardanowall::sealed_poe::x25519_public_key(&recipient_priv).unwrap();
-    let out = ecies_sealed_poe_wrap_with_rng(
-        WrapArgs {
-            plaintext: &fill(0xab, 16),
-            recipient_public_keys: &[recipient_pub.to_vec()],
-            cek: Some(&fill(0x33, 32)),
-            nonce: Some(&fill(0x44, 24)),
-            ephemeral_secrets: Some(&[fill(0x55, 32)]),
-            skip_shuffle: true,
-            ..Default::default()
-        },
-        &mut |_: &mut [u8]| panic!("deterministic wrap must not draw randomness"),
-    )
-    .expect("wrap below the bound");
-    assert_eq!(out.ciphertext.len(), 16 + 16, "16B plaintext + 16B tag");
 }
 
 // --------------------------------------------------------------------------
@@ -529,16 +547,15 @@ fn payload_and_ciphertext_bound_guards_reject_at_or_above_the_threshold() {
 
 #[test]
 fn producer_rejects_duplicate_recipient_public_keys() {
-    // Two slots wrapped to the SAME x25519 recipient public key (same epk would
-    // result only from a duplicate ephemeral, but the producer also rejects the
-    // duplicate epk that a repeated deterministic ephemeral would yield).
+    // Duplicate ephemeral secret across two slots → duplicate epk → reject.
     let priv0 = fill(0x21, 32);
-    let pub0 = cardanowall::sealed_poe::x25519_public_key(&priv0).unwrap();
-    // Duplicate ephemeral secret across the two slots → duplicate epk → reject.
+    let pub0 = x25519_public_key(&priv0).unwrap();
+    let hashes = test_hashes();
     let err = ecies_sealed_poe_wrap_with_rng(
         WrapArgs {
             plaintext: b"dup",
             recipient_public_keys: &[pub0.to_vec(), pub0.to_vec()],
+            hashes: &hashes,
             cek: Some(&fill(0x33, 32)),
             nonce: Some(&fill(0x44, 24)),
             ephemeral_secrets: Some(&[fill(0x55, 32), fill(0x55, 32)]),
@@ -555,7 +572,7 @@ fn producer_rejects_duplicate_recipient_public_keys() {
 fn verifier_rejects_duplicate_epk_before_any_decapsulation() {
     let env = SealedEnvelope {
         scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
         kem: "x25519".to_string(),
         nonce: fill(0u8, 24),
         slots: SealedSlots::X25519(vec![
@@ -573,8 +590,8 @@ fn verifier_rejects_duplicate_epk_before_any_decapsulation() {
     let err = ecies_sealed_poe_unwrap(
         &env,
         &fill(0u8, 16),
+        &test_hashes(),
         UnwrapKeys::Single(&fill(0x11, 32)),
-        true,
         None,
     )
     .expect_err("duplicate epk must be a structural rejection");
@@ -583,20 +600,20 @@ fn verifier_rejects_duplicate_epk_before_any_decapsulation() {
 
 #[test]
 fn verifier_rejects_duplicate_kem_ct_before_any_decapsulation() {
-    // Two hybrid slots whose kem_ct reassembles to identical 1120-byte enc.
+    // Two hybrid slots with identical 1120-byte kem_ct.
     let enc = fill(0x07, 1120);
     let env = SealedEnvelope {
         scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
         kem: "mlkem768x25519".to_string(),
         nonce: fill(0u8, 24),
         slots: SealedSlots::Mlkem768X25519(vec![
             Mlkem768X25519Slot {
-                kem_ct: chunk_kem_ct(&enc),
+                kem_ct: enc.clone(),
                 wrap: fill(0xcd, 48),
             },
             Mlkem768X25519Slot {
-                kem_ct: chunk_kem_ct(&enc),
+                kem_ct: enc,
                 wrap: fill(0xef, 48),
             },
         ]),
@@ -605,8 +622,8 @@ fn verifier_rejects_duplicate_kem_ct_before_any_decapsulation() {
     let err = ecies_sealed_poe_unwrap(
         &env,
         &fill(0u8, 16),
+        &test_hashes(),
         UnwrapKeys::Single(&fill(0x11, 32)),
-        true,
         None,
     )
     .expect_err("duplicate kem_ct must be a structural rejection");
@@ -614,27 +631,33 @@ fn verifier_rejects_duplicate_kem_ct_before_any_decapsulation() {
 }
 
 // --------------------------------------------------------------------------
-// Behavioural pins: the 25-codepoint White_Space normalization set
+// Behavioural pins: the passphrase normalization profile
 // --------------------------------------------------------------------------
 
 #[test]
 fn white_space_set_is_exactly_25_codepoints() {
-    // These 25 are the Unicode 16.0 White_Space property set. The normaliser
+    // These 25 are the Unicode 16.0 White_Space property set. The normalizer
     // collapses maximal runs of exactly these to one U+0020.
     let white_space: [u32; 25] = [
         0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x0020, 0x0085, 0x00a0, 0x1680, 0x2000, 0x2001,
         0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029,
         0x202f, 0x205f, 0x3000,
     ];
-    assert_eq!(white_space.len(), 25);
+    let expected: Vec<char> = white_space
+        .iter()
+        .map(|&cp| char::from_u32(cp).unwrap())
+        .collect();
+    assert_eq!(
+        cardanowall::sealed_poe::UNICODE_WHITE_SPACE.to_vec(),
+        expected
+    );
 
     // U+200B ZERO WIDTH SPACE is NOT White_Space: a run of it does NOT collapse.
-    // Two passphrases differing only by an interior U+200B normalise differently.
-    let with_zwsp = normalize_passphrase("a\u{200b}b");
-    let without = normalize_passphrase("ab");
+    // Two passphrases differing only by an interior U+200B normalize differently.
+    let with_zwsp = normalize_passphrase("a\u{200b}b").unwrap();
+    let without = normalize_passphrase("ab").unwrap();
     assert_eq!(
-        with_zwsp,
-        "a\u{200b}b".as_bytes().to_vec(),
+        with_zwsp, "a\u{200b}b",
         "U+200B is preserved verbatim, not collapsed"
     );
     assert_ne!(with_zwsp, without);
@@ -646,18 +669,42 @@ fn white_space_set_is_exactly_25_codepoints() {
         let ch = char::from_u32(cp).unwrap();
         let input = format!("a{ch}b");
         assert_eq!(
-            normalize_passphrase(&input),
-            input.as_bytes().to_vec(),
+            normalize_passphrase(&input).unwrap(),
+            input,
             "U+{cp:04X} must NOT be treated as White_Space"
         );
     }
 }
 
+#[test]
+fn empty_and_whitespace_only_passphrases_are_rejected() {
+    for vacuous in ["", " ", "\t \u{00a0}\u{3000}", "\u{2028}\u{2029}"] {
+        let err = normalize_passphrase(vacuous).unwrap_err();
+        assert_eq!(err.code(), "ENC_PASSPHRASE_EMPTY", "input {vacuous:?}");
+    }
+
+    // The same rejection surfaces from the seal API before any KDF work.
+    let hashes = test_hashes();
+    let err = passphrase_sealed_poe_seal(PassphraseSealArgs {
+        plaintext: b"body",
+        passphrase: " \t ",
+        salt: &fill(0x55, 16),
+        m: 65536,
+        t: 3,
+        p: 1,
+        nonce: &fill(0x66, 24),
+        hashes: &hashes,
+    })
+    .unwrap_err();
+    assert_eq!(err.code(), "ENC_PASSPHRASE_EMPTY");
+}
+
 // --------------------------------------------------------------------------
-// Behavioural pins: passphrase round-trip + AAD tamper + normalization equiv
+// Behavioural pins: passphrase round-trip + commitment + normalization equiv
 // --------------------------------------------------------------------------
 
-/// Encrypt a plaintext under the passphrase path and return (record, ciphertext).
+/// Seal a plaintext under the passphrase path and return
+/// (record, blob, hashes).
 fn seal_passphrase(
     passphrase: &str,
     salt: &[u8],
@@ -666,91 +713,198 @@ fn seal_passphrase(
     p: u64,
     nonce: &[u8],
     plaintext: &[u8],
-) -> (PoeRecord, Vec<u8>) {
-    let password = normalize_passphrase(passphrase);
-    let cek = argon2id_cek(
-        &password,
-        salt,
-        u32::try_from(m).unwrap(),
-        u32::try_from(t).unwrap(),
-        u32::try_from(p).unwrap(),
-    );
-    let payload_key = passphrase_payload_key(&cek, nonce);
-    let aad = ad_content_passphrase(nonce, "argon2id", salt, m, t, p);
-    let ciphertext = xchacha20_poly1305_encrypt(&payload_key, nonce, &aad, plaintext);
+) -> (PoeRecord, Vec<u8>, BTreeMap<String, Vec<u8>>) {
     let digest = cardanowall::hash::sha256(plaintext).to_vec();
+    let hashes: BTreeMap<String, Vec<u8>> = [("sha2-256".to_string(), digest.clone())].into();
+    let blob = passphrase_sealed_poe_seal(PassphraseSealArgs {
+        plaintext,
+        passphrase,
+        salt,
+        m,
+        t,
+        p,
+        nonce,
+        hashes: &hashes,
+    })
+    .expect("seal");
     let record = passphrase_record(salt, m, t, p, nonce, digest);
-    (record, ciphertext)
+    (record, blob, hashes)
+}
+
+/// Open through the crypto-layer API with header fields taken from arguments.
+#[allow(clippy::too_many_arguments)]
+fn open_blob(
+    blob: &[u8],
+    passphrase: &str,
+    salt: &[u8],
+    m: u64,
+    t: u64,
+    p: u64,
+    nonce: &[u8],
+    hashes: &BTreeMap<String, Vec<u8>>,
+) -> PassphraseOpenResult {
+    passphrase_sealed_poe_open(PassphraseOpenArgs {
+        blob,
+        passphrase,
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K,
+        alg: PASSPHRASE_KDF_ARGON2ID,
+        salt,
+        m,
+        t,
+        p,
+        nonce,
+        hashes,
+    })
+    .expect("structured open result")
 }
 
 #[test]
 fn passphrase_round_trip_recovers_plaintext() {
     let salt = fill(0x55, 16);
     let nonce = fill(0x66, 24);
-    let (record, ciphertext) = seal_passphrase(
+    let (record, blob, hashes) = seal_passphrase(
         "correct horse battery staple",
         &salt,
-        8,
-        1,
+        65536,
+        3,
         1,
         &nonce,
         b"sealed body",
     );
-    let row = decrypt_passphrase_row(&record, ciphertext, "correct horse battery staple");
-    assert!(row.ok);
+
+    // Crypto-layer open.
+    assert_eq!(
+        open_blob(
+            &blob,
+            "correct horse battery staple",
+            &salt,
+            65536,
+            3,
+            1,
+            &nonce,
+            &hashes
+        ),
+        PassphraseOpenResult::Opened {
+            plaintext: b"sealed body".to_vec()
+        }
+    );
+
+    // Verifier-path open.
+    let row = decrypt_passphrase_row(&record, blob, "correct horse battery staple");
+    assert!(row.decrypted);
     assert_eq!(row.plaintext_hash_ok, Some(true));
 }
 
 #[test]
-fn passphrase_aad_tamper_on_salt_breaks_open() {
+fn wrong_passphrase_is_the_single_generic_rejection_before_any_chunk() {
     let salt = fill(0x55, 16);
     let nonce = fill(0x66, 24);
-    let (mut record, ciphertext) = seal_passphrase("pw", &salt, 8, 1, 1, &nonce, b"body");
-    // Flip a salt byte in the record's enc block: the AAD recomputed at decrypt
-    // no longer matches the one the ciphertext was sealed under, so the AEAD
-    // open fails (a tampered-ciphertext verdict).
-    if let Some(block) = record.items.as_mut().unwrap()[0]
-        .enc
-        .as_mut()
-        .unwrap()
-        .passphrase
-        .as_mut()
-    {
-        block.salt[0] ^= 0x01;
-    }
-    let row = decrypt_passphrase_row(&record, ciphertext, "pw");
-    assert!(!row.ok, "a tampered AAD makes the AEAD open fail");
-    assert_eq!(row.plaintext_hash_ok, None);
-    assert_eq!(row.reason.map(|r| r.as_str()), Some("TAMPERED_CIPHERTEXT"));
+    let (record, blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"body");
+    assert_eq!(
+        open_blob(&blob, "not the pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Rejected
+    );
+    let row = decrypt_passphrase_row(&record, blob, "not the pw");
+    assert!(!row.decrypted);
+    assert_eq!(row.code.map(|c| c.code()), Some("TAMPERED_CIPHERTEXT"));
 }
 
 #[test]
-fn passphrase_aad_tamper_on_params_breaks_open() {
+fn commitment_header_flip_is_rejected() {
     let salt = fill(0x55, 16);
     let nonce = fill(0x66, 24);
-    let (mut record, ciphertext) = seal_passphrase("pw", &salt, 8, 1, 1, &nonce, b"body");
-    // Bump the `t` parameter in the record. This changes BOTH the derived CEK
-    // (different Argon2 cost) and the AAD, so the open fails regardless.
+    let (record, mut blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"body");
+    // Flip one bit inside the 32-byte commitment header: the STREAM chunks are
+    // untouched, so only the constant-time commitment check can reject this.
+    blob[7] ^= 0x01;
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Rejected
+    );
+    let row = decrypt_passphrase_row(&record, blob, "pw");
+    assert!(!row.decrypted);
+    assert_eq!(row.code.map(|c| c.code()), Some("TAMPERED_CIPHERTEXT"));
+}
+
+#[test]
+fn tampered_salt_or_params_break_the_commitment() {
+    let salt = fill(0x55, 16);
+    let nonce = fill(0x66, 24);
+    let (mut record, blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"body");
+
+    // Crypto layer: a flipped salt byte changes both the derived CEK and the
+    // transcript → Rejected.
+    let mut tampered_salt = salt.clone();
+    tampered_salt[0] ^= 0x01;
+    assert_eq!(
+        open_blob(&blob, "pw", &tampered_salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Rejected
+    );
+
+    // A bumped `t` parameter likewise → Rejected.
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 4, 1, &nonce, &hashes),
+        PassphraseOpenResult::Rejected
+    );
+
+    // Verifier path: tamper the record's params; the recomputed transcript no
+    // longer matches the commitment.
     {
-        let block = record.items.as_mut().unwrap()[0]
-            .enc
-            .as_mut()
-            .unwrap()
-            .passphrase
-            .as_mut()
-            .unwrap();
+        let Some(EncryptionEnvelope::Scheme1(enc)) = record.items.as_mut().unwrap()[0].enc.as_mut()
+        else {
+            panic!("passphrase record carries a scheme-1 envelope");
+        };
+        let block = enc.passphrase.as_mut().unwrap();
         for (k, val) in block.params.iter_mut() {
             if k == "t" {
-                *val = 2;
+                *val = 4;
             }
         }
     }
-    let row = decrypt_passphrase_row(&record, ciphertext, "pw");
+    let row = decrypt_passphrase_row(&record, blob, "pw");
     assert!(
-        !row.ok,
-        "a changed Argon2 cost derives a different CEK / AAD"
+        !row.decrypted,
+        "a changed Argon2 cost cannot reproduce the commitment"
     );
-    assert_eq!(row.reason.map(|r| r.as_str()), Some("TAMPERED_CIPHERTEXT"));
+    assert_eq!(row.code.map(|c| c.code()), Some("TAMPERED_CIPHERTEXT"));
+}
+
+#[test]
+fn passphrase_hashes_splice_breaks_the_commitment() {
+    // The commitment binds the item's hashes map: the same blob against an
+    // item with a different digest is rejected before any chunk.
+    let salt = fill(0x55, 16);
+    let nonce = fill(0x66, 24);
+    let (_record, blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"body");
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Opened {
+            plaintext: b"body".to_vec()
+        }
+    );
+    let mut spliced = BTreeMap::new();
+    spliced.insert("sha2-256".to_string(), vec![0xEEu8; 32]);
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &spliced),
+        PassphraseOpenResult::Rejected
+    );
+}
+
+#[test]
+fn tampered_stream_chunk_is_rejected_after_a_valid_commitment() {
+    let salt = fill(0x55, 16);
+    let nonce = fill(0x66, 24);
+    let (record, mut blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"body");
+    // Flip a byte PAST the commitment header: the commitment verifies, the
+    // chunk tag fails.
+    let idx = PASSPHRASE_COMMITMENT_LENGTH + 1;
+    blob[idx] ^= 0x01;
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Rejected
+    );
+    let row = decrypt_passphrase_row(&record, blob, "pw");
+    assert_eq!(row.code.map(|c| c.code()), Some("TAMPERED_CIPHERTEXT"));
 }
 
 #[test]
@@ -758,8 +912,8 @@ fn passphrase_normalization_equivalence_for_whitespace_variants() {
     let salt = fill(0x55, 16);
     let nonce = fill(0x66, 24);
     // Seal under a single-space-separated passphrase.
-    let (record, ciphertext) =
-        seal_passphrase("alpha beta", &salt, 8, 1, 1, &nonce, b"normalized body");
+    let (record, blob, _hashes) =
+        seal_passphrase("alpha beta", &salt, 65536, 3, 1, &nonce, b"normalized body");
 
     // Each of these collapses to "alpha beta" after the profile: an NBSP, a TAB,
     // an ideographic space (U+3000), and the NEL separator (U+0085) all map to a
@@ -772,48 +926,95 @@ fn passphrase_normalization_equivalence_for_whitespace_variants() {
         "  alpha   beta  ",      // multiple ASCII spaces + trim
         "alpha \t\u{00a0} beta", // mixed run collapses to one space
     ] {
-        let row = decrypt_passphrase_row(&record, ciphertext.clone(), variant);
-        assert!(row.ok, "variant {variant:?} should decrypt");
+        let row = decrypt_passphrase_row(&record, blob.clone(), variant);
+        assert!(row.decrypted, "variant {variant:?} should decrypt");
         assert_eq!(
             row.plaintext_hash_ok,
             Some(true),
-            "variant {variant:?} normalises to the same CEK"
+            "variant {variant:?} normalizes to the same CEK"
         );
     }
 
-    // An interior U+200B (NOT White_Space) changes the CEK → decrypt fails.
-    let row = decrypt_passphrase_row(&record, ciphertext, "alpha\u{200b} beta");
+    // An interior U+200B (NOT White_Space) changes the CEK → the commitment
+    // check rejects it.
+    let row = decrypt_passphrase_row(&record, blob, "alpha\u{200b} beta");
     assert_eq!(
-        row.reason.map(|r| r.as_str()),
+        row.code.map(|c| c.code()),
         Some("TAMPERED_CIPHERTEXT"),
         "U+200B is not collapsed, so it derives a different CEK"
     );
 }
 
+#[test]
+fn passphrase_path_handles_empty_and_multi_chunk_plaintexts() {
+    let salt = fill(0x55, 16);
+    let nonce = fill(0x66, 24);
+
+    // Empty plaintext: blob = 32-byte commitment + a lone 16-byte tag.
+    let (_, blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, b"");
+    assert_eq!(blob.len(), PASSPHRASE_COMMITMENT_LENGTH + 16);
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Opened { plaintext: vec![] }
+    );
+
+    // A plaintext crossing the 64 KiB chunk boundary.
+    let big: Vec<u8> = (0..65536 + 333).map(|i| (i % 251) as u8).collect();
+    let (_, blob, hashes) = seal_passphrase("pw", &salt, 65536, 3, 1, &nonce, &big);
+    assert_eq!(
+        blob.len(),
+        PASSPHRASE_COMMITMENT_LENGTH + big.len() + 2 * 16
+    );
+    assert_eq!(
+        open_blob(&blob, "pw", &salt, 65536, 3, 1, &nonce, &hashes),
+        PassphraseOpenResult::Opened { plaintext: big }
+    );
+}
+
 // --------------------------------------------------------------------------
-// Behavioural pin: the slots-transcript hash binds the header
+// Behavioural pin: the slots transcript binds header + hashes
 // --------------------------------------------------------------------------
 
 #[test]
-fn slots_hash_changes_when_a_header_field_changes() {
-    // Two envelopes with identical slots but a one-byte-different nonce produce
-    // different slots_hash values (the transcript binds the header), so a relay
-    // that swaps the nonce cannot keep the slots_mac valid.
+fn slots_hash_changes_when_a_header_field_or_the_hashes_change() {
     let slots = SealedSlots::X25519(vec![X25519Slot {
         epk: fill(0xab, 32),
         wrap: fill(0xcd, 48),
     }]);
-    let h1 = compute_slots_hash("x25519", &fill(0x00, 24), &slots);
+    let hashes_hash = item_hashes_hash(&test_hashes()).expect("hashes");
+    let aead = AEAD_CHACHA20_POLY1305_STREAM64K;
+    let h1 = compute_slots_hash(aead, "x25519", &fill(0x00, 24), &slots, &hashes_hash);
+
+    // The nonce is bound.
     let mut nonce2 = fill(0x00, 24);
     nonce2[23] = 0x10;
-    let h2 = compute_slots_hash("x25519", &nonce2, &slots);
+    let h2 = compute_slots_hash(aead, "x25519", &nonce2, &slots, &hashes_hash);
     assert_ne!(h1, h2, "the nonce is bound into the slots transcript");
-    // The kem identifier is bound too.
-    let h3 = compute_slots_hash("mlkem768x25519", &fill(0x00, 24), &slots);
+
+    // The kem identifier is bound.
+    let h3 = compute_slots_hash(
+        aead,
+        "mlkem768x25519",
+        &fill(0x00, 24),
+        &slots,
+        &hashes_hash,
+    );
     assert_ne!(
         h1, h3,
         "the kem identifier is bound into the slots transcript"
     );
+
+    // The item's hashes map is bound.
+    let mut other_hashes = BTreeMap::new();
+    other_hashes.insert("sha2-256".to_string(), vec![0xEEu8; 32]);
+    let h4 = compute_slots_hash(
+        aead,
+        "x25519",
+        &fill(0x00, 24),
+        &slots,
+        &item_hashes_hash(&other_hashes).expect("hashes"),
+    );
+    assert_ne!(h1, h4, "hashes_hash is bound into the slots transcript");
 }
 
 // --------------------------------------------------------------------------
@@ -846,7 +1047,7 @@ fn distinct_x25519_slots(count: usize) -> Vec<X25519Slot> {
 fn x25519_envelope(slots: Vec<X25519Slot>) -> SealedEnvelope {
     SealedEnvelope {
         scheme: 1,
-        aead: "xchacha20-poly1305".to_string(),
+        aead: AEAD_CHACHA20_POLY1305_STREAM64K.to_string(),
         kem: "x25519".to_string(),
         nonce: vec![0u8; NONCE_LEN],
         slots: SealedSlots::X25519(slots),
@@ -867,8 +1068,8 @@ fn rejects_more_than_max_slots() {
     let err = ecies_sealed_poe_unwrap(
         &env,
         &fill(0u8, 16),
+        &test_hashes(),
         UnwrapKeys::Single(&fill(0x11, 32)),
-        true,
         None,
     )
     .expect_err("more than MAX_SLOTS slots must be a structural rejection");
@@ -886,8 +1087,8 @@ fn rejects_decoded_envelope_over_byte_backstop() {
     let err = ecies_sealed_poe_unwrap(
         &env,
         &fill(0u8, 16),
+        &test_hashes(),
         UnwrapKeys::Single(&fill(0x11, 32)),
-        true,
         None,
     )
     .expect_err("a decoded envelope over the byte backstop must be rejected");
@@ -904,8 +1105,8 @@ fn accepts_envelope_just_below_the_byte_backstop() {
     let result = ecies_sealed_poe_unwrap(
         &env,
         &fill(0u8, 16),
+        &test_hashes(),
         UnwrapKeys::Single(&fill(0x11, 32)),
-        true,
         None,
     )
     .expect("just below the byte backstop must not be a resource error");
@@ -913,32 +1114,14 @@ fn accepts_envelope_just_below_the_byte_backstop() {
 }
 
 // --------------------------------------------------------------------------
-// Canonical transcript / AAD bytes (transcript-bytes.json)
+// Canonical transcript bytes (transcript-bytes.json; fixture-driven)
 // --------------------------------------------------------------------------
 
-/// Reconstruct the raw SLOTS_TRANSCRIPT canonical bytes the same way
-/// `compute_slots_hash` does internally (before prefix + SHA-256), so the
-/// pre-hash byte string can be asserted directly against the pinned vector.
-fn slots_transcript_bytes(kem: &str, nonce: &[u8], slots: &SealedSlots) -> Vec<u8> {
-    let transcript = CborValue::Map(vec![
-        (CborValue::text("scheme"), CborValue::Unsigned(1)),
-        (CborValue::text("path"), CborValue::text("slots")),
-        (
-            CborValue::text("aead"),
-            CborValue::text(AEAD_XCHACHA20_POLY1305),
-        ),
-        (CborValue::text("kem"), CborValue::text(kem)),
-        (CborValue::text("nonce"), CborValue::Bytes(nonce.to_vec())),
-        (CborValue::text("slots"), canonicalize_slots(slots)),
-    ]);
-    encode_canonical_cbor(&transcript).expect("transcript encodes")
-}
-
-/// Load (nonce, slots, slots_mac) from a committed wrap fixture.
-fn slots_from_wrap(name: &str, kem: &str) -> (Vec<u8>, SealedSlots, Vec<u8>) {
+/// Load (nonce, slots, hashes) from a committed wrap fixture.
+fn slots_from_wrap(name: &str, kem: &str) -> (Vec<u8>, SealedSlots, BTreeMap<String, Vec<u8>>) {
     let v = &fixture(name)["vector"];
     let nonce = b(v, "nonce_hex");
-    let slots_mac = b(v, "expected_slots_mac_hex");
+    let hashes = hashes_from(v);
     let arr = v["expected_slots"].as_array().expect("expected_slots");
     let slots = if kem == "x25519" {
         SealedSlots::X25519(
@@ -953,55 +1136,78 @@ fn slots_from_wrap(name: &str, kem: &str) -> (Vec<u8>, SealedSlots, Vec<u8>) {
         SealedSlots::Mlkem768X25519(
             arr.iter()
                 .map(|sv| Mlkem768X25519Slot {
-                    kem_ct: chunk_kem_ct(&b(sv, "kem_ct_hex")),
+                    kem_ct: b(sv, "kem_ct_hex"),
                     wrap: b(sv, "wrap_hex"),
                 })
                 .collect(),
         )
     };
-    (nonce, slots, slots_mac)
+    (nonce, slots, hashes)
 }
 
 #[test]
-fn transcript_and_aad_bytes_match_pinned_vectors() {
-    // Pins the exact canonicalEncode output of SLOTS_TRANSCRIPT, AD_CONTENT_SLOTS,
-    // and AD_CONTENT_PASSPHRASE so a canonical-encoding divergence localises to
-    // the encoder rather than only surfacing as a downstream slots_mac / tag
-    // mismatch.
+fn transcript_bytes_match_pinned_vectors() {
+    // Pins the exact canonicalEncode output of SLOTS_TRANSCRIPT (both KEMs)
+    // and PASSPHRASE_TRANSCRIPT, plus the item-hashes digest, so a
+    // canonical-encoding divergence localises to the encoder rather than only
+    // surfacing as a downstream slots_mac / commitment mismatch.
     let corpus = fixture("transcript-bytes.json");
+    let mut saw_hashes = false;
     let mut saw_x25519 = false;
     let mut saw_hybrid = false;
     let mut saw_passphrase = false;
     for v in corpus["vectors"].as_array().expect("vectors") {
         let name = s(v, "name");
-        if let Some(kem) = v.get("kem").and_then(|k| k.as_str()) {
-            let source = if kem == "x25519" {
-                "wrap-n3.json"
-            } else {
-                "wrap-hybrid-n1.json"
-            };
-            let (nonce, slots, slots_mac) = slots_from_wrap(source, kem);
+        // Three vector kinds, discriminated on field presence: item-hashes-only
+        // pins, SLOTS_TRANSCRIPT pins (a `kem` field), and the
+        // PASSPHRASE_TRANSCRIPT pin.
+        if v.get("kem").is_none()
+            && v.get("expected_passphrase_transcript_canonical_hex")
+                .is_none()
+        {
+            let hashes = hashes_from(v);
+            assert_eq!(
+                hex::encode(item_hashes_hash(&hashes).expect("hashes").as_slice()),
+                s(v, "expected_hashes_hash_hex"),
+                "{name}: hashes_hash"
+            );
+            saw_hashes = true;
+        } else if let Some(kem) = v.get("kem").and_then(|k| k.as_str()) {
+            let source = s(v, "source_fixture");
+            let (nonce, slots, hashes) = slots_from_wrap(source, kem);
             assert_eq!(hex::encode(&nonce), s(v, "nonce_hex"), "{name}");
 
-            let transcript = slots_transcript_bytes(kem, &nonce, &slots);
+            let hashes_hash = item_hashes_hash(&hashes).expect("hashes");
+            assert_eq!(
+                hex::encode(hashes_hash.as_slice()),
+                s(v, "expected_hashes_hash_hex"),
+                "{name}: hashes_hash"
+            );
+
+            let transcript = slots_transcript_bytes(
+                AEAD_CHACHA20_POLY1305_STREAM64K,
+                kem,
+                &nonce,
+                &slots,
+                &hashes_hash,
+            );
             assert_eq!(
                 hex::encode(&transcript),
                 s(v, "expected_slots_transcript_canonical_hex"),
                 "{name}: raw SLOTS_TRANSCRIPT bytes"
             );
 
-            let slots_hash = compute_slots_hash(kem, &nonce, &slots);
+            let slots_hash = compute_slots_hash(
+                AEAD_CHACHA20_POLY1305_STREAM64K,
+                kem,
+                &nonce,
+                &slots,
+                &hashes_hash,
+            );
             assert_eq!(
                 hex::encode(slots_hash.as_slice()),
                 s(v, "expected_slots_hash_hex"),
                 "{name}: slots_hash"
-            );
-
-            let ad = ad_content_slots(kem, &nonce, &slots_hash, &slots_mac);
-            assert_eq!(
-                hex::encode(&ad),
-                s(v, "expected_ad_content_slots_canonical_hex"),
-                "{name}: AD_CONTENT_SLOTS bytes"
             );
             saw_x25519 = saw_x25519 || kem == "x25519";
             saw_hybrid = saw_hybrid || kem == "mlkem768x25519";
@@ -1011,14 +1217,40 @@ fn transcript_and_aad_bytes_match_pinned_vectors() {
             let m = v["params"]["m"].as_u64().unwrap();
             let t = v["params"]["t"].as_u64().unwrap();
             let p = v["params"]["p"].as_u64().unwrap();
-            let ad = ad_content_passphrase(&nonce, "argon2id", &salt, m, t, p);
+            let hashes = hashes_from(v);
+            let hashes_hash = item_hashes_hash(&hashes).expect("hashes");
+            let transcript = passphrase_transcript_bytes(
+                AEAD_CHACHA20_POLY1305_STREAM64K,
+                &nonce,
+                PASSPHRASE_KDF_ARGON2ID,
+                &salt,
+                m,
+                t,
+                p,
+                &hashes_hash,
+            );
             assert_eq!(
-                hex::encode(&ad),
-                s(v, "expected_ad_content_passphrase_canonical_hex"),
-                "{name}: AD_CONTENT_PASSPHRASE bytes"
+                hex::encode(&transcript),
+                s(v, "expected_passphrase_transcript_canonical_hex"),
+                "{name}: raw PASSPHRASE_TRANSCRIPT bytes"
+            );
+            let pw_hash = compute_passphrase_hash(
+                AEAD_CHACHA20_POLY1305_STREAM64K,
+                &nonce,
+                PASSPHRASE_KDF_ARGON2ID,
+                &salt,
+                m,
+                t,
+                p,
+                &hashes_hash,
+            );
+            assert_eq!(
+                hex::encode(pw_hash.as_slice()),
+                s(v, "expected_pw_hash_hex"),
+                "{name}: pw_hash"
             );
             saw_passphrase = true;
         }
     }
-    assert!(saw_x25519 && saw_hybrid && saw_passphrase);
+    assert!(saw_hashes && saw_x25519 && saw_hybrid && saw_passphrase);
 }
