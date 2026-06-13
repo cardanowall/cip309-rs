@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > release. Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-06-13
+
+### Fixed
+
+- Mixed-case CIDv1 URIs are rejected. The multibase body is decoded verbatim against the case its prefix advertises (`b`/`B` base32, `f`/`F` base16) instead of being case-folded, so a non-canonical CID no longer validates — keeping the verdict in lockstep with the TypeScript and Python SDKs.
+
 ## [0.5.0] - 2026-06-12
 
 ### Breaking

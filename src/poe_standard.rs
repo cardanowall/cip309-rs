@@ -3522,17 +3522,25 @@ fn read_varint(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
 }
 
 // Multibase decoders for the closed set the CID profile admits.
+//
+// The body is decoded VERBATIM against the case the prefix advertises — never
+// case-folded. RFC 4648 base32/base16 each have a distinct lower- and
+// upper-case multibase prefix (`b`/`B`, `f`/`F`); a body whose case disagrees
+// with its prefix is not a canonical CID and is rejected (the mismatched
+// character is absent from the advertised alphabet), not silently folded into
+// the advertised case.
 fn decode_multibase(prefix: char, body: &str) -> Option<Vec<u8>> {
     match prefix {
-        'b' => decode_base32(&body.to_ascii_lowercase(), false),
-        'B' => decode_base32(&body.to_ascii_uppercase(), true),
-        'f' | 'F' => decode_base16(body),
+        'b' => decode_base32(body, false),
+        'B' => decode_base32(body, true),
+        'f' => decode_base16(body, false),
+        'F' => decode_base16(body, true),
         'z' => decode_base58btc(body),
         _ => None,
     }
 }
 
-fn decode_base16(s: &str) -> Option<Vec<u8>> {
+fn decode_base16(s: &str, upper: bool) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -3540,19 +3548,19 @@ fn decode_base16(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let hi = hex_digit(bytes[i])?;
-        let lo = hex_digit(bytes[i + 1])?;
+        let hi = hex_digit(bytes[i], upper)?;
+        let lo = hex_digit(bytes[i + 1], upper)?;
         out.push((hi << 4) | lo);
         i += 2;
     }
     Some(out)
 }
 
-fn hex_digit(b: u8) -> Option<u8> {
+fn hex_digit(b: u8, upper: bool) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' if !upper => Some(b - b'a' + 10),
+        b'A'..=b'F' if upper => Some(b - b'A' + 10),
         _ => None,
     }
 }
